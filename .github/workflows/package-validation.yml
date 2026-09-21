@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@d4c94342e560b34958e1a5f7d17e66c4b9131d1f # v4.0.0
+        uses: actions/setup-dotnet@4d6c8fcf3c8f7a60068d26b594648e99df24cee3 # v4.0.0
         with:
           dotnet-version: 10.0.100
 

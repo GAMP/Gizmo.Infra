@@ -39,10 +39,20 @@ public sealed class ReusableWorkflowContractTests
     // runs never contend with another package.
     private const string ConcurrencyGroup = "nuget-${{ github.repository }}-${{ inputs.package-id }}";
 
+    // Validation run 35636544410 failed in setup because actions/setup-dotnet
+    // resolved an invalid v4.0.0 commit; the corrected SHA must stay pinned and
+    // the rejected one must never come back.
+    private const string SetupDotnetPin =
+        "uses: actions/setup-dotnet@4d6c8fcf3c8f7a60068d26b594648e99df24cee3 # v4.0.0";
+    private const string RejectedSetupDotnetSha = "d4c94342e560b34958e1a5f7d17e66c4b9131d1f";
+
     private static readonly Regex UsesLine = new(
         @"^\s*uses:", RegexOptions.Multiline | RegexOptions.CultureInvariant);
     private static readonly Regex PinnedUsesLine = new(
         @"^\s*uses:\s+[^\s@]+@[0-9a-f]{40}\s+#\s+v[0-9][^\s]*\s*$",
+        RegexOptions.Multiline | RegexOptions.CultureInvariant);
+    private static readonly Regex SetupDotnetUsesLine = new(
+        @"^\s*uses:\s+actions/setup-dotnet@[^\s#]+(?:\s+#[^\r\n]*)?\s*$",
         RegexOptions.Multiline | RegexOptions.CultureInvariant);
 
     [Fact]
@@ -247,6 +257,21 @@ public sealed class ReusableWorkflowContractTests
         {
             Assert.Matches("actions/download-artifact@[0-9a-f]{40} # v", Read(file));
         }
+    }
+
+    [Theory]
+    [InlineData(ValidationFile)]
+    [InlineData(DevelopmentFile)]
+    [InlineData(ReleaseFile)]
+    public void SetupDotnet_IsPinnedToTheValidatedV4ShaExactlyOnce(string file)
+    {
+        var content = Read(file);
+        var uses = SetupDotnetUsesLine.Matches(content).Cast<Match>()
+            .Select(match => match.Value.Trim())
+            .ToArray();
+
+        Assert.Equal(new[] { SetupDotnetPin }, uses);
+        Assert.DoesNotContain(RejectedSetupDotnetSha, content, StringComparison.Ordinal);
     }
 
     [Fact]
