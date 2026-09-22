@@ -39,20 +39,28 @@ public sealed class ReusableWorkflowContractTests
     // runs never contend with another package.
     private const string ConcurrencyGroup = "nuget-${{ github.repository }}-${{ inputs.package-id }}";
 
-    // Validation run 35636544410 failed in setup because actions/setup-dotnet
-    // resolved an invalid v4.0.0 commit; the corrected SHA must stay pinned and
-    // the rejected one must never come back.
+    // Finalized Node 24 action releases. Every workflow that declares one of
+    // these actions must use exactly this commit and matching release comment, so
+    // a partial upgrade that leaves any action on a stale major fails here.
+    // download-artifact is declared only by the publishing workflows.
+    private const string CheckoutPin =
+        "uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0";
     private const string SetupDotnetPin =
-        "uses: actions/setup-dotnet@4d6c8fcf3c8f7a60068d26b594648e99df24cee3 # v4.0.0";
+        "uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0";
+    private const string UploadArtifactPin =
+        "uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0";
+    private const string DownloadArtifactPin =
+        "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1";
+
+    // Validation run 35636544410 failed in setup because actions/setup-dotnet
+    // resolved an invalid v4.0.0 commit; the corrected pin above must hold and
+    // the rejected commit must never come back.
     private const string RejectedSetupDotnetSha = "d4c94342e560b34958e1a5f7d17e66c4b9131d1f";
 
     private static readonly Regex UsesLine = new(
         @"^\s*uses:", RegexOptions.Multiline | RegexOptions.CultureInvariant);
     private static readonly Regex PinnedUsesLine = new(
         @"^\s*uses:\s+[^\s@]+@[0-9a-f]{40}\s+#\s+v[0-9][^\s]*\s*$",
-        RegexOptions.Multiline | RegexOptions.CultureInvariant);
-    private static readonly Regex SetupDotnetUsesLine = new(
-        @"^\s*uses:\s+actions/setup-dotnet@[^\s#]+(?:\s+#[^\r\n]*)?\s*$",
         RegexOptions.Multiline | RegexOptions.CultureInvariant);
 
     [Fact]
@@ -260,18 +268,32 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Theory]
-    [InlineData(ValidationFile)]
-    [InlineData(DevelopmentFile)]
-    [InlineData(ReleaseFile)]
-    public void SetupDotnet_IsPinnedToTheValidatedV4ShaExactlyOnce(string file)
+    [InlineData(ValidationFile, "actions/checkout", CheckoutPin)]
+    [InlineData(DevelopmentFile, "actions/checkout", CheckoutPin)]
+    [InlineData(ReleaseFile, "actions/checkout", CheckoutPin)]
+    [InlineData(ValidationFile, "actions/setup-dotnet", SetupDotnetPin)]
+    [InlineData(DevelopmentFile, "actions/setup-dotnet", SetupDotnetPin)]
+    [InlineData(ReleaseFile, "actions/setup-dotnet", SetupDotnetPin)]
+    [InlineData(ValidationFile, "actions/upload-artifact", UploadArtifactPin)]
+    [InlineData(DevelopmentFile, "actions/upload-artifact", UploadArtifactPin)]
+    [InlineData(ReleaseFile, "actions/upload-artifact", UploadArtifactPin)]
+    [InlineData(DevelopmentFile, "actions/download-artifact", DownloadArtifactPin)]
+    [InlineData(ReleaseFile, "actions/download-artifact", DownloadArtifactPin)]
+    public void Actions_ArePinnedToTheFinalNode24Release(string file, string action, string expectedPin)
     {
-        var content = Read(file);
-        var uses = SetupDotnetUsesLine.Matches(content).Cast<Match>()
-            .Select(match => match.Value.Trim())
-            .ToArray();
+        var uses = ActionUses(Read(file), action);
 
-        Assert.Equal(new[] { SetupDotnetPin }, uses);
-        Assert.DoesNotContain(RejectedSetupDotnetSha, content, StringComparison.Ordinal);
+        Assert.NotEmpty(uses);
+        Assert.All(uses, use => Assert.Equal(expectedPin, use));
+    }
+
+    [Fact]
+    public void SetupDotnet_NeverReintroducesTheRejectedCommit()
+    {
+        foreach (var file in ContractFiles)
+        {
+            Assert.DoesNotContain(RejectedSetupDotnetSha, Read(file), StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -1166,6 +1188,15 @@ public sealed class ReusableWorkflowContractTests
     private static string Read(string fileName) =>
         File.ReadAllText(Path.Combine(
             InfraRepositoryLocator.ResolveRoot(), ".github", "workflows", fileName));
+
+    private static string[] ActionUses(string content, string action) =>
+        Regex.Matches(
+                content,
+                $@"^\s*uses:\s+{Regex.Escape(action)}@[^\s#]+(?:\s+#[^\r\n]*)?\s*$",
+                RegexOptions.Multiline | RegexOptions.CultureInvariant)
+            .Cast<Match>()
+            .Select(match => match.Value.Trim())
+            .ToArray();
 
     private static YamlMappingNode Parse(string fileName) => YamlWorkflowReader.Parse(Read(fileName));
 
