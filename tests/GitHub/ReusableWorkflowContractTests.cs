@@ -1124,13 +1124,21 @@ public sealed class ReusableWorkflowContractTests
     {
         foreach (var file in ContractFiles)
         {
-            var content = Read(file);
+            var script = Run(BuildJob(Parse(file), file), "Restore with NuGet audit");
 
-            Assert.Contains("-p:NuGetAudit=true", content, StringComparison.Ordinal);
-            Assert.Contains("-p:NuGetAuditMode=all", content, StringComparison.Ordinal);
-            Assert.Contains("-p:NuGetAuditLevel=low", content, StringComparison.Ordinal);
-            Assert.Contains("-p:WarningsAsErrors=\"NU1904;NU1903\"", content, StringComparison.Ordinal);
-            Assert.Contains("-p:WarningsNotAsErrors=\"NU1901;NU1902\"", content, StringComparison.Ordinal);
+            Assert.Contains("-p:NuGetAudit=true", script, StringComparison.Ordinal);
+            Assert.Contains("-p:NuGetAuditMode=all", script, StringComparison.Ordinal);
+            Assert.Contains("-p:NuGetAuditLevel=low", script, StringComparison.Ordinal);
+
+            // MSBuild parses a '-p:' value as semicolon-separated name=value
+            // pairs, so an unescaped 'NU1904;NU1903' splits 'NU1903' into its
+            // own switch and fails the Bash restore with MSB1006. Only the %3B
+            // escape survives, with or without shell quoting around the value.
+            Assert.Contains("-p:WarningsAsErrors=NU1904%3BNU1903", script, StringComparison.Ordinal);
+            Assert.Contains("-p:WarningsNotAsErrors=NU1901%3BNU1902", script, StringComparison.Ordinal);
+            Assert.DoesNotMatch(@"-p:Warnings(?:Not)?AsErrors=(?:""[^""\r\n]*;|NU\d+;)", script);
+            Assert.DoesNotContain("-p:WarningsAsErrors=\"NU1904;NU1903\"", script, StringComparison.Ordinal);
+            Assert.DoesNotContain("-p:WarningsNotAsErrors=\"NU1901;NU1902\"", script, StringComparison.Ordinal);
         }
     }
 
