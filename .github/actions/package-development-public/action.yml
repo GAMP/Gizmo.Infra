@@ -1,0 +1,123 @@
+name: Publish public NuGet development package
+description: Recheck caller repository state and publish to NuGet.org using caller-owned GitHub OIDC.
+inputs:
+  package-id:
+    description: NuGet package ID.
+    required: true
+  nuget-user:
+    description: NuGet.org profile name used for trusted publishing token exchange.
+    required: true
+  package-artifact:
+    description: Repository-relative path of the packed .nupkg inside the workflow artifact.
+    required: true
+  package-version:
+    description: Calculated package version.
+    required: true
+  calculated-state:
+    description: Complete state emitted by the prepare action.
+    required: true
+  tag-state-fingerprint:
+    description: Tag-state fingerprint emitted by the prepare action.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Validate trusted publisher invocation
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref }}
+        REF_PROTECTED: ${{ github.ref_protected }}
+        NUGET_USER: ${{ inputs.nuget-user }}
+      run: |
+        set -euo pipefail
+        if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
+          echo "Publishing is allowed only from push or workflow_dispatch." >&2
+          exit 1
+        fi
+        if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
+          echo "Publishing requires a protected branch ref." >&2
+          exit 1
+        fi
+        if [[ ! "$NUGET_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+          echo "nuget-user is missing or invalid." >&2
+          exit 1
+        fi
+    - name: Download exact package artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
+        path: artifacts
+
+    - name: Recheck calculated tag state before publication
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EXPECTED_PACKAGE_ID: ${{ inputs.package-id }}
+        PACKAGE_VERSION: ${{ inputs.package-version }}
+        EXPECTED_STATE: ${{ inputs.calculated-state }}
+        EXPECTED_FINGERPRINT: ${{ inputs.tag-state-fingerprint }}
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        response_file=$(mktemp)
+        tag_object_file=$(mktemp)
+        trap 'rm -f "$response_file" "$tag_object_file"' EXIT
+        resolve_commit() {
+          local object_type=$1 object_sha=$2 status depth=0
+          while :; do
+            case "$object_type" in
+              commit) printf '%s' "$object_sha"; return 0 ;;
+              tag)
+                ((depth += 1))
+                if (( depth > 16 )) || ! status=$(curl --silent --show-error --location --output "$tag_object_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$object_sha"); then echo "Could not resolve an annotated package tag during publication recheck." >&2; return 1; fi
+                if [[ "$status" != 200 ]] || ! object_type=$(jq -er '.object.type | strings' "$tag_object_file") || ! object_sha=$(jq -er '.object.sha | strings' "$tag_object_file"); then echo "GitHub returned a malformed annotated package-tag response during publication recheck." >&2; return 1; fi
+                ;;
+              *) echo "Package tag ref does not resolve to a commit." >&2; return 1 ;;
+            esac
+          done
+        }
+        tag_prefix="refs/tags/${EXPECTED_PACKAGE_ID}/"
+        snapshot=''
+        page=1
+        while :; do
+          if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$EXPECTED_PACKAGE_ID/?per_page=100&page=$page"); then echo "Could not refetch caller-repository package tag refs." >&2; exit 1; fi
+          if [[ "$status" != 200 ]] || ! jq -e 'type == "array" and all(.[]; (.ref | type == "string") and (.object | type == "object") and (.object.type | type == "string") and (.object.sha | type == "string"))' "$response_file" > /dev/null; then echo "GitHub returned a malformed package tag-ref response during publication recheck." >&2; exit 1; fi
+          while IFS=$'\t' read -r ref object_type object_sha; do
+            [[ -z "$ref" ]] && continue
+            if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
+            leaf=${ref#"$tag_prefix"}
+            if [[ ! "$leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
+            snapshot+="${ref}=${object_sha}"$'\n'
+          done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")
+          count=$(jq -er 'length' "$response_file")
+          if (( count < 100 )); then break; fi
+          ((page += 1))
+        done
+        snapshot=$(printf '%s' "$snapshot" | LC_ALL=C sort)
+        fingerprint=$(printf '%s' "$snapshot" | sha256sum | cut -d ' ' -f1)
+        tag_state=$(printf '%s' "$snapshot" | base64 --wrap=0)
+        if [[ "$EXPECTED_STATE" != *";tag-state=${tag_state}" || "$fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then echo "Calculated package state drifted before publication; refusing to publish." >&2; exit 1; fi
+        package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/index.json"); then echo "Could not recheck whether the public package version already exists." >&2; exit 1; fi
+        case "$status" in
+          200) jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null || { echo "NuGet.org returned a malformed package-version response." >&2; exit 1; }; jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) == null' "$response_file" > /dev/null || { echo "Package version collision appeared before publication." >&2; exit 1; } ;;
+          404) ;;
+          *) echo "NuGet.org returned HTTP $status while rechecking package publication." >&2; exit 1 ;;
+        esac
+
+    - name: Exchange OIDC identity for temporary NuGet API key
+      shell: bash
+      env:
+        NUGET_USER: ${{ inputs.nuget-user }}
+        PACKAGE_ARTIFACT: ${{ inputs.package-artifact }}
+      run: |
+        set -euo pipefail
+        oidc_response=$(curl --fail --silent --show-error --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fwww.nuget.org")
+        oidc_token=$(printf '%s' "$oidc_response" | jq -er '.value')
+        token_request=$(jq -nc --arg username "$NUGET_USER" '{username: $username, tokenType: "ApiKey"}')
+        token_response=$(curl --fail --silent --show-error --request POST --header 'Content-Type: application/json' --header "Authorization: Bearer $oidc_token" --data "$token_request" 'https://www.nuget.org/api/v2/token')
+        nuget_api_key=$(printf '%s' "$token_response" | jq -er '.apiKey')
+        echo "::add-mask::$nuget_api_key"
+        dotnet nuget push "$PACKAGE_ARTIFACT" --source https://api.nuget.org/v3/index.json --api-key "$nuget_api_key"

@@ -1,0 +1,103 @@
+name: Reconcile immutable NuGet release tag
+description: Recheck caller tag state and create the missing immutable package-qualified release tag.
+inputs:
+  release-tag:
+    description: Package-qualified release tag, for example Gizmo.Shared/v3.0.0.
+    required: true
+  calculated-state:
+    description: Complete state emitted by the release prepare action.
+    required: true
+  tag-state-fingerprint:
+    description: Tag-state fingerprint emitted by the release prepare action.
+    required: true
+  nuget-user:
+    description: Unused compatibility input for the common trusted-invocation guard.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Validate trusted publisher invocation
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref }}
+        REF_PROTECTED: ${{ github.ref_protected }}
+        NUGET_USER: ${{ inputs.nuget-user }}
+      run: |
+        set -euo pipefail
+        if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
+          echo "Publishing is allowed only from push or workflow_dispatch." >&2
+          exit 1
+        fi
+        if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
+          echo "Publishing requires a protected branch ref." >&2
+          exit 1
+        fi
+
+    - name: Refetch and recheck calculated state before tagging
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        EXPECTED_STATE: ${{ inputs.calculated-state }}
+        EXPECTED_FINGERPRINT: ${{ inputs.tag-state-fingerprint }}
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        package_id=${RELEASE_TAG%%/v*}
+        if [[ -z "$package_id" || "$package_id" == "$RELEASE_TAG" ]]; then echo "Calculated release tag has an invalid package prefix." >&2; exit 1; fi
+        response_file=$(mktemp)
+        tag_object_file=$(mktemp)
+        trap 'rm -f "$response_file" "$tag_object_file"' EXIT
+        resolve_commit() {
+          local object_type=$1 object_sha=$2 status depth=0
+          while :; do
+            case "$object_type" in
+              commit) printf '%s' "$object_sha"; return 0 ;;
+              tag)
+                ((depth += 1))
+                if (( depth > 16 )) || ! status=$(curl --silent --show-error --location --output "$tag_object_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$object_sha"); then echo "Could not resolve an annotated package tag during tag recheck." >&2; return 1; fi
+                if [[ "$status" != 200 ]] || ! object_type=$(jq -er '.object.type | strings' "$tag_object_file") || ! object_sha=$(jq -er '.object.sha | strings' "$tag_object_file"); then echo "GitHub returned a malformed annotated package-tag response during tag recheck." >&2; return 1; fi
+                ;;
+              *) echo "Package tag ref does not resolve to a commit." >&2; return 1 ;;
+            esac
+          done
+        }
+        tag_prefix="refs/tags/${package_id}/"
+        snapshot=''
+        page=1
+        while :; do
+          if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$package_id/?per_page=100&page=$page"); then echo "Could not refetch caller-repository package tag refs." >&2; exit 1; fi
+          if [[ "$status" != 200 ]] || ! jq -e 'type == "array" and all(.[]; (.ref | type == "string") and (.object | type == "object") and (.object.type | type == "string") and (.object.sha | type == "string"))' "$response_file" > /dev/null; then echo "GitHub returned a malformed package tag-ref response during tag recheck." >&2; exit 1; fi
+          while IFS=$'\t' read -r ref object_type object_sha; do
+            [[ -z "$ref" ]] && continue
+            if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
+            leaf=${ref#"$tag_prefix"}
+            if [[ ! "$leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
+            snapshot+="${ref}=${object_sha}"$'\n'
+          done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")
+          count=$(jq -er 'length' "$response_file")
+          if (( count < 100 )); then break; fi
+          ((page += 1))
+        done
+        snapshot=$(printf '%s' "$snapshot" | LC_ALL=C sort)
+        fingerprint=$(printf '%s' "$snapshot" | sha256sum | cut -d ' ' -f1)
+        tag_state=$(printf '%s' "$snapshot" | base64 --wrap=0)
+        if [[ "$EXPECTED_STATE" != *";tag-state=${tag_state}" || "$fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then echo "Calculated package state drifted before tagging; refusing to create a tag." >&2; exit 1; fi
+
+    - name: Create or reconcile immutable release tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      run: |
+        set -euo pipefail
+        response_file=$(mktemp)
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"); then echo "Could not check whether the release tag is already claimed." >&2; exit 1; fi
+        case "$status" in
+          200) tag_sha=$(jq -er '.object.sha | strings' "$response_file") || { echo "GitHub returned a malformed release-tag response." >&2; exit 1; }; if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then echo "Release tag already exists for a different commit; refusing to move it." >&2; exit 1; fi ;;
+          404) request_body=$(jq -nc --arg ref "refs/tags/$RELEASE_TAG" --arg sha "$GITHUB_SHA" '{ref: $ref, sha: $sha}'); if ! status=$(curl --silent --show-error --location --output /dev/null --write-out '%{http_code}' --request POST --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'Content-Type: application/json' --data "$request_body" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs"); then echo "Could not create the release tag; the tag was not moved or overwritten." >&2; exit 1; fi; if [[ "$status" != 201 ]]; then echo "GitHub returned HTTP $status while creating the release tag; the tag was not moved or overwritten." >&2; exit 1; fi ;;
+          *) echo "GitHub returned HTTP $status while checking the release tag." >&2; exit 1 ;;
+        esac

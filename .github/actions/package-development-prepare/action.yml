@@ -1,0 +1,218 @@
+name: Prepare NuGet development package
+description: Calculate, validate, build, pack, collision-check and upload a development NuGet package from the caller repository.
+inputs:
+  project-path:
+    description: Repository-relative path to the SDK-style package project.
+    required: true
+  package-id:
+    description: Expected NuGet package ID from the project metadata.
+    required: true
+  package-visibility:
+    description: Package registry visibility; must be public or private.
+    required: true
+  nuget-user:
+    description: NuGet.org profile name; required only for public packages.
+    required: false
+    default: ''
+outputs:
+  package-artifact:
+    description: Repository-relative path of the packed .nupkg inside the workflow artifact.
+    value: ${{ steps.version-state.outputs.package-artifact }}
+  package-version:
+    description: Calculated development package version.
+    value: ${{ steps.version-state.outputs.package-version }}
+  calculated-state:
+    description: Complete calculated state used for publication race rechecks.
+    value: ${{ steps.version-state.outputs.calculated-state }}
+  tag-state-fingerprint:
+    description: Fingerprint of the package tag state.
+    value: ${{ steps.version-state.outputs.tag-state-fingerprint }}
+runs:
+  using: composite
+  steps:
+    - name: Validate and export package inputs
+      shell: bash
+      env:
+        INPUT_PROJECT_PATH: ${{ inputs.project-path }}
+        INPUT_PACKAGE_ID: ${{ inputs.package-id }}
+        INPUT_PACKAGE_VISIBILITY: ${{ inputs.package-visibility }}
+        INPUT_NUGET_USER: ${{ inputs.nuget-user }}
+      run: |
+        set -euo pipefail
+        if [[ "$INPUT_PROJECT_PATH" == *$'\n'* || "$INPUT_PROJECT_PATH" == *$'\r'* ]]; then
+          echo "project-path must not contain newlines." >&2
+          exit 1
+        fi
+        if [[ ! "$INPUT_PACKAGE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          echo "package-id has an invalid format." >&2
+          exit 1
+        fi
+        case "$INPUT_PACKAGE_VISIBILITY" in
+          public|private) ;;
+          *) echo "package-visibility must be public or private." >&2; exit 1 ;;
+        esac
+        if [[ "$INPUT_PACKAGE_VISIBILITY" == public && ! "$INPUT_NUGET_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+          echo "nuget-user is required for public publishing and has an invalid format." >&2
+          exit 1
+        fi
+        {
+          printf 'PROJECT_PATH=%s\n' "$INPUT_PROJECT_PATH"
+          printf 'EXPECTED_PACKAGE_ID=%s\n' "$INPUT_PACKAGE_ID"
+          printf 'PACKAGE_VISIBILITY=%s\n' "$INPUT_PACKAGE_VISIBILITY"
+          printf 'NUGET_USER=%s\n' "$INPUT_NUGET_USER"
+        } >> "$GITHUB_ENV"
+    - name: Checkout caller repository
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      with:
+        persist-credentials: false
+
+    - name: Set up .NET
+      uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Validate caller inputs and development package metadata
+      id: metadata
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -z "$PROJECT_PATH" || "$PROJECT_PATH" == /* || "$PROJECT_PATH" == *\\* || "$PROJECT_PATH" == *"//"* || "$PROJECT_PATH" == . || "$PROJECT_PATH" == ../* || "$PROJECT_PATH" == */.. || "$PROJECT_PATH" == */../* || "$PROJECT_PATH" == *"/./"* || "$PROJECT_PATH" != *.csproj ]]; then
+          echo "project-path must be a repository-relative .csproj path without traversal." >&2
+          exit 1
+        fi
+        if [[ ! -f "$PROJECT_PATH" ]]; then
+          echo "project-path does not identify a file in the caller repository." >&2
+          exit 1
+        fi
+        if [[ ! "$EXPECTED_PACKAGE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          echo "package-id has an invalid format." >&2
+          exit 1
+        fi
+        case "$PACKAGE_VISIBILITY" in
+          public|private) ;;
+          *) echo "package-visibility must be public or private." >&2; exit 1 ;;
+        esac
+        if [[ "$PACKAGE_VISIBILITY" == public && ! "$NUGET_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+          echo "nuget-user is required for public publishing and has an invalid format." >&2
+          exit 1
+        fi
+        package_id=$(dotnet msbuild "$PROJECT_PATH" -nologo -getProperty:PackageId)
+        compatibility_line=$(dotnet msbuild "$PROJECT_PATH" -nologo -getProperty:Version)
+        if [[ "$package_id" != "$EXPECTED_PACKAGE_ID" ]]; then
+          echo "package-id does not match the caller project PackageId." >&2
+          exit 1
+        fi
+        if [[ ! "$compatibility_line" =~ ^3\.(0|[1-9][0-9]*)$ ]]; then
+          echo "the caller project Version must be exactly 3.X, with numeric X and no leading zero." >&2
+          exit 1
+        fi
+        printf 'package-id=%s\ncompatibility-line=%s\n' "$package_id" "$compatibility_line" >> "$GITHUB_OUTPUT"
+
+    - name: Calculate package version and tag state
+      id: version-state
+      shell: bash
+      env:
+        PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
+        COMPATIBILITY_LINE: ${{ steps.metadata.outputs.compatibility-line }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        response_file=$(mktemp)
+        tag_object_file=$(mktemp)
+        trap 'rm -f "$response_file" "$tag_object_file"' EXIT
+        fetch_tag_rows() {
+          local page=1 count status
+          while :; do
+            if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$PACKAGE_ID/?per_page=100&page=$page"); then echo "Could not fetch caller-repository package tag refs." >&2; return 1; fi
+            if [[ "$status" != 200 ]] || ! jq -e 'type == "array" and all(.[]; (.ref | type == "string") and (.object | type == "object") and (.object.type | type == "string") and (.object.sha | type == "string"))' "$response_file" > /dev/null; then echo "GitHub returned a malformed package tag-ref response." >&2; return 1; fi
+            jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file"
+            count=$(jq -er 'length' "$response_file")
+            if (( count < 100 )); then return 0; fi
+            ((page += 1))
+          done
+        }
+        resolve_commit() {
+          local object_type=$1 object_sha=$2 status depth=0
+          while :; do
+            case "$object_type" in
+              commit) printf '%s' "$object_sha"; return 0 ;;
+              tag)
+                ((depth += 1))
+                if (( depth > 16 )) || ! status=$(curl --silent --show-error --location --output "$tag_object_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$object_sha"); then echo "Could not resolve an annotated package tag." >&2; return 1; fi
+                if [[ "$status" != 200 ]] || ! object_type=$(jq -er '.object.type | strings' "$tag_object_file") || ! object_sha=$(jq -er '.object.sha | strings' "$tag_object_file"); then echo "GitHub returned a malformed annotated package-tag response." >&2; return 1; fi
+                ;;
+              *) echo "Package tag ref does not resolve to a commit." >&2; return 1 ;;
+            esac
+          done
+        }
+        increment_decimal() {
+          local value=$1 result='' digit carry=1 i
+          for ((i=${#value}-1; i>=0; i--)); do digit=${value:i:1}; if (( carry )); then if [[ "$digit" == 9 ]]; then digit=0; else digit=$((10#$digit + 1)); carry=0; fi; fi; result="$digit$result"; done
+          if (( carry )); then result="1$result"; fi
+          printf '%s' "$result"
+        }
+        tag_rows=$(fetch_tag_rows)
+        tag_prefix="refs/tags/${PACKAGE_ID}/"
+        max_patch=''
+        tag_snapshot=''
+        while IFS=$'\t' read -r ref object_type object_sha; do
+          [[ -z "$ref" ]] && continue
+          if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
+          tag_leaf=${ref#"$tag_prefix"}
+          if [[ ! "$tag_leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+          tag_line="3.${BASH_REMATCH[1]}"
+          tag_patch=${BASH_REMATCH[2]}
+          tag_commit=$(resolve_commit "$object_type" "$object_sha")
+          tag_snapshot+="${ref}=${object_sha}"$'\n'
+          if [[ "$tag_line" == "$COMPATIBILITY_LINE" ]] && { [[ -z "$max_patch" ]] || (( ${#tag_patch} > ${#max_patch} )) || { (( ${#tag_patch} == ${#max_patch} )) && [[ "$tag_patch" > "$max_patch" ]]; }; }; then max_patch=$tag_patch; fi
+        done <<< "$tag_rows"
+        if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi
+        base_version="${COMPATIBILITY_LINE}.${patch}"
+        package_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
+        tag_snapshot=$(printf '%s' "$tag_snapshot" | sort)
+        tag_state_fingerprint=$(printf '%s' "$tag_snapshot" | sha256sum | cut -d ' ' -f1)
+        tag_state=$(printf '%s' "$tag_snapshot" | base64 --wrap=0)
+        calculated_state="package-id=${PACKAGE_ID};compatibility-line=${COMPATIBILITY_LINE};base-version=${base_version};package-version=${package_version};release-tag=${PACKAGE_ID}/v${base_version};tag-state=${tag_state}"
+        package_artifact="artifacts/${PACKAGE_ID}.${package_version}.nupkg"
+        printf 'base-version=%s\npackage-version=%s\npackage-artifact=%s\ncalculated-state=%s\ntag-state-fingerprint=%s\n' "$base_version" "$package_version" "$package_artifact" "$calculated_state" "$tag_state_fingerprint" >> "$GITHUB_OUTPUT"
+
+    - name: Verify public package version is unpublished
+      if: inputs.package-visibility == 'public'
+      shell: bash
+      env:
+        PACKAGE_VERSION: ${{ steps.version-state.outputs.package-version }}
+      run: |
+        set -euo pipefail
+        response_file=$(mktemp)
+        package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/index.json"); then echo "Could not check whether the public package version already exists." >&2; exit 1; fi
+        case "$status" in
+          200)
+            if ! jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null; then echo "NuGet.org returned a malformed package-version response." >&2; exit 1; fi
+            if jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then echo "Package version already exists; refusing to overwrite." >&2; exit 1; fi
+            ;;
+          404) ;;
+          *) echo "NuGet.org returned HTTP $status while checking package publication." >&2; exit 1 ;;
+        esac
+
+    - name: Restore with NuGet audit
+      shell: bash
+      run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
+
+    - name: Build
+      shell: bash
+      run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
+
+    - name: Pack calculated development version
+      shell: bash
+      env:
+        CALCULATED_VERSION: ${{ steps.version-state.outputs.package-version }}
+      run: dotnet pack "$PROJECT_PATH" --configuration Release --no-restore --output artifacts -p:RepositoryCommit="$GITHUB_SHA" -p:PackageVersion="$CALCULATED_VERSION"
+
+    - name: Upload exact package artifact
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      with:
+        name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.version-state.outputs.package-artifact }}
+        if-no-files-found: error
