@@ -188,7 +188,7 @@ jobs:
 
       - name: Restore with NuGet audit
         shell: bash
-        run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors="NU1904;NU1903" -p:WarningsNotAsErrors="NU1901;NU1902"
+        run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
 
       - name: Build
         shell: bash

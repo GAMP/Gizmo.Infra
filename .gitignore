@@ -1,7 +1,6 @@
-bin/
-obj/
-artifacts/
-TestResults/
-*.user
-.opencode/
+*/bin/
+*/obj/
 .tasks/
+opencode*
+.opencode/
+AGENTS.md
