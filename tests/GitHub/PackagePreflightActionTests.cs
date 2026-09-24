@@ -13,8 +13,9 @@ namespace Gizmo.Infra.Tests.GitHub;
 ///
 /// Executable tests run the action's own extracted bash and Node blocks against a
 /// real working tree, so the committed source, not a hand copy, is under test.
-/// Network, jq, and GitHub are unavailable locally, so the visibility request is
-/// exercised through its exact command text plus a curl test double.
+/// Network and GitHub are unavailable locally, so the visibility transport is
+/// exercised through its exact command text plus a curl test double, and the
+/// visibility parsing block runs its committed jq filter through a Node jq shim.
 /// </summary>
 public sealed class PackagePreflightActionTests
 {
@@ -173,7 +174,7 @@ public sealed class PackagePreflightActionTests
         Assert.Contains("git check-ref-format --branch \"$development_branch\"", Action, StringComparison.Ordinal);
         Assert.Contains("git check-ref-format --branch \"$release_branch\"", Action, StringComparison.Ordinal);
         Assert.Contains(
-            @"printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\npackage-visibility=%s\nbranch-role=%s\n'",
+            @"printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\nrepository-visibility=%s\nbranch-role=%s\n'",
             Action,
             StringComparison.Ordinal);
     }
@@ -216,12 +217,13 @@ public sealed class PackagePreflightActionTests
     }
 
     [Fact]
-    public void Visibility_ParsesOnlyAStringVisibilityFromAnObject()
+    public void Visibility_DeclaresTheFailClosedStringTypeFilter()
     {
-        Assert.Contains(
-            "if ! package_visibility=$(jq -er 'if type == \"object\" and (.visibility | type == \"string\") then .visibility else error(\"missing visibility\") end' \"$response_file\"); then",
-            Action,
-            StringComparison.Ordinal);
+        // The executable tests below run this filter through the jq shim; pinning
+        // the committed text keeps a weakened filter from being masked by it.
+        Assert.Equal(
+            "if type == \"object\" and (.visibility | type == \"string\") then .visibility else error(\"missing visibility\") end",
+            VisibilityJqFilter());
         Assert.Contains("fail \"GitHub returned malformed caller repository metadata.\"", Action, StringComparison.Ordinal);
     }
 
@@ -265,9 +267,9 @@ public sealed class PackagePreflightActionTests
     [InlineData("public")]
     [InlineData("private")]
     [InlineData("internal")]
-    public void Visibility_AcceptsOnlyKnownVisibilityValues(string value)
+    public void Visibility_AcceptsOnlyKnownVisibilityFromParsedMetadata(string value)
     {
-        var result = RunVisibilityValue(value);
+        var result = RunVisibilityParsing($"{{\"visibility\":\"{value}\"}}");
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal("accepted", result.StandardOutput);
@@ -279,13 +281,36 @@ public sealed class PackagePreflightActionTests
     [InlineData("")]
     public void Visibility_FailsClosedOnUnknownVisibilityValues(string value)
     {
-        var result = RunVisibilityValue(value);
+        var result = RunVisibilityParsing($"{{\"visibility\":\"{value}\"}}");
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains(
             "GitHub returned an unsupported caller repository visibility.",
             result.StandardError,
             StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("{}")]                              // object without visibility
+    [InlineData("{\"visibility\":null}")]           // explicit null
+    [InlineData("{\"visibility\":123}")]            // non-string number
+    [InlineData("{\"visibility\":true}")]           // non-string boolean
+    [InlineData("{\"visibility\":[\"public\"]}")]   // non-string array
+    [InlineData("[]")]                              // non-object array
+    [InlineData("\"public\"")]                      // non-object string
+    [InlineData("null")]                            // non-object null
+    [InlineData("{")]                               // malformed JSON
+    [InlineData("not json")]                        // malformed JSON
+    public void Visibility_FailsClosedOnMissingNonStringOrNonObjectMetadata(string responseBody)
+    {
+        var result = RunVisibilityParsing(responseBody);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(
+            "GitHub returned malformed caller repository metadata.",
+            result.StandardError,
+            StringComparison.Ordinal);
+        Assert.Empty(result.StandardOutput);
     }
 
     [Fact]
@@ -336,7 +361,7 @@ public sealed class PackagePreflightActionTests
                 .OrderBy(name => name, StringComparer.Ordinal)
                 .ToArray());
         Assert.Equal(
-            new[] { "branch-role", "compatibility-line", "package-id", "package-visibility", "project-path" },
+            new[] { "branch-role", "compatibility-line", "package-id", "project-path", "repository-visibility" },
             MappingKeys(YamlWorkflowReader.MappingChild(root, "outputs"))
                 .OrderBy(name => name, StringComparer.Ordinal)
                 .ToArray());
@@ -372,7 +397,7 @@ public sealed class PackagePreflightActionTests
             // require-nuget-user may reappear before a routing contract exists.
             foreach (var forbidden in new[]
                      {
-                         "project-path", "package-id", "package-visibility",
+                         "project-path", "package-id", "package-visibility", "repository-visibility",
                          "nuget-user", "require-nuget-user",
                      })
             {
@@ -424,16 +449,28 @@ public sealed class PackagePreflightActionTests
         return WorkflowShell.RunBash(script, Path.GetTempPath());
     }
 
-    private static ShellResult RunVisibilityValue(string value)
+    private static ShellResult RunVisibilityParsing(string responseBody)
     {
-        var caseBlock = WorkflowShell.ExtractBlock(Action, "case \"$package_visibility\" in", "esac");
+        using var repository = new TempRepository();
+        repository.WriteFile("response.json", responseBody);
+        var shim = JqShim.BashFunction(repository.WriteFile("jq.js", JqShim.JavaScript));
+        var parsing = WorkflowShell.ExtractBlock(Action, "if ! repository_visibility=$(jq", "esac");
         var script =
             "set -euo pipefail\n"
             + "fail() { echo \"$1\" >&2; exit 1; }\n"
-            + $"package_visibility='{value}'\n"
-            + caseBlock
+            + shim
+            + "\nresponse_file=response.json\n"
+            + parsing
             + "\nprintf 'accepted'\n";
-        return WorkflowShell.RunBash(script, Path.GetTempPath());
+        return WorkflowShell.RunBash(script, repository.Root);
+    }
+
+    private static string VisibilityJqFilter()
+    {
+        var block = WorkflowShell.ExtractBlock(Action, "if ! repository_visibility=$(jq", "esac");
+        var match = Regex.Match(block, @"jq -er '(?<filter>[^']*)'", RegexOptions.CultureInvariant);
+        Assert.True(match.Success, "the visibility block has no jq -er filter.");
+        return match.Groups["filter"].Value;
     }
 
     private static string DiscoveryScript()

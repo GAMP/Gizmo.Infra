@@ -20,9 +20,9 @@ outputs:
   compatibility-line:
     description: Evaluated Version compatibility line from the discovered project.
     value: ${{ steps.discover.outputs.compatibility-line }}
-  package-visibility:
+  repository-visibility:
     description: Authenticated caller repository visibility.
-    value: ${{ steps.discover.outputs.package-visibility }}
+    value: ${{ steps.discover.outputs.repository-visibility }}
   branch-role:
     description: "Resolved caller branch role: development, release, or none."
     value: ${{ steps.discover.outputs.branch-role }}
@@ -80,10 +80,10 @@ runs:
           fail "Could not fetch authenticated caller repository metadata."
         fi
         [[ "$status" == 200 ]] || fail "GitHub returned HTTP $status for caller repository metadata."
-        if ! package_visibility=$(jq -er 'if type == "object" and (.visibility | type == "string") then .visibility else error("missing visibility") end' "$response_file"); then
+        if ! repository_visibility=$(jq -er 'if type == "object" and (.visibility | type == "string") then .visibility else error("missing visibility") end' "$response_file"); then
           fail "GitHub returned malformed caller repository metadata."
         fi
-        case "$package_visibility" in
+        case "$repository_visibility" in
           public|private|internal) ;;
           *) fail "GitHub returned an unsupported caller repository visibility." ;;
         esac
@@ -133,4 +133,4 @@ runs:
           branch_role=release
         fi
 
-        printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\npackage-visibility=%s\nbranch-role=%s\n' "$project_path" "$package_id" "$compatibility_line" "$package_visibility" "$branch_role" >> "$GITHUB_OUTPUT"
+        printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\nrepository-visibility=%s\nbranch-role=%s\n' "$project_path" "$package_id" "$compatibility_line" "$repository_visibility" "$branch_role" >> "$GITHUB_OUTPUT"

@@ -129,8 +129,8 @@ public sealed class ReusableWorkflowContractTests
             foreach (var forbidden in new[]
                      {
                          "version", "package-version", "version-override", "patch", "prerelease",
-                         "project-path", "package-id", "package-visibility", "nuget-user",
-                         "require-nuget-user",
+                         "project-path", "package-id", "package-visibility", "repository-visibility",
+                         "nuget-user", "require-nuget-user",
                      })
             {
                 Assert.DoesNotContain($"inputs.{forbidden}", Read(file), StringComparison.Ordinal);
@@ -146,9 +146,10 @@ public sealed class ReusableWorkflowContractTests
             var content = Read(file);
 
             // The preflight resolves visibility, but the workflow must not read it
-            // to pick a registry, gate a job, or branch a step; the caller input is
-            // gone entirely.
+            // to pick a registry, gate a job, or branch a step; the old caller
+            // input is gone and the renamed output is not consumed either.
             Assert.DoesNotContain("package-visibility", content, StringComparison.Ordinal);
+            Assert.DoesNotContain("repository-visibility", content, StringComparison.Ordinal);
             Assert.DoesNotContain("github.event.repository.visibility", content, StringComparison.Ordinal);
         }
 
@@ -374,27 +375,37 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void ImmutableInfraSource_IsResolvedFromCallerIndependentJobContexts()
+    public void ImmutableInfraSource_ValidatesJobWorkflowRefAndShaAlignment()
     {
         foreach (var file in ContractFiles)
         {
             var content = Read(file);
             var build = BuildJob(Parse(file), file);
 
-            // github.workflow_ref describes the caller's workflow, not this
-            // reusable workflow, so it cannot pin the Gizmo.Infra source commit.
+            // github.workflow_* describes the caller's workflow, not this called
+            // reusable workflow, so only job.workflow_* can pin the source commit.
             Assert.DoesNotContain("github.workflow_ref", content, StringComparison.Ordinal);
             Assert.DoesNotContain("github.workflow_sha", content, StringComparison.Ordinal);
 
             var guard = StepById(build, "infra-source");
             var env = YamlWorkflowReader.MappingChild(guard, "env");
             Assert.Equal("${{ job.workflow_repository }}", YamlWorkflowReader.ScalarChild(env, "WORKFLOW_REPOSITORY"));
+            Assert.Equal("${{ job.workflow_ref }}", YamlWorkflowReader.ScalarChild(env, "WORKFLOW_REF"));
             Assert.Equal("${{ job.workflow_sha }}", YamlWorkflowReader.ScalarChild(env, "WORKFLOW_SHA"));
             Assert.Equal("${{ job.workflow_file_path }}", YamlWorkflowReader.ScalarChild(env, "WORKFLOW_FILE_PATH"));
 
             var run = YamlWorkflowReader.ScalarChild(guard, "run");
             Assert.Contains("\"$WORKFLOW_REPOSITORY\" != GAMP/Gizmo.Infra", run, StringComparison.Ordinal);
             Assert.Contains($"\"$WORKFLOW_FILE_PATH\" != .github/workflows/{file}", run, StringComparison.Ordinal);
+
+            // The resolved job.workflow_sha is a commit, not proof the caller used
+            // a full SHA; job.workflow_ref's path@sha must carry the same complete
+            // 40-character commit before the source is trusted.
+            Assert.Contains($"expected_workflow_ref=\"GAMP/Gizmo.Infra/.github/workflows/{file}@\"", run, StringComparison.Ordinal);
+            Assert.Contains("workflow_ref_sha=${WORKFLOW_REF#\"$expected_workflow_ref\"}", run, StringComparison.Ordinal);
+            Assert.Contains("\"$workflow_ref_sha\" == \"$WORKFLOW_REF\"", run, StringComparison.Ordinal);
+            Assert.Contains("[[ ! \"$workflow_ref_sha\" =~ ^[0-9a-f]{40}$ ]]", run, StringComparison.Ordinal);
+            Assert.Contains("\"$workflow_ref_sha\" != \"$WORKFLOW_SHA\"", run, StringComparison.Ordinal);
             Assert.Contains("[[ ! \"$WORKFLOW_SHA\" =~ ^[0-9a-f]{40}$ ]]", run, StringComparison.Ordinal);
             Assert.Contains("printf 'repository=%s\\nref=%s\\n'", run, StringComparison.Ordinal);
 

@@ -32,17 +32,20 @@ jobs:
         with:
           dotnet-version: 11.0.x
 
-      - name: Resolve immutable Gizmo.Infra action source
+      - name: Validate immutable Gizmo.Infra workflow identity
         id: infra-source
         shell: bash
         env:
           WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
           WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         run: |
           set -euo pipefail
-          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-development.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "GitHub did not resolve this reusable workflow to the expected immutable Gizmo.Infra source." >&2
+          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package-development.yml@"
+          workflow_ref_sha=${WORKFLOW_REF#"$expected_workflow_ref"}
+          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-development.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
+            echo "The reusable workflow must be called from the expected Gizmo.Infra file with a complete immutable commit SHA." >&2
             exit 1
           fi
           printf 'repository=%s\nref=%s\n' "$WORKFLOW_REPOSITORY" "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"

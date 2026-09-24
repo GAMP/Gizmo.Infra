@@ -297,6 +297,7 @@ public static class WorkflowShell
         {
             var startInfo = new ProcessStartInfo(executable)
             {
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -308,6 +309,11 @@ public static class WorkflowShell
             {
                 return false;
             }
+
+            // Close stdin before probing: a headless test host has no console
+            // stdin, and Git Bash can block on the inherited handle instead of
+            // exiting, hanging the whole suite before any test runs.
+            process.StandardInput.Close();
 
             var stdout = process.StandardOutput.ReadToEnd();
             process.StandardError.ReadToEnd();

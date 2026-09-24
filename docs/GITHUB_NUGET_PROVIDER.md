@@ -51,20 +51,25 @@ or package visibility.
 
 The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
 authenticated repository metadata with bounded connect and total request
-timeouts. Only `public`, `private`, and `internal` visibility values are
-accepted; transport failures, timeouts, non-success responses, malformed
-metadata, and unknown values fail closed. It never reads
+timeouts, then emits the `repository-visibility` output. Only `public`,
+`private`, and `internal` visibility values are accepted; transport failures,
+timeouts, non-success responses, malformed metadata, and unknown values fail
+closed. It never reads
 `github.event.repository.visibility`. This release only discovers and validates
 visibility; it does not introduce registry-routing behavior. Consequently, the
 public/private collision, publication, and release-tag jobs are disabled until a
 separate routing contract is authorized.
 
-The reusable workflow obtains its own repository, file path, and resolved commit
-SHA from the caller-independent `job.workflow_*` contexts, validates that source,
-checks out that exact commit into `.gizmo-infra`, and runs the bundled preflight
-action there; it never assumes a caller-local `./.github/actions` path belongs to
-Gizmo.Infra. Repository visibility discovery is diagnostic and fail-closed only;
-it does not select a collision check or publishing registry.
+The reusable workflow validates its own repository and file path through the
+caller-independent `job.workflow_*` contexts. It validates `job.workflow_ref` as
+the expected workflow identity ending in the same complete 40-character commit
+SHA reported by `job.workflow_sha`, then checks out that exact commit into
+`.gizmo-infra` and runs the bundled preflight action there; it never assumes a
+caller-local `./.github/actions` path belongs to Gizmo.Infra. `job.workflow_sha`
+alone is a resolved commit and cannot establish that a caller used a full SHA;
+the original `job.workflow_ref` check enforces that invariant. Repository
+visibility discovery is diagnostic and fail-closed only; it does not select a
+collision check or publishing registry.
 
 Callers grant permissions on the calling job; a called workflow cannot elevate
 them. Do not use `secrets: inherit`, pass an API key, or create a

@@ -150,6 +150,7 @@ public sealed class GitHubNugetProviderDocsTests
             "uses the caller `GITHUB_TOKEN` and `github.repository` to read authenticated repository metadata",
             doc,
             StringComparison.Ordinal);
+        Assert.Contains("then emits the `repository-visibility` output", doc, StringComparison.Ordinal);
         Assert.Contains("Only `public`, `private`, and `internal` visibility values are accepted", doc, StringComparison.Ordinal);
         Assert.Contains(
             "transport failures, timeouts, non-success responses, malformed metadata, and unknown values fail closed",
@@ -169,7 +170,11 @@ public sealed class GitHubNugetProviderDocsTests
         var doc = ProviderDoc();
 
         Assert.Contains(
-            "obtains its own repository, file path, and resolved commit SHA from the caller-independent `job.workflow_*` contexts",
+            "validates its own repository and file path through the caller-independent `job.workflow_*` contexts",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "validates `job.workflow_ref` as the expected workflow identity ending in the same complete 40-character commit SHA reported by `job.workflow_sha`",
             doc,
             StringComparison.Ordinal);
         Assert.Contains("checks out that exact commit into `.gizmo-infra`", doc, StringComparison.Ordinal);
@@ -177,6 +182,11 @@ public sealed class GitHubNugetProviderDocsTests
             "never assumes a caller-local `./.github/actions` path belongs to Gizmo.Infra",
             doc,
             StringComparison.Ordinal);
+        Assert.Contains(
+            "`job.workflow_sha` alone is a resolved commit and cannot establish that a caller used a full SHA",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains("the original `job.workflow_ref` check enforces that invariant", doc, StringComparison.Ordinal);
         Assert.Contains(
             "Repository visibility discovery is diagnostic and fail-closed only; it does not select a collision check or publishing registry.",
             doc,
