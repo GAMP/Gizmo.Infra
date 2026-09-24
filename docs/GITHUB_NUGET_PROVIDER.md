@@ -12,8 +12,8 @@ no mode, descriptor version, workflow version, or equivalent version input.
 | Workflow | Purpose | Caller permissions |
 | --- | --- | --- |
 | `.github/workflows/package-validation.yml` | Calculate, restore, audit, build, pack, and retain a nonpublished validation package. It cannot publish or tag. | `contents: read` |
-| `.github/workflows/package-development.yml` | Calculate and publish a development package after fail-closed state and collision checks. | public: `contents: read`, `id-token: write`; private: `contents: read`, `packages: write` |
-| `.github/workflows/package-release.yml` | Calculate and publish a stable package, then create or reconcile its immutable package-qualified tag. | public: `contents: write`, `id-token: write`; private: `contents: write`, `packages: write` |
+| `.github/workflows/package-development.yml` | Calculate, build, pack, and retain a nonpublished development package. | `contents: read` |
+| `.github/workflows/package-release.yml` | Calculate, build, pack, and retain a nonpublished stable package. | `contents: read` |
 
 Every caller must use an immutable, complete 40-character Gizmo.Infra commit
 SHA. A branch, tag, abbreviated SHA, or expression is not an acceptable
@@ -25,41 +25,58 @@ permissions:
 
 jobs:
   validate-package:
-    uses: gizmo/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>
-    with:
-      project-path: src/Gizmo.Widget/Gizmo.Widget.csproj
-      package-id: Gizmo.Widget
-      package-visibility: public
+    uses: GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>
 ```
 
-All workflows require `project-path`, `package-id`, and `package-visibility`.
-Publishing workflows additionally accept `nuget-user` only for a public
-package. `project-path` is a caller-repository-relative `.csproj` path without
-traversal; `package-id` must match evaluated project `PackageId`; and visibility
-is exactly `public` or `private`. Public `nuget-user` is a NuGet.org profile
-identifier, not an email address or secret. Inputs, paths, metadata, visibility,
-and public user identifiers fail closed before restore, pack, or publication.
+Every caller contains `.github/package.yml` with exactly its branch deployment
+configuration:
+
+```yaml
+branches:
+  development: version-3
+  release: release
+```
+
+The branch names must be distinct valid Git branch names. The preflight resolves
+the caller ref to `development`, `release`, or `none`; non-branch refs and
+branches not named by this file resolve to `none`.
+
+The workflows deterministically discover exactly one SDK-style packable
+`.csproj` from the caller workspace and read `PackageId`, `Version`, and
+`IsPackable` through MSBuild. Zero or multiple candidates, non-packable or
+non-SDK-style projects, invalid project metadata, or invalid package
+configuration fail closed. The evaluated project `Version` remains the `3.X`
+compatibility line; callers do not supply a project path, package ID, version,
+or package visibility.
+
+The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
+authenticated repository metadata with bounded connect and total request
+timeouts. Only `public`, `private`, and `internal` visibility values are
+accepted; transport failures, timeouts, non-success responses, malformed
+metadata, and unknown values fail closed. It never reads
+`github.event.repository.visibility`. This release only discovers and validates
+visibility; it does not introduce registry-routing behavior. Consequently, the
+public/private collision, publication, and release-tag jobs are disabled until a
+separate routing contract is authorized.
+
+The reusable workflow obtains its own repository, file path, and resolved commit
+SHA from the caller-independent `job.workflow_*` contexts, validates that source,
+checks out that exact commit into `.gizmo-infra`, and runs the bundled preflight
+action there; it never assumes a caller-local `./.github/actions` path belongs to
+Gizmo.Infra. Repository visibility discovery is diagnostic and fail-closed only;
+it does not select a collision check or publishing registry.
 
 Callers grant permissions on the calling job; a called workflow cannot elevate
 them. Do not use `secrets: inherit`, pass an API key, or create a
-`NUGET_API_KEY` secret. Public publishing uses caller-bound GitHub OIDC and
-exchanges it for a short-lived NuGet credential only in memory. Private
-publishing uses only the calling job's `GITHUB_TOKEN` for its GitHub Packages
-feed.
+`NUGET_API_KEY` secret. The active workflows do not request publication
+credentials or publish to either registry.
 
 ## Publisher invocation trust boundary
 
-The development and release publisher jobs (`publish-public`, `publish-private`,
-and the release `tag` job) run only for a trusted caller invocation. Each
-publisher job requires the caller event to be `push` or `workflow_dispatch`, the
-`github.ref` to be a branch ref (`refs/heads/`), and GitHub to report
-`github.ref_protected` as true for that ref. Callers must configure branch
-protection or a ruleset on every branch allowed to publish. `pull_request`,
-`pull_request_target`, `workflow_run`, tag refs, and unprotected branches are
-therefore denied: the publisher jobs are skipped before they can download the
-package artifact or obtain OIDC or package credentials. The check is enforced
-with supported `github` contexts in the publisher job `if` conditions; it is
-not prose-only. Validation does not publish and applies no such boundary.
+The public/private collision, publisher, and release-tag jobs remain disabled.
+They do not obtain OIDC or package credentials, download artifacts, contact a
+package feed, or create tags. A separate routing contract must restore an
+operation-specific publisher path and its protected-branch trust boundary.
 
 ## Automatic versioning
 
@@ -90,47 +107,21 @@ ambiguous and fail closed. A claimed calculated tag on another commit, a
 malformed tag response, or a changed tag state is a failure; the workflow never
 moves or overwrites a tag.
 
-The build job emits package version, complete calculated state, and a
-tag-state fingerprint. Immediately before every publication—and before release
-tagging—the workflow refetches, validates, and fingerprints the caller tag
-state and rechecks the target feed version. The publication and tagging rechecks
-paginate the same complete tag prefix and resolve annotated tags to their
-commit, matching the build job's tag-state logic rather than a partial page. A
-fingerprint/state drift or a package/tag collision fails closed. This is both an
-external-race check and the release rerun safety boundary.
+The build job emits package version, complete calculated state, and a tag-state
+fingerprint. The inactive publisher and tag jobs retain their fail-closed
+rechecks but do not run until a routing contract authorizes them.
 
-Development and release (and validation for the same package) use native
-per-package concurrency `nuget-${{ github.repository }}-${{ inputs.package-id }}`
-with `cancel-in-progress: false`. It never cancels running work. GitHub does
-not guarantee FIFO: the latest pending run may replace an earlier pending run,
-so this is not a durable queue.
+Development, release, and validation use a shared caller-repository concurrency
+group `nuget-${{ github.repository }}` with `cancel-in-progress: false`. It
+never cancels running work. GitHub does not guarantee FIFO: the latest pending
+run may replace an earlier pending run, so this is not a durable queue.
 
 ## Artifacts, collision checks, and release recovery
 
 The build job packs the calculated version with the caller commit as repository
 metadata and uploads only its exact `.nupkg` path. Artifact names include both
-`github.run_id` and `github.run_attempt`; publishers download that exact name,
-never a wildcard, and never rebuild from source.
-
-Public packages check NuGet's flat-container version index. Private packages
-check the caller-owner GitHub Packages NuGet feed at
-`GITHUB_REPOSITORY_OWNER` using the caller job token; they do not use GitHub's
-package-management REST endpoints. For release, an existing stable version is
-recoverable only after reading the published package and confirming that its
-embedded repository commit equals the caller SHA; an unreadable package, a
-missing commit, or a different commit fails closed instead of creating a
-recovery tag. Existing versions, transport errors, unexpected statuses,
-malformed or empty successful responses, and a collision detected during the
-final recheck fail closed.
-
-Release creates the lightweight immutable `<package-id>/v3.X.Y` ref only after
-the stable package is known published. A previously published stable version is
-recoverable only when the published package's embedded repository commit durably
-matches the exact caller SHA; an existing version with no same-SHA provenance is
-a collision and fails closed. When a publish succeeded but tag creation failed,
-a rerun with no current-SHA tag verifies that same-SHA provenance and may create
-only the missing tag. If the tag is already at the caller SHA, it is an
-idempotent result. The workflow never force-updates, deletes, or moves a tag.
+`github.run_id` and `github.run_attempt`. No active job downloads the artifact,
+queries a package feed, publishes, or creates a release tag.
 
 All action references are pinned to full commit SHAs, checkout credentials are
 disabled, and caller-supplied strings enter shell commands only through quoted
@@ -146,15 +137,7 @@ migrate consumers or enable CPM floating-version behavior.
 
 ## Public NuGet trusted publishing
 
-Before a public publisher is enabled, configure NuGet.org Trusted Publishing
-for the exact caller repository and each applicable Gizmo.Infra reusable
-workflow identity (`package-development.yml` and/or `package-release.yml`) at
-the approved immutable Infra revision. The trust binding must identify both the
-caller repository and reusable workflow; do not use wildcard repository or
-workflow rules. The publish job requests `id-token: write` only for the public
-publisher, obtains a NuGet.org-audience OIDC token, and exchanges it at the
-documented NuGet endpoint.
-
-This is a confirmation-gated operator action. Verify NuGet.org UI and OIDC
-claim support before enabling a real publisher. This repository neither
-performs nor implies that configuration.
+Do not configure NuGet.org Trusted Publishing for these inactive publishers.
+Any future publisher is a confirmation-gated operator action and must bind the
+exact caller repository and approved immutable Gizmo.Infra revision without
+wildcards.
