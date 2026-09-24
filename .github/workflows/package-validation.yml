@@ -2,24 +2,11 @@ name: NuGet package validation
 
 on:
   workflow_call:
-    inputs:
-      project-path:
-        description: Repository-relative path to the SDK-style package project.
-        required: true
-        type: string
-      package-id:
-        description: Expected NuGet package ID from the project metadata.
-        required: true
-        type: string
-      package-visibility:
-        description: Package registry visibility; must be public or private.
-        required: true
-        type: string
 
 permissions: {}
 
 concurrency:
-  group: nuget-${{ github.repository }}-${{ inputs.package-id }}
+  group: nuget-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -32,10 +19,6 @@ jobs:
       package-version: ${{ steps.version-state.outputs.package-version }}
       calculated-state: ${{ steps.version-state.outputs.calculated-state }}
       tag-state-fingerprint: ${{ steps.version-state.outputs.tag-state-fingerprint }}
-    env:
-      PROJECT_PATH: ${{ inputs.project-path }}
-      EXPECTED_PACKAGE_ID: ${{ inputs.package-id }}
-      PACKAGE_VISIBILITY: ${{ inputs.package-visibility }}
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -45,40 +28,41 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
-          dotnet-version: 10.0.100
+          dotnet-version: 11.0.x
 
-      - name: Validate caller inputs and package metadata
-        id: metadata
+      - name: Validate immutable Gizmo.Infra workflow identity
+        id: infra-source
         shell: bash
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         run: |
           set -euo pipefail
-          if [[ -z "$PROJECT_PATH" || "$PROJECT_PATH" == /* || "$PROJECT_PATH" == *\\* || "$PROJECT_PATH" == *"//"* || "$PROJECT_PATH" == . || "$PROJECT_PATH" == ../* || "$PROJECT_PATH" == */.. || "$PROJECT_PATH" == */../* || "$PROJECT_PATH" == *"/./"* || "$PROJECT_PATH" != *.csproj ]]; then
-            echo "project-path must be a repository-relative .csproj path without traversal." >&2
+          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@"
+          workflow_ref_sha=${WORKFLOW_REF#"$expected_workflow_ref"}
+          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-validation.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
+            echo "The reusable workflow must be called from the expected Gizmo.Infra file with a complete immutable commit SHA." >&2
             exit 1
           fi
-          if [[ ! -f "$PROJECT_PATH" ]]; then
-            echo "project-path does not identify a file in the caller repository." >&2
-            exit 1
-          fi
-          if [[ ! "$EXPECTED_PACKAGE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            echo "package-id has an invalid format." >&2
-            exit 1
-          fi
-          case "$PACKAGE_VISIBILITY" in
-            public|private) ;;
-            *) echo "package-visibility must be public or private." >&2; exit 1 ;;
-          esac
-          package_id=$(dotnet msbuild "$PROJECT_PATH" -nologo -getProperty:PackageId)
-          compatibility_line=$(dotnet msbuild "$PROJECT_PATH" -nologo -getProperty:Version)
-          if [[ "$package_id" != "$EXPECTED_PACKAGE_ID" ]]; then
-            echo "package-id does not match the caller project PackageId." >&2
-            exit 1
-          fi
-          if [[ ! "$compatibility_line" =~ ^3\.(0|[1-9][0-9]*)$ ]]; then
-            echo "the caller project Version must be exactly 3.X, with numeric X and no leading zero." >&2
-            exit 1
-          fi
-          printf 'package-id=%s\ncompatibility-line=%s\n' "$package_id" "$compatibility_line" >> "$GITHUB_OUTPUT"
+          printf 'repository=%s\nref=%s\n' "$WORKFLOW_REPOSITORY" "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout immutable Gizmo.Infra action source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ steps.infra-source.outputs.repository }}
+          ref: ${{ steps.infra-source.outputs.ref }}
+          path: .gizmo-infra
+          persist-credentials: false
+
+      - name: Discover caller package metadata
+        id: metadata
+        uses: ./.gizmo-infra/.github/actions/package-preflight
+        with:
+          caller-repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          current-ref: ${{ github.ref }}
 
       - name: Calculate package version and tag state
         id: version-state
@@ -86,6 +70,7 @@ jobs:
         env:
           PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
           COMPATIBILITY_LINE: ${{ steps.metadata.outputs.compatibility-line }}
+          PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -188,16 +173,21 @@ jobs:
 
       - name: Restore with NuGet audit
         shell: bash
+        env:
+          PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
 
       - name: Build
         shell: bash
+        env:
+          PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
 
       - name: Pack calculated validation version
         shell: bash
         env:
           CALCULATED_VERSION: ${{ steps.version-state.outputs.package-version }}
+          PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet pack "$PROJECT_PATH" --configuration Release --no-restore --output artifacts -p:RepositoryCommit="$GITHUB_SHA" -p:PackageVersion="$CALCULATED_VERSION"
 
       - name: Upload exact package artifact

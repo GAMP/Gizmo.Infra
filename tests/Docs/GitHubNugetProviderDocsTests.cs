@@ -45,7 +45,7 @@ public sealed class GitHubNugetProviderDocsTests
             doc,
             StringComparison.Ordinal);
         Assert.Contains(
-            "gizmo/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>",
+            "GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>",
             doc,
             StringComparison.Ordinal);
     }
@@ -100,7 +100,7 @@ public sealed class GitHubNugetProviderDocsTests
     }
 
     [Fact]
-    public void ProviderDoc_DocumentsStateFingerprintAndRechecks()
+    public void ProviderDoc_DocumentsStateFingerprintAndInactiveRechecks()
     {
         var doc = ProviderDoc();
 
@@ -108,20 +108,19 @@ public sealed class GitHubNugetProviderDocsTests
             "The build job emits package version, complete calculated state, and a tag-state fingerprint.",
             doc,
             StringComparison.Ordinal);
-        Assert.Contains("resolve annotated tags to their commit", doc, StringComparison.Ordinal);
         Assert.Contains(
-            "A fingerprint/state drift or a package/tag collision fails closed.",
+            "The inactive publisher and tag jobs retain their fail-closed rechecks but do not run until a routing contract authorizes them.",
             doc,
             StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ProviderDoc_DocumentsNonCancellingPerPackageConcurrency()
+    public void ProviderDoc_DocumentsNonCancellingCallerRepositoryConcurrency()
     {
         var doc = ProviderDoc();
 
         Assert.Contains(
-            "use native per-package concurrency `nuget-${{ github.repository }}-${{ inputs.package-id }}` with `cancel-in-progress: false`",
+            "use a shared caller-repository concurrency group `nuget-${{ github.repository }}` with `cancel-in-progress: false`",
             doc,
             StringComparison.Ordinal);
         Assert.Contains("It never cancels running work.", doc, StringComparison.Ordinal);
@@ -130,34 +129,100 @@ public sealed class GitHubNugetProviderDocsTests
     }
 
     [Fact]
-    public void ProviderDoc_DocumentsArtifactHandoffAndCollisionChecks()
+    public void ProviderDoc_DocumentsPreflightDiscoveryBranchConfigAndVisibility()
     {
         var doc = ProviderDoc();
 
-        Assert.Contains("packs the calculated version with the caller commit as repository metadata", doc, StringComparison.Ordinal);
+        Assert.Contains("`.github/package.yml` with exactly its branch deployment configuration", doc, StringComparison.Ordinal);
+        Assert.Contains("The branch names must be distinct valid Git branch names.", doc, StringComparison.Ordinal);
+        Assert.Contains("resolves the caller ref to `development`, `release`, or `none`", doc, StringComparison.Ordinal);
+        Assert.Contains("deterministically discover exactly one SDK-style packable `.csproj`", doc, StringComparison.Ordinal);
+        Assert.Contains("read `PackageId`, `Version`, and `IsPackable` through MSBuild", doc, StringComparison.Ordinal);
         Assert.Contains(
-            "Artifact names include both `github.run_id` and `github.run_attempt`; publishers download that exact name, never a wildcard, and never rebuild from source.",
+            "Zero or multiple candidates, non-packable or non-SDK-style projects, invalid project metadata, or invalid package configuration fail closed.",
             doc,
             StringComparison.Ordinal);
         Assert.Contains(
-            "Private packages check the caller-owner GitHub Packages NuGet feed at `GITHUB_REPOSITORY_OWNER`",
+            "callers do not supply a project path, package ID, version, or package visibility",
             doc,
             StringComparison.Ordinal);
-        Assert.Contains("they do not use GitHub's package-management REST endpoints.", doc, StringComparison.Ordinal);
         Assert.Contains(
-            "malformed or empty successful responses, and a collision detected during the final recheck fail closed.",
+            "uses the caller `GITHUB_TOKEN` and `github.repository` to read authenticated repository metadata",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains("then emits the `repository-visibility` output", doc, StringComparison.Ordinal);
+        Assert.Contains("Only `public`, `private`, and `internal` visibility values are accepted", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "transport failures, timeouts, non-success responses, malformed metadata, and unknown values fail closed",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains("It never reads `github.event.repository.visibility`.", doc, StringComparison.Ordinal);
+        Assert.Contains("does not introduce registry-routing behavior", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "Consequently, the public/private collision, publication, and release-tag jobs are disabled until a separate routing contract is authorized.",
             doc,
             StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ProviderDoc_DocumentsReleaseRecoveryWithoutMutation()
+    public void ProviderDoc_DocumentsImmutableJobWorkflowSourceIdentity()
     {
         var doc = ProviderDoc();
 
-        Assert.Contains("may create only the missing tag", doc, StringComparison.Ordinal);
-        Assert.Contains("If the tag is already at the caller SHA, it is an idempotent result.", doc, StringComparison.Ordinal);
-        Assert.Contains("The workflow never force-updates, deletes, or moves a tag.", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "validates its own repository and file path through the caller-independent `job.workflow_*` contexts",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "validates `job.workflow_ref` as the expected workflow identity ending in the same complete 40-character commit SHA reported by `job.workflow_sha`",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains("checks out that exact commit into `.gizmo-infra`", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "never assumes a caller-local `./.github/actions` path belongs to Gizmo.Infra",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "`job.workflow_sha` alone is a resolved commit and cannot establish that a caller used a full SHA",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains("the original `job.workflow_ref` check enforces that invariant", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "Repository visibility discovery is diagnostic and fail-closed only; it does not select a collision check or publishing registry.",
+            doc,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProviderDoc_DocumentsArtifactHandoffAndDisabledPublishers()
+    {
+        var doc = ProviderDoc();
+
+        Assert.Contains("packs the calculated version with the caller commit as repository metadata", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "Artifact names include both `github.run_id` and `github.run_attempt`.",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "No active job downloads the artifact, queries a package feed, publishes, or creates a release tag.",
+            doc,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProviderDoc_DocumentsTheDisabledPublisherTrustBoundary()
+    {
+        var doc = ProviderDoc();
+
+        Assert.Contains("The public/private collision, publisher, and release-tag jobs remain disabled.", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "They do not obtain OIDC or package credentials, download artifacts, contact a package feed, or create tags.",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "A separate routing contract must restore an operation-specific publisher path and its protected-branch trust boundary.",
+            doc,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -169,22 +234,23 @@ public sealed class GitHubNugetProviderDocsTests
             "Do not use `secrets: inherit`, pass an API key, or create a `NUGET_API_KEY` secret.",
             doc,
             StringComparison.Ordinal);
-        Assert.Contains("Public publishing uses caller-bound GitHub OIDC", doc, StringComparison.Ordinal);
-        Assert.Contains("Private publishing uses only the calling job's `GITHUB_TOKEN`", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "The active workflows do not request publication credentials or publish to either registry.",
+            doc,
+            StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ProviderDoc_RequiresCallerBoundOidcTrustedPublishing()
+    public void ProviderDoc_ForbidsTrustedPublishingForDisabledPublishers()
     {
         var doc = ProviderDoc();
 
-        Assert.Contains("configure NuGet.org Trusted Publishing", doc, StringComparison.Ordinal);
+        Assert.Contains("Do not configure NuGet.org Trusted Publishing for these inactive publishers.", doc, StringComparison.Ordinal);
+        Assert.Contains("Any future publisher is a confirmation-gated operator action", doc, StringComparison.Ordinal);
         Assert.Contains(
-            "caller repository and each applicable Gizmo.Infra reusable workflow identity",
+            "bind the exact caller repository and approved immutable Gizmo.Infra revision without wildcards",
             doc,
             StringComparison.Ordinal);
-        Assert.Contains("do not use wildcard repository or workflow rules", doc, StringComparison.Ordinal);
-        Assert.Contains("confirmation-gated operator action", doc, StringComparison.Ordinal);
     }
 
     [Fact]

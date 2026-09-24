@@ -1,0 +1,136 @@
+name: Discover NuGet package metadata
+description: Discover the caller package, validate branch configuration, and resolve caller repository visibility.
+inputs:
+  caller-repository:
+    description: Caller repository from github.repository.
+    required: true
+  github-token:
+    description: Caller workflow token used only for authenticated repository metadata lookup.
+    required: true
+  current-ref:
+    description: Caller ref from github.ref.
+    required: true
+outputs:
+  project-path:
+    description: Repository-relative path to the sole SDK-style packable project.
+    value: ${{ steps.discover.outputs.project-path }}
+  package-id:
+    description: Evaluated PackageId from the discovered project.
+    value: ${{ steps.discover.outputs.package-id }}
+  compatibility-line:
+    description: Evaluated Version compatibility line from the discovered project.
+    value: ${{ steps.discover.outputs.compatibility-line }}
+  repository-visibility:
+    description: Authenticated caller repository visibility.
+    value: ${{ steps.discover.outputs.repository-visibility }}
+  branch-role:
+    description: "Resolved caller branch role: development, release, or none."
+    value: ${{ steps.discover.outputs.branch-role }}
+runs:
+  using: composite
+  steps:
+    - name: Discover and validate caller package metadata
+      id: discover
+      shell: bash
+      env:
+        CALLER_REPOSITORY: ${{ inputs.caller-repository }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        CURRENT_REF: ${{ inputs.current-ref }}
+      run: |
+        set -euo pipefail
+        fail() {
+          echo "$1" >&2
+          exit 1
+        }
+
+        [[ "$CALLER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "github.repository is malformed."
+        [[ -n "$GH_TOKEN" ]] || fail "The caller GITHUB_TOKEN is required to read repository metadata."
+
+        candidates=()
+        while IFS= read -r -d '' project; do
+          if ! is_sdk_style=$(dotnet msbuild "$project" -nologo -getProperty:UsingMicrosoftNETSdk); then
+            fail "Could not evaluate whether a .csproj is SDK-style."
+          fi
+          if ! is_packable=$(dotnet msbuild "$project" -nologo -getProperty:IsPackable); then
+            fail "Could not evaluate IsPackable for a .csproj."
+          fi
+          if [[ "$is_sdk_style" == true && "$is_packable" == true ]]; then
+            project=${project#./}
+            [[ "$project" != *$'\n'* && "$project" != *$'\r'* ]] || fail "Discovered project path contains a newline."
+            candidates+=("$project")
+          fi
+        done < <(find . -path ./.git -prune -o -path ./.gizmo-infra -prune -o -type f -name '*.csproj' -print0 | LC_ALL=C sort -z)
+
+        case ${#candidates[@]} in
+          1) project_path=${candidates[0]} ;;
+          0) fail "Expected exactly one SDK-style packable .csproj; found none." ;;
+          *) fail "Expected exactly one SDK-style packable .csproj; found multiple candidates." ;;
+        esac
+
+        package_id=$(dotnet msbuild "$project_path" -nologo -getProperty:PackageId) || fail "Could not evaluate PackageId for the discovered project."
+        compatibility_line=$(dotnet msbuild "$project_path" -nologo -getProperty:Version) || fail "Could not evaluate Version for the discovered project."
+        is_packable=$(dotnet msbuild "$project_path" -nologo -getProperty:IsPackable) || fail "Could not re-evaluate IsPackable for the discovered project."
+        [[ "$is_packable" == true ]] || fail "The discovered project is not packable."
+        [[ "$package_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "The discovered project PackageId has an invalid format."
+        [[ "$compatibility_line" =~ ^3\.(0|[1-9][0-9]*)$ ]] || fail "The discovered project Version must be exactly 3.X, with numeric X and no leading zero."
+
+        response_file=$(mktemp)
+        trap 'rm -f "$response_file"' EXIT
+        if ! status=$(curl --silent --show-error --location --connect-timeout 10 --max-time 30 --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$CALLER_REPOSITORY"); then
+          fail "Could not fetch authenticated caller repository metadata."
+        fi
+        [[ "$status" == 200 ]] || fail "GitHub returned HTTP $status for caller repository metadata."
+        if ! repository_visibility=$(jq -er 'if type == "object" and (.visibility | type == "string") then .visibility else error("missing visibility") end' "$response_file"); then
+          fail "GitHub returned malformed caller repository metadata."
+        fi
+        case "$repository_visibility" in
+          public|private|internal) ;;
+          *) fail "GitHub returned an unsupported caller repository visibility." ;;
+        esac
+
+        config_json=$(node -e "$(cat <<'NODE'
+          const fs = require("fs");
+          const lines = fs.readFileSync(process.argv[1], "utf8").split(/\r?\n/);
+          const branches = new Map();
+          let foundRoot = false;
+          for (const line of lines) {
+            if (line === "" || /^\s*#/.test(line)) continue;
+            if (line === "branches:") {
+              if (foundRoot) process.exit(1);
+              foundRoot = true;
+              continue;
+            }
+            const match = /^  (development|release): ([^\s].*)$/.exec(line);
+            if (!foundRoot || !match || /\s$/.test(match[2]) || branches.has(match[1])) process.exit(1);
+            let value = match[2];
+            if (value.startsWith("'")) {
+              if (!value.endsWith("'") || value.length < 2) process.exit(1);
+              value = value.slice(1, -1).replace(/''/g, "'");
+            } else if (value.startsWith("\"")) {
+              if (!value.endsWith("\"") || value.length < 2) process.exit(1);
+              try { value = JSON.parse(value); } catch { process.exit(1); }
+              if (typeof value !== "string") process.exit(1);
+            } else if (/^(?:~|null|true|false|[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?)$/i.test(value) || /^[!&*|>@[{]/.test(value)) {
+              process.exit(1);
+            }
+            if (value === "") process.exit(1);
+            branches.set(match[1], value);
+          }
+          if (!foundRoot || branches.size !== 2 || !branches.has("development") || !branches.has("release")) process.exit(1);
+          process.stdout.write(JSON.stringify(Object.fromEntries(branches)));
+        NODE
+        )" .github/package.yml) || fail ".github/package.yml must contain only non-empty string branches.development and branches.release values."
+        development_branch=$(jq -er '.development' <<< "$config_json") || fail ".github/package.yml development branch is malformed."
+        release_branch=$(jq -er '.release' <<< "$config_json") || fail ".github/package.yml release branch is malformed."
+        [[ "$development_branch" != "$release_branch" ]] || fail ".github/package.yml development and release branches must differ."
+        git check-ref-format --branch "$development_branch" > /dev/null 2>&1 || fail ".github/package.yml development branch is not a valid branch name."
+        git check-ref-format --branch "$release_branch" > /dev/null 2>&1 || fail ".github/package.yml release branch is not a valid branch name."
+
+        branch_role=none
+        if [[ "$CURRENT_REF" == "refs/heads/$development_branch" ]]; then
+          branch_role=development
+        elif [[ "$CURRENT_REF" == "refs/heads/$release_branch" ]]; then
+          branch_role=release
+        fi
+
+        printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\nrepository-visibility=%s\nbranch-role=%s\n' "$project_path" "$package_id" "$compatibility_line" "$repository_visibility" "$branch_role" >> "$GITHUB_OUTPUT"
