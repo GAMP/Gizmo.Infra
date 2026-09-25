@@ -73,10 +73,16 @@ public sealed class GitHubNugetProviderDocsTests
         Assert.Contains("3.X.Y-dev.${{ github.run_number }}", doc, StringComparison.Ordinal);
         Assert.Contains("`3.X.Y` and `<package-id>/v3.X.Y`", doc, StringComparison.Ordinal);
 
-        // The unified workflow derives the development base from the current stable
-        // patch; development must never advance the stable patch.
+        // The unified workflow derives the next stable patch from the complete
+        // stable tag state. Development creates no tag, so repeated development
+        // runs advertise the same next-release base and never advance the stable
+        // patch themselves.
         Assert.Contains(
-            "Development uses the current highest stable patch on its compatibility line (or `0` when no stable tag exists), so a development package never advances the stable patch.",
+            "Validation and development calculate the next patch from the complete stable tag state: `0` when the matching compatibility line has no stable tag, otherwise numeric `max(Y)+1`.",
+            doc,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Development does not create a stable tag, so repeated development runs use that same next-release base until a release creates its stable tag.",
             doc,
             StringComparison.Ordinal);
     }
@@ -93,7 +99,7 @@ public sealed class GitHubNugetProviderDocsTests
         Assert.Contains("Each tag there must be exactly `<package-id>/v3.X.Y`", doc, StringComparison.Ordinal);
         Assert.Contains("malformed prefix tags fail closed", doc, StringComparison.Ordinal);
         Assert.Contains(
-            "Validation and a new release select `Y=0` when the matching line has no tags, otherwise numeric `max(Y)+1`",
+            "Validation, development, and a new release select `Y=0` when the matching line has no tags, otherwise `max(Y)+1`",
             doc,
             StringComparison.Ordinal);
         Assert.Contains("The GitHub run number supplies `N`", doc, StringComparison.Ordinal);

@@ -135,7 +135,7 @@ jobs:
           done <<< "$tag_rows"
           case "$BRANCH_ROLE" in
             development)
-              if [[ -z "$max_patch" ]]; then patch=0; else patch=$max_patch; fi
+              if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi
               base_version="${COMPATIBILITY_LINE}.${patch}"
               package_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
               release_tag_state=not-applicable

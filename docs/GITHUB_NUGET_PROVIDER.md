@@ -93,8 +93,8 @@ authoritative.
 For each package independently, the workflow uses the caller job's
 token-supported GitHub Git-refs API to paginate the complete caller-repository
 tag set under the exact prefix `<package-id>/`. Each tag there must be exactly
-`<package-id>/v3.X.Y`; malformed prefix tags fail closed. Validation and a new
-release select `Y=0` when the matching line has no tags, otherwise numeric
+`<package-id>/v3.X.Y`; malformed prefix tags fail closed. Validation, development,
+and a new release select `Y=0` when the matching line has no tags, otherwise
 `max(Y)+1`. The GitHub run number supplies `N`:
 
 | Operation | Calculated package version |
@@ -103,12 +103,13 @@ release select `Y=0` when the matching line has no tags, otherwise numeric
 | Development | `3.X.Y-dev.${{ github.run_number }}` |
 | Release | `3.X.Y` and `<package-id>/v3.X.Y` |
 
-Validation calculates the next patch from the complete tag state. Development
-uses the current highest stable patch on its compatibility line (or `0` when no
-stable tag exists), so a development package never advances the stable patch.
-Release first resolves every matching line tag to its commit. A rerun reuses a
-base only if exactly one package/line tag resolves to the caller SHA. No
-current-SHA tag calculates the next base. Multiple current-SHA tags are
+Validation and development calculate the next patch from the complete stable
+tag state: `0` when the matching compatibility line has no stable tag, otherwise
+numeric `max(Y)+1`. Development does not create a stable tag, so repeated
+development runs use that same next-release base until a release creates its
+stable tag. Release first resolves every matching line tag to its commit. A
+rerun reuses a base only if exactly one package/line tag resolves to the caller
+SHA. No current-SHA tag calculates the next base. Multiple current-SHA tags are
 ambiguous and fail closed. A claimed calculated tag on another commit, a
 malformed tag response, or a changed tag state is a failure; the workflow never
 moves or overwrites a tag.

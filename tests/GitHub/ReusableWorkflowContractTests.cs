@@ -639,27 +639,6 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void DevelopmentMode_LeavesTheStablePatchUnchanged()
-    {
-        var script = VersionStateScript(PublishFile);
-
-        // The development arm reuses the current highest stable patch (or 0) and
-        // must never call the increment that only the release arm uses, so a
-        // development build cannot advance the stable patch.
-        var developmentArm = Regex.Match(
-            script,
-            @"case ""\$BRANCH_ROLE"" in\s*development\)(?<arm>.*?)release\)",
-            RegexOptions.Singleline | RegexOptions.CultureInvariant);
-        Assert.True(developmentArm.Success, "publish must branch on the resolved role.");
-        Assert.Contains("patch=$max_patch", developmentArm.Groups["arm"].Value, StringComparison.Ordinal);
-        Assert.DoesNotContain("increment_decimal", developmentArm.Groups["arm"].Value, StringComparison.Ordinal);
-        Assert.Contains("release_tag_state=not-applicable", developmentArm.Groups["arm"].Value, StringComparison.Ordinal);
-
-        // The release arm owns the stable patch increment and the package-qualified tag.
-        Assert.Contains("patch=$(increment_decimal \"$max_patch\")", script, StringComparison.Ordinal);
-    }
-
-    [Fact]
     public void BuildEmitsFullCalculatedStateAndAFingerprint()
     {
         foreach (var file in ContractFiles)
