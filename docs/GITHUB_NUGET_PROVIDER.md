@@ -6,14 +6,13 @@ or a caller repository, and it does not perform a publication or tag write.
 
 ## Callable workflows
 
-Gizmo.Infra exposes three distinct direct `workflow_call` workflows. There is
-no mode, descriptor version, workflow version, or equivalent version input.
+Gizmo.Infra exposes two direct `workflow_call` workflows. There is no mode,
+descriptor version, workflow version, or equivalent version input.
 
 | Workflow | Purpose | Caller permissions |
 | --- | --- | --- |
 | `.github/workflows/package-validation.yml` | Calculate, restore, audit, build, pack, and retain a nonpublished validation package. It cannot publish or tag. | `contents: read` |
-| `.github/workflows/package-development.yml` | Calculate, build, pack, and retain a nonpublished development package. | `contents: read` |
-| `.github/workflows/package-release.yml` | Calculate, build, pack, and retain a nonpublished stable package. | `contents: read` |
+| `.github/workflows/package-publish.yml` | Resolves the caller branch role, then calculates, builds, packs, and retains a nonpublished development or stable package. A `none` role stops before tag lookup, restore, build, pack, publication, or tagging work. | `contents: read` |
 
 Every caller must use an immutable, complete 40-character Gizmo.Infra commit
 SHA. A branch, tag, abbreviated SHA, or expression is not an acceptable
@@ -94,9 +93,9 @@ authoritative.
 For each package independently, the workflow uses the caller job's
 token-supported GitHub Git-refs API to paginate the complete caller-repository
 tag set under the exact prefix `<package-id>/`. Each tag there must be exactly
-`<package-id>/v3.X.Y`; malformed prefix tags fail closed. The matching line
-selects `Y=0` when it has no tags, otherwise numeric `max(Y)+1`. The GitHub run
-number supplies `N`:
+`<package-id>/v3.X.Y`; malformed prefix tags fail closed. Validation, development,
+and a new release select `Y=0` when the matching line has no tags, otherwise
+`max(Y)+1`. The GitHub run number supplies `N`:
 
 | Operation | Calculated package version |
 | --- | --- |
@@ -104,17 +103,22 @@ number supplies `N`:
 | Development | `3.X.Y-dev.${{ github.run_number }}` |
 | Release | `3.X.Y` and `<package-id>/v3.X.Y` |
 
-Validation and development always calculate from the complete tag state.
-Release first resolves every matching line tag to its commit. A rerun reuses a
-base only if exactly one package/line tag resolves to the caller SHA. No
-current-SHA tag calculates the next base. Multiple current-SHA tags are
+Validation and development calculate the next patch from the complete stable
+tag state: `0` when the matching compatibility line has no stable tag, otherwise
+numeric `max(Y)+1`. Development does not create a stable tag, so repeated
+development runs use that same next-release base until a release creates its
+stable tag. Release first resolves every matching line tag to its commit. A
+rerun reuses a base only if exactly one package/line tag resolves to the caller
+SHA. No current-SHA tag calculates the next base. Multiple current-SHA tags are
 ambiguous and fail closed. A claimed calculated tag on another commit, a
 malformed tag response, or a changed tag state is a failure; the workflow never
 moves or overwrites a tag.
 
-The build job emits package version, complete calculated state, and a tag-state
-fingerprint. The inactive publisher and tag jobs retain their fail-closed
-rechecks but do not run until a routing contract authorizes them.
+The publish workflow uses the preflight action as the only authority for branch
+role and never parses `.github/package.yml` itself. Its build job emits package
+version, complete calculated state, and a tag-state fingerprint only for
+`development` or `release`. The inactive publisher and tag jobs retain their
+fail-closed rechecks but do not run until a routing contract authorizes them.
 
 Development, release, and validation use a shared caller-repository concurrency
 group `nuget-${{ github.repository }}` with `cancel-in-progress: false`. It

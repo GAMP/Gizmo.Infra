@@ -8,8 +8,8 @@ calculate package patches from caller-repository tags.
 ## GitHub NuGet workflows
 
 See [docs/GITHUB_NUGET_PROVIDER.md](docs/GITHUB_NUGET_PROVIDER.md) for the
-three callable workflow contracts, automatic GitHub-calculated versioning,
-required inputs and permissions, immutable full-SHA invocation, OIDC
-trusted-publishing requirements, and recovery rules. The documentation
-describes external configuration only; this repository does not perform
-publication, tagging, or any remote configuration.
+validation and canonical publish workflow contracts, automatic
+GitHub-calculated versioning, caller branch-role resolution, immutable full-SHA
+invocation, OIDC trusted-publishing requirements, and recovery rules. The
+documentation describes external configuration only; this repository does not
+perform publication, tagging, or any remote configuration.

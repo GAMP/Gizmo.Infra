@@ -179,6 +179,25 @@ public static class WorkflowShell
     }
 
     /// <summary>
+    /// Parses a committed script with <c>bash -n</c> without executing it. A YAML
+    /// indentation slip can still parse as a scalar while producing invalid shell,
+    /// and GitHub would only surface that on an actual runner.
+    /// </summary>
+    public static ShellResult CheckBashSyntax(string script)
+    {
+        var startInfo = new ProcessStartInfo(BashExecutable.Value)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add("-n");
+        startInfo.ArgumentList.Add("-s");
+        return Execute(startInfo, script);
+    }
+
+    /// <summary>
     /// Runs the exact multi-line <c>node -e</c> program the action embeds, with
     /// <paramref name="argument"/> available as <c>process.argv[1]</c>. The
     /// program is loaded from a file so a multi-line program never has to survive

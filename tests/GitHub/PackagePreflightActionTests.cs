@@ -21,10 +21,9 @@ public sealed class PackagePreflightActionTests
 {
     private const string PreflightAction = "package-preflight";
     private const string ValidationFile = "package-validation.yml";
-    private const string DevelopmentFile = "package-development.yml";
-    private const string ReleaseFile = "package-release.yml";
+    private const string PublishFile = "package-publish.yml";
 
-    private static readonly string[] ContractFiles = [ValidationFile, DevelopmentFile, ReleaseFile];
+    private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
 
     private static readonly string Action = WorkflowShell.ReadAction(PreflightAction);
 

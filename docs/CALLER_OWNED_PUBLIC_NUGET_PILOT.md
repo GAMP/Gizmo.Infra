@@ -4,9 +4,9 @@ This pilot keeps all deterministic NuGet logic in `Gizmo.Infra` while moving the
 GitHub job identity that requests the NuGet.org OIDC token back into the caller
 repository.
 
-The existing reusable workflows are intentionally left unchanged during the
-pilot. New public callers compose pinned `Gizmo.Infra` composite actions in
-normal caller jobs.
+The registry-neutral `package-publish.yml` reusable workflow remains unchanged
+by this pilot. New public callers compose pinned `Gizmo.Infra` composite
+actions in normal caller jobs.
 
 ## Development caller shape
 
@@ -69,9 +69,9 @@ check and fail closed.
 ## NuGet.org trusted publishing
 
 For a caller such as `GAMP/Gizmo.Shared`, NuGet.org Trusted Publishing should
-trust the caller workflow file (for example `package-release.yml`), because the
-OIDC-requesting job is now defined by that caller workflow. The composite action
-contains the mechanics, but it does not become `job_workflow_ref`.
+trust the caller's own publishing workflow file, because the OIDC-requesting
+job is now defined by that caller workflow. The composite action contains the
+mechanics, but it does not become `job_workflow_ref`.
 
 The repository/organization variable `NUGET_USER` remains a NuGet.org profile
 identifier, not a secret or API key.

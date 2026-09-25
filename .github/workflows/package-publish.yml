@@ -1,4 +1,4 @@
-name: NuGet release publish
+name: NuGet package publish
 
 on:
   workflow_call:
@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build release package
+    name: Build package
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,9 +45,9 @@ jobs:
           WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         run: |
           set -euo pipefail
-          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package-release.yml@"
+          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@"
           workflow_ref_sha=${WORKFLOW_REF#"$expected_workflow_ref"}
-          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-release.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
+          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-publish.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
             echo "The reusable workflow must be called from the expected Gizmo.Infra file with a complete immutable commit SHA." >&2
             exit 1
           fi
@@ -69,16 +69,22 @@ jobs:
           github-token: ${{ github.token }}
           current-ref: ${{ github.ref }}
 
-      - name: Calculate release version and tag state
+      - name: Calculate package version and tag state
         id: version-state
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
           COMPATIBILITY_LINE: ${{ steps.metadata.outputs.compatibility-line }}
+          BRANCH_ROLE: ${{ steps.metadata.outputs.branch-role }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export LC_ALL=C
+          case "$BRANCH_ROLE" in
+            development|release) ;;
+            *) echo "The package preflight did not resolve a publishable branch role." >&2; exit 1 ;;
+          esac
           response_file=$(mktemp); tag_object_file=$(mktemp)
           trap 'rm -f "$response_file" "$tag_object_file"' EXIT
           fetch_tag_rows() {
@@ -127,13 +133,23 @@ jobs:
               if [[ "$tag_commit" == "$GITHUB_SHA" ]]; then current_tags+=("$tag_leaf"); fi
             fi
           done <<< "$tag_rows"
-          case ${#current_tags[@]} in
-            0) if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi; release_tag_state=missing ;;
-            1) if [[ ! "${current_tags[0]}" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Current-SHA package tag is malformed." >&2; exit 1; fi; base_version="3.${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; patch=${BASH_REMATCH[2]}; release_tag_state=present ;;
-            *) echo "Multiple package/compatibility-line tags point to the caller commit; refusing ambiguous release rerun." >&2; exit 1 ;;
+          case "$BRANCH_ROLE" in
+            development)
+              if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi
+              base_version="${COMPATIBILITY_LINE}.${patch}"
+              package_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
+              release_tag_state=not-applicable
+              ;;
+            release)
+              case ${#current_tags[@]} in
+                0) if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi; release_tag_state=missing ;;
+                1) if [[ ! "${current_tags[0]}" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Current-SHA package tag is malformed." >&2; exit 1; fi; base_version="3.${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; patch=${BASH_REMATCH[2]}; release_tag_state=present ;;
+                *) echo "Multiple package/compatibility-line tags point to the caller commit; refusing ambiguous release rerun." >&2; exit 1 ;;
+              esac
+              if [[ "$release_tag_state" == missing ]]; then base_version="${COMPATIBILITY_LINE}.${patch}"; fi
+              package_version=$base_version
+              ;;
           esac
-          if [[ "$release_tag_state" == missing ]]; then base_version="${COMPATIBILITY_LINE}.${patch}"; fi
-          package_version=$base_version
           release_tag="${PACKAGE_ID}/v${base_version}"
           tag_snapshot=$(printf '%s' "$tag_snapshot" | sort)
           tag_state_fingerprint=$(printf '%s' "$tag_snapshot" | sha256sum | cut -d ' ' -f1)
@@ -176,18 +192,21 @@ jobs:
           esac
 
       - name: Restore with NuGet audit
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
 
       - name: Build
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
 
-      - name: Pack calculated release version
+      - name: Pack calculated package version
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           CALCULATED_VERSION: ${{ steps.version-state.outputs.package-version }}
@@ -195,6 +214,7 @@ jobs:
         run: dotnet pack "$PROJECT_PATH" --configuration Release --no-restore --output artifacts -p:RepositoryCommit="$GITHUB_SHA" -p:PackageVersion="$CALCULATED_VERSION"
 
       - name: Upload exact package artifact
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
@@ -244,7 +264,7 @@ jobs:
           esac
 
   publish-public:
-    name: Publish public release package
+    name: Publish public package
     if: ${{ false }}
     needs: build
     runs-on: ubuntu-latest
@@ -327,7 +347,7 @@ jobs:
           dotnet nuget push "$PACKAGE_ARTIFACT" --source https://api.nuget.org/v3/index.json --api-key "$nuget_api_key"
 
   publish-private:
-    name: Publish private release package
+    name: Publish private package
     if: ${{ false }}
     needs:
       - build
