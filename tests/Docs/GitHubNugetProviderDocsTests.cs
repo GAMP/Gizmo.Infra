@@ -23,15 +23,19 @@ public sealed class GitHubNugetProviderDocsTests
     private static string Collapse(string text) => Regex.Replace(text, @"\s+", " ");
 
     [Fact]
-    public void ProviderDoc_NamesTheThreeDirectReusableWorkflows()
+    public void ProviderDoc_NamesTheTwoDirectReusableWorkflows()
     {
         var doc = ProviderDoc();
 
-        Assert.Contains("three distinct direct `workflow_call` workflows", doc, StringComparison.Ordinal);
+        Assert.Contains("two direct `workflow_call` workflows", doc, StringComparison.Ordinal);
         Assert.Contains(".github/workflows/package-validation.yml", doc, StringComparison.Ordinal);
-        Assert.Contains(".github/workflows/package-development.yml", doc, StringComparison.Ordinal);
-        Assert.Contains(".github/workflows/package-release.yml", doc, StringComparison.Ordinal);
+        Assert.Contains(".github/workflows/package-publish.yml", doc, StringComparison.Ordinal);
         Assert.Contains("no mode, descriptor version, workflow version, or equivalent version input", doc, StringComparison.Ordinal);
+
+        // The legacy development/release reusable workflows are gone; the canonical
+        // publish workflow replaces them and must be the only named publisher.
+        Assert.DoesNotContain(".github/workflows/package-development.yml", doc, StringComparison.Ordinal);
+        Assert.DoesNotContain(".github/workflows/package-release.yml", doc, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -68,6 +72,13 @@ public sealed class GitHubNugetProviderDocsTests
         Assert.Contains("3.X.Y-pr.${{ github.run_number }}", doc, StringComparison.Ordinal);
         Assert.Contains("3.X.Y-dev.${{ github.run_number }}", doc, StringComparison.Ordinal);
         Assert.Contains("`3.X.Y` and `<package-id>/v3.X.Y`", doc, StringComparison.Ordinal);
+
+        // The unified workflow derives the development base from the current stable
+        // patch; development must never advance the stable patch.
+        Assert.Contains(
+            "Development uses the current highest stable patch on its compatibility line (or `0` when no stable tag exists), so a development package never advances the stable patch.",
+            doc,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -81,7 +92,10 @@ public sealed class GitHubNugetProviderDocsTests
             StringComparison.Ordinal);
         Assert.Contains("Each tag there must be exactly `<package-id>/v3.X.Y`", doc, StringComparison.Ordinal);
         Assert.Contains("malformed prefix tags fail closed", doc, StringComparison.Ordinal);
-        Assert.Contains("selects `Y=0` when it has no tags, otherwise numeric `max(Y)+1`", doc, StringComparison.Ordinal);
+        Assert.Contains(
+            "Validation and a new release select `Y=0` when the matching line has no tags, otherwise numeric `max(Y)+1`",
+            doc,
+            StringComparison.Ordinal);
         Assert.Contains("The GitHub run number supplies `N`", doc, StringComparison.Ordinal);
     }
 
@@ -105,11 +119,22 @@ public sealed class GitHubNugetProviderDocsTests
         var doc = ProviderDoc();
 
         Assert.Contains(
-            "The build job emits package version, complete calculated state, and a tag-state fingerprint.",
+            "Its build job emits package version, complete calculated state, and a tag-state fingerprint only for `development` or `release`.",
             doc,
             StringComparison.Ordinal);
         Assert.Contains(
             "The inactive publisher and tag jobs retain their fail-closed rechecks but do not run until a routing contract authorizes them.",
+            doc,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProviderDoc_DocumentsPreflightBranchRoleAsTheOnlyModeAuthority()
+    {
+        var doc = ProviderDoc();
+
+        Assert.Contains(
+            "The publish workflow uses the preflight action as the only authority for branch role and never parses `.github/package.yml` itself.",
             doc,
             StringComparison.Ordinal);
     }
@@ -280,8 +305,9 @@ public sealed class GitHubNugetProviderDocsTests
     {
         var readme = Readme();
 
-        Assert.Contains("three callable workflow contracts", readme, StringComparison.Ordinal);
+        Assert.Contains("validation and canonical publish workflow contracts", readme, StringComparison.Ordinal);
         Assert.Contains("automatic GitHub-calculated versioning", readme, StringComparison.Ordinal);
+        Assert.Contains("caller branch-role resolution", readme, StringComparison.Ordinal);
         Assert.Contains("immutable full-SHA invocation", readme, StringComparison.Ordinal);
         Assert.Contains("OIDC trusted-publishing requirements", readme, StringComparison.Ordinal);
         Assert.Contains("set only the `3.X` compatibility line", readme, StringComparison.Ordinal);
