@@ -5,33 +5,28 @@ inputs:
     description: Package-qualified release tag, for example Gizmo.Shared/v3.0.0.
     required: true
   calculated-state:
-    description: Complete state emitted by the release prepare action.
+    description: Complete state emitted by the release preparation workflow.
     required: true
   tag-state-fingerprint:
-    description: Tag-state fingerprint emitted by the release prepare action.
+    description: Tag-state fingerprint emitted by the release preparation workflow.
     required: true
-  nuget-user:
-    description: Unused compatibility input for the common trusted-invocation guard.
-    required: false
-    default: ''
 runs:
   using: composite
   steps:
-    - name: Validate trusted publisher invocation
+    - name: Validate trusted tag invocation
       shell: bash
       env:
         EVENT_NAME: ${{ github.event_name }}
         REF_NAME: ${{ github.ref }}
         REF_PROTECTED: ${{ github.ref_protected }}
-        NUGET_USER: ${{ inputs.nuget-user }}
       run: |
         set -euo pipefail
         if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
-          echo "Publishing is allowed only from push or workflow_dispatch." >&2
+          echo "Tagging is allowed only from push or workflow_dispatch." >&2
           exit 1
         fi
         if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
-          echo "Publishing requires a protected branch ref." >&2
+          echo "Tagging requires a protected branch ref." >&2
           exit 1
         fi
 

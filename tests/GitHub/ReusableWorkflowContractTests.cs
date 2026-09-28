@@ -1,15 +1,14 @@
 using System.Text.RegularExpressions;
 using Gizmo.Infra.Tests.TestSupport;
 using YamlDotNet.RepresentationModel;
-using Xunit.Sdk;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
 /// Static contract coverage for the two direct reusable <c>workflow_call</c>
-/// workflows Gizmo.Infra publishes: the validation workflow and the canonical
-/// unified publish workflow. The tests read the committed YAML and never render
-/// or execute it, so they hold without GitHub, NuGet, or remote setup.
+/// workflows Gizmo.Infra publishes: the validation workflow and the non-mutating
+/// publish preparation workflow. The tests read the committed YAML and never
+/// render or execute it, so they hold without GitHub, NuGet, or remote setup.
 /// </summary>
 public sealed class ReusableWorkflowContractTests
 {
@@ -18,29 +17,21 @@ public sealed class ReusableWorkflowContractTests
 
     private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
 
-    // The publish workflow is the only canonical publishing workflow. Every job
-    // that could publish or mutate a tag is declared there but hard-disabled until
-    // a separate routing contract restores an operation-specific publisher path.
-    private static readonly string[] PublishJobs =
+    // The publish workflow is a preparation authority only: it must export the
+    // caller-routing outputs and never request a publication credential, contact a
+    // package feed, publish, or mutate a tag.
+    private static readonly string[] CallerRoutingOutputs =
     [
-        "verify-private-collision",
-        "publish-public",
-        "publish-private",
-        "tag",
+        "package-artifact",
+        "package-version",
+        "release-tag",
+        "release-tag-state",
+        "calculated-state",
+        "tag-state-fingerprint",
+        "package-id",
+        "branch-role",
+        "repository-visibility",
     ];
-
-    // These disabled publish/tag jobs still repeat tag discovery and state
-    // validation; each is a distinct attack surface for pagination, prefix,
-    // malformed-tag, and annotated-tag handling regressions.
-    private static readonly (string Job, string Step, string PackageVariable)[] RecheckJobs =
-    [
-        ("publish-public", "Recheck calculated state and public collision before publication", "$EXPECTED_PACKAGE_ID"),
-        ("publish-private", "Recheck calculated state and private collision before publication", "$EXPECTED_PACKAGE_ID"),
-        ("tag", "Refetch and recheck calculated state before tagging", "$package_id"),
-    ];
-
-    private const string PublicCollisionStep = "Resolve public package version state";
-    private const string PrivateCollisionStep = "Resolve private package version state";
 
     // Reruns of the same workflow run must not collide on the uploaded artifact
     // name, so the attempt discriminator is part of the contract.
@@ -51,21 +42,18 @@ public sealed class ReusableWorkflowContractTests
     private const string ConcurrencyGroup = "nuget-${{ github.repository }}";
 
     // The preflight action is the only authority for the publish branch role; the
-    // expensive and mutating steps all skip when it resolves to none.
+    // expensive steps all skip when it resolves to none.
     private const string PublishableBranchRole = "${{ steps.metadata.outputs.branch-role != 'none' }}";
 
     // Finalized Node 24 action releases. Every workflow that declares one of
     // these actions must use exactly this commit and matching release comment, so
     // a partial upgrade that leaves any action on a stale major fails here.
-    // download-artifact is declared only by the publish workflow.
     private const string CheckoutPin =
         "uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0";
     private const string SetupDotnetPin =
         "uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0";
     private const string UploadArtifactPin =
         "uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0";
-    private const string DownloadArtifactPin =
-        "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1";
 
     // Validation run 35636544410 failed in setup because actions/setup-dotnet
     // resolved an invalid v4.0.0 commit; the corrected pin above must hold and
@@ -125,16 +113,22 @@ public sealed class ReusableWorkflowContractTests
     [Fact]
     public void EachFile_DeclaresNoCallerSuppliedInputs()
     {
-        // E15: the preflight discovers the project, package ID, compatibility
-        // line, and visibility, and no publisher input remains, so every workflow
-        // exposes a body-less `workflow_call:` (a null scalar, not a mapping).
+        // The preflight discovers the project, package ID, compatibility line,
+        // branch role, and visibility; the publish workflow adds only outputs, so
+        // no workflow declares any caller-supplied input.
         foreach (var file in ContractFiles)
         {
             var root = Parse(file);
             var workflowCall = YamlWorkflowReader.Child(
                 YamlWorkflowReader.MappingChild(root, "on"), "workflow_call");
 
-            Assert.IsType<YamlScalarNode>(workflowCall);
+            if (workflowCall is YamlMappingNode mapping)
+            {
+                Assert.False(
+                    YamlWorkflowReader.HasChild(mapping, "inputs"),
+                    $"{file} must not declare workflow_call inputs.");
+            }
+
             Assert.Null(WorkflowCallInputs(root));
 
             // The compatibility line comes from the caller project; no descriptor,
@@ -153,32 +147,71 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void Visibility_IsDiagnosticOnlyAndNeverRoutesAPublisher()
+    public void PublishWorkflow_ExportsCallerRoutingOutputs()
     {
-        foreach (var file in ContractFiles)
-        {
-            var content = Read(file);
-
-            // The preflight resolves visibility, but the workflow must not read it
-            // to pick a registry, gate a job, or branch a step; the old caller
-            // input is gone and the renamed output is not consumed either.
-            Assert.DoesNotContain("package-visibility", content, StringComparison.Ordinal);
-            Assert.DoesNotContain("repository-visibility", content, StringComparison.Ordinal);
-            Assert.DoesNotContain("github.event.repository.visibility", content, StringComparison.Ordinal);
-        }
-
         var root = Parse(PublishFile);
+        var call = YamlWorkflowReader.MappingChild(
+            YamlWorkflowReader.MappingChild(root, "on"), "workflow_call");
+        var workflowOutputs = YamlWorkflowReader.MappingChild(call, "outputs");
+        var jobOutputs = Outputs(Job(root, "build"));
 
-        // The public version check, the private collision job, and both publishers
-        // remain declared but are hard-disabled.
-        Assert.Equal(
-            "${{ false }}",
-            YamlWorkflowReader.ScalarChild(Step(BuildJob(root, PublishFile), PublicCollisionStep), "if"));
-
-        foreach (var job in PublishJobs)
+        foreach (var output in CallerRoutingOutputs)
         {
-            Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, job), "if"));
+            var workflowOutput = YamlWorkflowReader.MappingChild(workflowOutputs, output);
+            Assert.Contains(
+                $"jobs.build.outputs.{output}",
+                YamlWorkflowReader.ScalarChild(workflowOutput, "value"),
+                StringComparison.Ordinal);
+            Assert.True(
+                YamlWorkflowReader.HasChild(jobOutputs, output),
+                $"the build job must expose the '{output}' output.");
         }
+
+        // Identity and routing outputs come from the always-running discovery step,
+        // not from a step that skips when the branch role is none.
+        Assert.Equal(
+            "${{ steps.metadata.outputs.branch-role }}",
+            YamlWorkflowReader.ScalarChild(jobOutputs, "branch-role"));
+        Assert.Equal(
+            "${{ steps.metadata.outputs.repository-visibility }}",
+            YamlWorkflowReader.ScalarChild(jobOutputs, "repository-visibility"));
+
+        // The exported visibility is routing data only; the workflow must not
+        // branch on it or read an event-specific visibility.
+        Assert.DoesNotContain(
+            "github.event.repository.visibility",
+            Read(PublishFile),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PublishWorkflow_IsANonMutatingPreparationAuthority()
+    {
+        var content = Read(PublishFile);
+
+        foreach (var forbidden in new[]
+                 {
+                     "dotnet nuget push", "id-token", "ACTIONS_ID_TOKEN",
+                     "api.nuget.org", "nuget.pkg.github.com", "git/refs",
+                     "contents: write", "packages: write", "packages: read",
+                     "actions/download-artifact", "NUGET_API_KEY", "NUGET_TOKEN", "secrets:",
+                 })
+        {
+            Assert.DoesNotContain(forbidden, content, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void PublishWorkflow_DeclaresOnlyThePreparationJob()
+    {
+        var jobs = Jobs(Parse(PublishFile));
+
+        var names = jobs.Children.Keys
+            .Select(key => Assert.IsType<YamlScalarNode>(key).Value ?? string.Empty)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(new[] { "build" }, names);
     }
 
     [Fact]
@@ -231,8 +264,6 @@ public sealed class ReusableWorkflowContractTests
             Assert.DoesNotContain("package-id", group, StringComparison.Ordinal);
             Assert.Equal("false", YamlWorkflowReader.ScalarChild(concurrency, "cancel-in-progress"));
 
-            // The doc promises the latest pending run may replace an earlier pending
-            // run without cancelling an active one; that is exactly this setting.
             Assert.DoesNotContain("cancel-in-progress: true", Read(file), StringComparison.Ordinal);
         }
     }
@@ -250,32 +281,6 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void PublishingJobs_GrantOnlyTheCredentialTheyNeed()
-    {
-        var root = Parse(PublishFile);
-
-        var publicPermissions = Permissions(Job(root, "publish-public"));
-        Assert.Equal("read", YamlWorkflowReader.ScalarChild(publicPermissions, "contents"));
-        Assert.Equal("write", YamlWorkflowReader.ScalarChild(publicPermissions, "id-token"));
-        Assert.False(YamlWorkflowReader.HasChild(publicPermissions, "packages"));
-        Assert.Equal(2, publicPermissions.Children.Count);
-
-        var privatePermissions = Permissions(Job(root, "publish-private"));
-        Assert.Equal("read", YamlWorkflowReader.ScalarChild(privatePermissions, "contents"));
-        Assert.Equal("write", YamlWorkflowReader.ScalarChild(privatePermissions, "packages"));
-        Assert.False(YamlWorkflowReader.HasChild(privatePermissions, "id-token"));
-        Assert.Equal(2, privatePermissions.Children.Count);
-
-        var collisionPermissions = Permissions(Job(root, "verify-private-collision"));
-        Assert.Equal("read", YamlWorkflowReader.ScalarChild(collisionPermissions, "packages"));
-        Assert.Single(collisionPermissions.Children);
-
-        var tagPermissions = Permissions(Job(root, "tag"));
-        Assert.Equal("write", YamlWorkflowReader.ScalarChild(tagPermissions, "contents"));
-        Assert.Single(tagPermissions.Children);
-    }
-
-    [Fact]
     public void ValidationWorkflow_CannotPublishTagOrElevate()
     {
         var content = Read(ValidationFile);
@@ -285,26 +290,6 @@ public sealed class ReusableWorkflowContractTests
         Assert.DoesNotContain("packages", content, StringComparison.Ordinal);
         Assert.DoesNotContain("git/refs", content, StringComparison.Ordinal);
         Assert.DoesNotContain("contents: write", content, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void OnlyPublishWorkflow_DeclaresPublisherAndTagJobs()
-    {
-        var validationJobs = Jobs(Parse(ValidationFile));
-        foreach (var job in PublishJobs)
-        {
-            Assert.False(
-                YamlWorkflowReader.HasChild(validationJobs, job),
-                $"the validation workflow must not declare the '{job}' job.");
-        }
-
-        var publishJobs = Jobs(Parse(PublishFile));
-        foreach (var job in PublishJobs)
-        {
-            Assert.True(
-                YamlWorkflowReader.HasChild(publishJobs, job),
-                $"the publish workflow must declare the retained '{job}' job.");
-        }
     }
 
     [Fact]
@@ -351,8 +336,6 @@ public sealed class ReusableWorkflowContractTests
             Assert.Matches("actions/setup-dotnet@[0-9a-f]{40} # v", content);
             Assert.Matches("actions/upload-artifact@[0-9a-f]{40} # v", content);
         }
-
-        Assert.Matches("actions/download-artifact@[0-9a-f]{40} # v", Read(PublishFile));
     }
 
     [Theory]
@@ -362,7 +345,6 @@ public sealed class ReusableWorkflowContractTests
     [InlineData(PublishFile, "actions/setup-dotnet", SetupDotnetPin)]
     [InlineData(ValidationFile, "actions/upload-artifact", UploadArtifactPin)]
     [InlineData(PublishFile, "actions/upload-artifact", UploadArtifactPin)]
-    [InlineData(PublishFile, "actions/download-artifact", DownloadArtifactPin)]
     public void Actions_ArePinnedToTheFinalNode24Release(string file, string action, string expectedPin)
     {
         var uses = ActionUses(Read(file), action);
@@ -674,8 +656,8 @@ public sealed class ReusableWorkflowContractTests
     {
         var content = Read(PublishFile);
 
-        // The issue #4 resolver output is the sole mode authority for the unified
-        // workflow; the workflow must not reparse the caller configuration.
+        // The preflight resolver output is the sole mode authority for the
+        // preparation workflow; the workflow must not reparse the caller config.
         Assert.Contains(
             "BRANCH_ROLE: ${{ steps.metadata.outputs.branch-role }}",
             content,
@@ -698,13 +680,13 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void NoneMode_SkipsEveryExpensiveAndMutatingStep()
+    public void NoneMode_SkipsEveryExpensiveStep()
     {
         var build = BuildJob(Parse(PublishFile), PublishFile);
 
         // The version calculation performs the tag lookup, and the restore, build,
-        // pack, and upload all mutate or cost work; every one must skip for none
-        // while the cheap preflight still resolves the role.
+        // pack, and upload all cost work; every one must skip for none while the
+        // cheap preflight still resolves the role.
         foreach (var step in new[]
                  {
                      "Calculate package version and tag state",
@@ -722,325 +704,7 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void PublishAndTag_RefetchAndRecheckStateBeforeActing()
-    {
-        var root = Parse(PublishFile);
-        var publishSteps = new (string Job, string Step)[]
-        {
-            ("publish-public", "Recheck calculated state and public collision before publication"),
-            ("publish-private", "Recheck calculated state and private collision before publication"),
-        };
-        foreach (var (jobName, stepName) in publishSteps)
-        {
-            var script = Run(Job(root, jobName), stepName);
-
-            Assert.Contains("EXPECTED_STATE", script, StringComparison.Ordinal);
-            Assert.Contains("EXPECTED_FINGERPRINT", script, StringComparison.Ordinal);
-            Assert.Contains("Calculated package state drifted before publication; refusing to publish.", script, StringComparison.Ordinal);
-            Assert.Contains("Could not refetch caller-repository package tag refs.", script, StringComparison.Ordinal);
-            Assert.Contains("resolve_commit() {", script, StringComparison.Ordinal);
-            Assert.Contains("Package version collision appeared before publication.", script, StringComparison.Ordinal);
-            Assert.Contains(
-                "git/matching-refs/tags/$EXPECTED_PACKAGE_ID/?per_page=100&page=$page",
-                script,
-                StringComparison.Ordinal);
-            Assert.Contains("Malformed tag under the exact package prefix: $ref", script, StringComparison.Ordinal);
-        }
-
-        var tagScript = Run(Job(root, "tag"), "Refetch and recheck calculated state before tagging");
-        Assert.Contains("EXPECTED_FINGERPRINT", tagScript, StringComparison.Ordinal);
-        Assert.Contains("Calculated package state drifted before tagging; refusing to create a tag.", tagScript, StringComparison.Ordinal);
-        Assert.Contains("resolve_commit() {", tagScript, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void RecheckJobs_PaginateTheCompleteExactPrefixAndTerminate()
-    {
-        foreach (var (job, step, packageVariable) in RecheckJobs)
-        {
-            var script = Run(Job(Parse(PublishFile), job), step);
-
-            Assert.Contains("page=1", script, StringComparison.Ordinal);
-            Assert.Contains(
-                $"git/matching-refs/tags/{packageVariable}/?per_page=100&page=$page",
-                script,
-                StringComparison.Ordinal);
-            Assert.Contains(
-                @"all(.[]; (.ref | type == ""string"") and (.object | type == ""object"") and (.object.type | type == ""string"") and (.object.sha | type == ""string""))",
-                script,
-                StringComparison.Ordinal);
-            Assert.Contains("jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' \"$response_file\"", script, StringComparison.Ordinal);
-            Assert.Contains("count=$(jq -er 'length' \"$response_file\")", script, StringComparison.Ordinal);
-            Assert.Contains("if (( count < 100 )); then break; fi", script, StringComparison.Ordinal);
-            Assert.Contains("((page += 1))", script, StringComparison.Ordinal);
-
-            // A malformed page body or non-200 must fail closed rather than read as
-            // an empty (unpublished) tag set.
-            Assert.Contains(
-                job == "tag"
-                    ? "GitHub returned a malformed package tag-ref response during tag recheck."
-                    : "GitHub returned a malformed package tag-ref response during publication recheck.",
-                script,
-                StringComparison.Ordinal);
-        }
-    }
-
-    [Fact]
-    public void RecheckJobs_RejectForeignAndMalformedTagsUnderTheExactPrefix()
-    {
-        foreach (var (job, step, _) in RecheckJobs)
-        {
-            var script = Run(Job(Parse(PublishFile), job), step);
-            var expectedPrefix = job == "tag"
-                ? "tag_prefix=\"refs/tags/${package_id}/\""
-                : "tag_prefix=\"refs/tags/${EXPECTED_PACKAGE_ID}/\"";
-
-            Assert.Contains(expectedPrefix, script, StringComparison.Ordinal);
-
-            // A ref outside the requested package prefix is never silently ignored.
-            Assert.Contains(
-                "if [[ \"$ref\" != \"$tag_prefix\"* ]]; then echo \"GitHub returned a tag outside the requested package prefix.\" >&2; exit 1; fi",
-                script,
-                StringComparison.Ordinal);
-
-            // A malformed leaf under the exact package prefix fails closed, so a
-            // bogus tag cannot be skipped or attributed to another package.
-            Assert.Contains("leaf=${ref#\"$tag_prefix\"}", script, StringComparison.Ordinal);
-            Assert.Contains(
-                "if [[ ! \"$leaf\" =~ ^v3\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then echo \"Malformed tag under the exact package prefix: $ref\" >&2; exit 1; fi",
-                script,
-                StringComparison.Ordinal);
-        }
-    }
-
-    [Fact]
-    public void RecheckJobs_ResolveAnnotatedTagsToCommitsBeforeSnapshotting()
-    {
-        foreach (var (job, step, _) in RecheckJobs)
-        {
-            var script = Run(Job(Parse(PublishFile), job), step);
-
-            Assert.Contains("resolve_commit() {", script, StringComparison.Ordinal);
-            Assert.Contains("git/tags/$object_sha", script, StringComparison.Ordinal);
-            Assert.Contains("case \"$object_type\" in", script, StringComparison.Ordinal);
-            Assert.Contains("commit) printf '%s' \"$object_sha\"; return 0 ;;", script, StringComparison.Ordinal);
-            Assert.Contains("if (( depth > 16 )) ||", script, StringComparison.Ordinal);
-            Assert.Contains("*) echo \"Package tag ref does not resolve to a commit.\" >&2; return 1 ;;", script, StringComparison.Ordinal);
-
-            // Each page resolves every entry and aborts instead of snapshotting an
-            // annotated tag whose chain could not be walked back to a commit.
-            Assert.Contains("resolve_commit \"$object_type\" \"$object_sha\" > /dev/null || exit 1", script, StringComparison.Ordinal);
-            Assert.Contains("snapshot+=\"${ref}=${object_sha}\"$'\\n'", script, StringComparison.Ordinal);
-        }
-    }
-
-    [Theory]
-    [InlineData("publish-public")]
-    [InlineData("publish-private")]
-    [InlineData("verify-private-collision")]
-    [InlineData("tag")]
-    public void PublishJobs_AreDisabledPendingTheRoutingContract(string jobName)
-    {
-        // GH-4 accepts repository visibility as diagnostic-only. Until a separate
-        // routing contract is authorized, no job may choose a registry or mutate a
-        // tag, so every publisher and tag job is hard-disabled rather than gated on
-        // a visibility or protected-branch condition.
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(Parse(PublishFile), jobName), "if"));
-    }
-
-    [Fact]
-    public void ReleaseCollisionProvenance_BindsTheExistingPackageToTheCallerSha()
-    {
-        AssertProvenanceFailsClosed(
-            PublicCollisionScript(),
-            packageLabel: "public",
-            packageDownload: "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg",
-            transport: "NuGet.org");
-        AssertProvenanceFailsClosed(
-            PrivateCollisionScript(),
-            packageLabel: "private",
-            packageDownload: "https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg",
-            transport: "GitHub Packages");
-
-        // The retained provenance rejection cannot lead to a tag: the tag job is
-        // hard-disabled until a routing contract restores tagging.
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(Parse(PublishFile), "tag"), "if"));
-    }
-
-    private static void AssertProvenanceFailsClosed(string script, string packageLabel, string packageDownload, string transport)
-    {
-        Assert.Contains(packageDownload, script, StringComparison.Ordinal);
-        Assert.Contains("nuspec=$(unzip -p \"$package_file\" '*.nuspec' 2>/dev/null || true)", script, StringComparison.Ordinal);
-        Assert.Contains(
-            "repository_commit=$(printf '%s' \"$nuspec\" | grep -oE 'commit=\"[0-9a-fA-F]{40}\"' | head -n 1 | sed -E 's/.*\"([0-9a-fA-F]{40})\".*/\\1/' | tr 'A-F' 'a-f' || true)",
-            script,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            $"{transport} returned HTTP $status for the published {packageLabel} package; treating the existing version as an unverifiable collision.",
-            script,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            $"if [[ \"$repository_commit\" != \"$GITHUB_SHA\" ]]; then echo \"The existing {packageLabel} package version has no authenticated provenance for this caller SHA; failing closed instead of creating a recovery tag.\" >&2; exit 1; fi",
-            script,
-            StringComparison.Ordinal);
-
-        // The published signal is the only fallback that lets recovery tagging run
-        // without a successful publish, so it can only be emitted after the commit
-        // comparison succeeds.
-        var comparisonIndex = script.IndexOf("if [[ \"$repository_commit\" != \"$GITHUB_SHA\" ]]", StringComparison.Ordinal);
-        var publishedIndex = script.IndexOf("package-state=published", StringComparison.Ordinal);
-        Assert.True(comparisonIndex >= 0, $"{packageLabel} release collision must compare the embedded commit.");
-        Assert.True(publishedIndex > comparisonIndex, $"{packageLabel} release collision must publish state only after provenance matches.");
-    }
-
-    [Fact]
-    public void CollisionChecks_QueryTheOperationSpecificFeed()
-    {
-        Assert.Contains(
-            "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/index.json",
-            PublicCollisionScript(),
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void PrivateCollisionCheck_UsesTheCallerOwnerFeedWithTheCallerToken()
-    {
-        var job = Job(Parse(PublishFile), "verify-private-collision");
-        var script = PrivateCollisionScript();
-
-        // The caller-owner GitHub Packages NuGet feed is the only endpoint this
-        // token can read for the caller repository; the management REST
-        // /user/packages path is not a valid caller-token precheck.
-        Assert.Contains(
-            "https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/flatcontainer/",
-            script,
-            StringComparison.Ordinal);
-        Assert.Contains("${package_id_lower}/index.json", script, StringComparison.Ordinal);
-        Assert.Contains(@"--user ""$GITHUB_ACTOR:$GH_TOKEN""", script, StringComparison.Ordinal);
-        Assert.DoesNotContain("/user/packages", script, StringComparison.Ordinal);
-        Assert.DoesNotContain("api.github.com", script, StringComparison.Ordinal);
-
-        var env = YamlWorkflowReader.MappingChild(job, "env");
-        Assert.Equal("${{ github.token }}", YamlWorkflowReader.ScalarChild(env, "GH_TOKEN"));
-        Assert.Equal("${{ needs.build.outputs.package-id }}", YamlWorkflowReader.ScalarChild(env, "EXPECTED_PACKAGE_ID"));
-        Assert.Equal(
-            "${{ needs.build.outputs.package-version }}",
-            YamlWorkflowReader.ScalarChild(env, "PACKAGE_VERSION"));
-    }
-
-    [Fact]
-    public void CollisionChecks_TreatTransportAndUnexpectedStatusesAsFailure()
-    {
-        foreach (var script in CollisionChecks())
-        {
-            Assert.Contains("--write-out '%{http_code}'", script, StringComparison.Ordinal);
-
-            // Transport failure or a failed curl is a hard stop, never "unpublished".
-            Assert.Contains("if ! status=$(curl", script, StringComparison.Ordinal);
-            Assert.Matches("Could not (re)?check whether the", script);
-            Assert.Contains("exit 1", script, StringComparison.Ordinal);
-
-            // A malformed or empty HTTP 200 body is not a valid version index and
-            // must fail closed rather than read as "no collision".
-            Assert.Contains(
-                "jq -e 'type == \"object\" and (.versions | type == \"array\") and all(.versions[]; type == \"string\")'",
-                script,
-                StringComparison.Ordinal);
-            Assert.Contains("malformed package-version response.", script, StringComparison.Ordinal);
-
-            // Any other HTTP status is unexpected and fails closed.
-            Assert.Matches(@"returned HTTP \$status while (re)?checking", script);
-        }
-    }
-
-    [Fact]
-    public void CollisionChecks_RecordPublishedStateAndFailClosed()
-    {
-        // The unified workflow retains the release-style claim so a rerun cannot
-        // overwrite an already-published version. The former development-only
-        // overwrite rejection is gone with the separate development workflow.
-        foreach (var script in new[] { PublicCollisionScript(), PrivateCollisionScript() })
-        {
-            Assert.Contains("package-state=published", script, StringComparison.Ordinal);
-            Assert.Contains("package-state=unpublished", script, StringComparison.Ordinal);
-            Assert.DoesNotContain("refusing to overwrite.", script, StringComparison.Ordinal);
-        }
-    }
-
-    [Fact]
-    public void PublicCollisionStep_RetainsItsOrderButNeverRuns()
-    {
-        var root = Parse(PublishFile);
-        var build = BuildJob(root, PublishFile);
-        var names = StepNames(build);
-
-        var collisionIndex = names.IndexOf(PublicCollisionStep);
-        var packIndex = names.FindIndex(name => name.StartsWith("Pack calculated", StringComparison.Ordinal));
-
-        Assert.True(collisionIndex >= 0, "the publish workflow must retain the public version check.");
-        Assert.True(
-            collisionIndex < names.IndexOf("Restore with NuGet audit"),
-            "the publish workflow must retain the public version check before restoring.");
-        Assert.True(
-            collisionIndex < packIndex,
-            "the publish workflow must retain the public version check before packing.");
-
-        // The retained check is inert and cannot gate anything: routing on the
-        // discovered visibility is disabled pending a separate contract.
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Step(build, PublicCollisionStep), "if"));
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, "publish-public"), "if"));
-
-        // The publish job remains wired after the build job.
-        Assert.Equal("build", YamlWorkflowReader.ScalarChild(Job(root, "publish-public"), "needs"));
-
-        // Identity/state resolution still precedes the inert version check.
-        Assert.True(names.IndexOf("Calculate package version and tag state") < collisionIndex);
-    }
-
-    [Fact]
-    public void PrivateCollisionJob_IsDisabledAndDoesNotRouteOnVisibility()
-    {
-        var root = Parse(PublishFile);
-        var collision = Job(root, "verify-private-collision");
-
-        Assert.Equal("build", YamlWorkflowReader.ScalarChild(collision, "needs"));
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(collision, "if"));
-
-        var needs = Needs(Job(root, "publish-private"));
-        Assert.Contains("build", needs);
-        Assert.Contains("verify-private-collision", needs);
-
-        // The retained check still records published/unpublished state, but it
-        // cannot run and cannot select a registry from the discovered visibility.
-        var check = PrivateCollisionScript();
-        Assert.Contains("package-state=published", check, StringComparison.Ordinal);
-        Assert.Contains("package-state=unpublished", check, StringComparison.Ordinal);
-
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, "publish-private"), "if"));
-    }
-
-    [Fact]
-    public void PublicPublication_UsesCallerScopedOidcInsteadOfAStoredKey()
-    {
-        var publish = Job(Parse(PublishFile), "publish-public");
-        var permissions = Permissions(publish);
-
-        Assert.Equal("read", YamlWorkflowReader.ScalarChild(permissions, "contents"));
-        Assert.Equal("write", YamlWorkflowReader.ScalarChild(permissions, "id-token"));
-        Assert.False(YamlWorkflowReader.HasChild(permissions, "packages"));
-
-        var exchange = Run(publish, "Exchange OIDC identity for temporary NuGet API key");
-        Assert.Contains("ACTIONS_ID_TOKEN_REQUEST_URL", exchange, StringComparison.Ordinal);
-        Assert.Contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN", exchange, StringComparison.Ordinal);
-        Assert.Contains("audience=https%3A%2F%2Fwww.nuget.org", exchange, StringComparison.Ordinal);
-        Assert.Contains("https://www.nuget.org/api/v2/token", exchange, StringComparison.Ordinal);
-        Assert.Contains("::add-mask::", exchange, StringComparison.Ordinal);
-        Assert.Contains(@"--api-key ""$nuget_api_key""", exchange, StringComparison.Ordinal);
-        Assert.DoesNotContain("NUGET_API_KEY", exchange, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void MetadataPreflight_PrecedesRestoreCollisionAndPack()
+    public void MetadataPreflight_PrecedesRestoreAndPack()
     {
         foreach (var file in ContractFiles)
         {
@@ -1061,16 +725,17 @@ public sealed class ReusableWorkflowContractTests
                 metadataIndex < names.FindIndex(name => name.StartsWith("Pack calculated", StringComparison.Ordinal)),
                 $"{file} must discover caller metadata before packing.");
         }
+    }
 
-        // The publish workflow retains a public collision step, which must still run
-        // after discovery.
-        var publishBuild = BuildJob(Parse(PublishFile), PublishFile);
-        var publishNames = StepNames(publishBuild);
-        var publishMetadataIndex = publishNames.IndexOf(
-            YamlWorkflowReader.ScalarChild(StepById(publishBuild, "metadata"), "name"));
-        Assert.True(
-            publishMetadataIndex < publishNames.IndexOf(PublicCollisionStep),
-            "the publish workflow must discover caller metadata before checking publication state.");
+    [Fact]
+    public void ReleaseBuild_CalculatesStateAndAppliesTagRulesBeforePackaging()
+    {
+        var names = StepNames(Job(Parse(PublishFile), "build"));
+
+        var stateIndex = names.IndexOf("Calculate package version and tag state");
+        Assert.True(stateIndex >= 0);
+        Assert.True(stateIndex < names.IndexOf("Restore with NuGet audit"));
+        Assert.True(stateIndex < names.FindIndex(name => name.StartsWith("Pack calculated", StringComparison.Ordinal)));
     }
 
     [Fact]
@@ -1102,77 +767,7 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void ReleaseTagCreation_IsIdempotentAndNeverMovesOrOverwrites()
-    {
-        var finalize = Run(Job(Parse(PublishFile), "tag"), "Create or reconcile immutable release tag");
-
-        Assert.Contains("git/ref/tags/$RELEASE_TAG", finalize, StringComparison.Ordinal);
-        Assert.Contains("Release tag already exists for a different commit; refusing to move it.", finalize, StringComparison.Ordinal);
-        Assert.Contains("the tag was not moved or overwritten.", finalize, StringComparison.Ordinal);
-        Assert.Contains("git/refs", finalize, StringComparison.Ordinal);
-        Assert.Contains("--request POST", finalize, StringComparison.Ordinal);
-        Assert.Contains("if [[ \"$status\" != 201 ]]", finalize, StringComparison.Ordinal);
-        Assert.DoesNotContain("--force", finalize, StringComparison.Ordinal);
-        Assert.DoesNotContain("PATCH", finalize, StringComparison.Ordinal);
-        Assert.DoesNotContain("--request PUT", finalize, StringComparison.Ordinal);
-        Assert.DoesNotContain("--request DELETE", finalize, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void ReleaseTagJob_IsDisabledAndRetainsImmutableTagPermissions()
-    {
-        var root = Parse(PublishFile);
-        var tag = Job(root, "tag");
-        var needs = Needs(tag);
-
-        Assert.Contains("build", needs);
-        Assert.Contains("verify-private-collision", needs);
-        Assert.Contains("publish-public", needs);
-        Assert.Contains("publish-private", needs);
-
-        // No condition can enable the tag job until routing is authorized.
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(tag, "if"));
-
-        var permissions = Permissions(tag);
-        Assert.Equal("write", YamlWorkflowReader.ScalarChild(permissions, "contents"));
-        Assert.Single(permissions.Children);
-    }
-
-    [Fact]
-    public void ReleaseTagRecovery_IsDisabledAndRetainsIdempotentLogic()
-    {
-        var root = Parse(PublishFile);
-
-        // The build no longer advertises a package state: with routing disabled no
-        // downstream job consumes it.
-        Assert.False(YamlWorkflowReader.HasChild(Outputs(Job(root, "build")), "package-state"));
-
-        // Every job that could recover a tag is hard-disabled pending routing.
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, "publish-public"), "if"));
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, "publish-private"), "if"));
-        Assert.Equal("${{ false }}", YamlWorkflowReader.ScalarChild(Job(root, "tag"), "if"));
-
-        // Same-commit tag is a success and an absent tag is created; a tag on
-        // another commit fails closed without mutation.
-        var finalize = Run(Job(root, "tag"), "Create or reconcile immutable release tag");
-        Assert.Contains("if [[ \"$tag_sha\" != \"$GITHUB_SHA\" ]]", finalize, StringComparison.Ordinal);
-        Assert.Contains("404)", finalize, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void ReleaseBuild_CalculatesStateAndAppliesTagRulesBeforePackaging()
-    {
-        var names = StepNames(Job(Parse(PublishFile), "build"));
-
-        var stateIndex = names.IndexOf("Calculate package version and tag state");
-        Assert.True(stateIndex >= 0);
-        Assert.True(stateIndex < names.IndexOf(PublicCollisionStep));
-        Assert.True(stateIndex < names.IndexOf("Restore with NuGet audit"));
-        Assert.True(stateIndex < names.FindIndex(name => name.StartsWith("Pack calculated", StringComparison.Ordinal)));
-    }
-
-    [Fact]
-    public void BuildAndPublish_HandOffTheExactPackageArtifact()
+    public void BuildAndUpload_HandOffTheExactPackageArtifact()
     {
         foreach (var file in ContractFiles)
         {
@@ -1189,56 +784,15 @@ public sealed class ReusableWorkflowContractTests
             Assert.Contains("github.run_attempt", ArtifactName, StringComparison.Ordinal);
             Assert.Equal("${{ steps.version-state.outputs.package-artifact }}", YamlWorkflowReader.ScalarChild(uploadWith, "path"));
             Assert.Equal("error", YamlWorkflowReader.ScalarChild(uploadWith, "if-no-files-found"));
+
+            var outputs = Outputs(buildJob);
+            Assert.True(YamlWorkflowReader.HasChild(outputs, "package-version"));
         }
 
-        var root = Parse(PublishFile);
-        var outputs = Outputs(Job(root, "build"));
-        Assert.True(YamlWorkflowReader.HasChild(outputs, "package-artifact"));
-        Assert.True(YamlWorkflowReader.HasChild(outputs, "package-version"));
-
-        foreach (var jobName in new[] { "publish-public", "publish-private" })
-        {
-            var publish = Job(root, jobName);
-            var download = Step(publish, "Download exact package artifact");
-            var downloadWith = YamlWorkflowReader.MappingChild(download, "with");
-            Assert.Equal(ArtifactName, YamlWorkflowReader.ScalarChild(downloadWith, "name"));
-            Assert.Equal("artifacts", YamlWorkflowReader.ScalarChild(downloadWith, "path"));
-
-            // Publishing must consume the transferred artifact, never rebuild it.
-            foreach (var script in Scripts(publish))
-            {
-                Assert.DoesNotContain("dotnet pack", script, StringComparison.Ordinal);
-                Assert.DoesNotContain("dotnet build", script, StringComparison.Ordinal);
-                Assert.DoesNotContain("dotnet restore", script, StringComparison.Ordinal);
-            }
-        }
-    }
-
-    [Fact]
-    public void ArtifactNames_AreRerunSafeAndIdenticalAcrossEveryHandoffStep()
-    {
-        foreach (var file in ContractFiles)
-        {
-            var upload = Step(BuildJob(Parse(file), file), "Upload exact package artifact");
-            var uploadWith = YamlWorkflowReader.MappingChild(upload, "with");
-            var name = YamlWorkflowReader.ScalarChild(uploadWith, "name");
-
-            Assert.Contains("github.run_id", name, StringComparison.Ordinal);
-            Assert.Contains("github.run_attempt", name, StringComparison.Ordinal);
-        }
-
-        var root = Parse(PublishFile);
-        var uploaded = YamlWorkflowReader.ScalarChild(
-            YamlWorkflowReader.MappingChild(Step(BuildJob(root, PublishFile), "Upload exact package artifact"), "with"),
-            "name");
-
-        foreach (var jobName in new[] { "publish-public", "publish-private" })
-        {
-            var download = Step(Job(root, jobName), "Download exact package artifact");
-            Assert.Equal(
-                uploaded,
-                YamlWorkflowReader.ScalarChild(YamlWorkflowReader.MappingChild(download, "with"), "name"));
-        }
+        // The publish preparation advertises the exact artifact path its
+        // caller-owned publishers download; validation only retains it.
+        Assert.True(
+            YamlWorkflowReader.HasChild(Outputs(Job(Parse(PublishFile), "build")), "package-artifact"));
     }
 
     [Fact]
@@ -1278,13 +832,6 @@ public sealed class ReusableWorkflowContractTests
             Assert.Contains("tag_prefix=\"refs/tags/${PACKAGE_ID}/\"", content, StringComparison.Ordinal);
             Assert.Contains("package_artifact=\"artifacts/${PACKAGE_ID}.${package_version}.nupkg\"", content, StringComparison.Ordinal);
         }
-
-        var publishContent = Read(PublishFile);
-        Assert.Contains("EXPECTED_PACKAGE_ID: ${{ needs.build.outputs.package-id }}", publishContent, StringComparison.Ordinal);
-        Assert.Contains(
-            "package_id_lower=$(printf '%s' \"$EXPECTED_PACKAGE_ID\" | tr '[:upper:]' '[:lower:]')",
-            publishContent,
-            StringComparison.Ordinal);
     }
 
     private static string Read(string fileName) =>
@@ -1333,34 +880,11 @@ public sealed class ReusableWorkflowContractTests
         return YamlWorkflowReader.ScalarChild(step, "run");
     }
 
-    private static string PublicCollisionScript() =>
-        Run(BuildJob(Parse(PublishFile), PublishFile), PublicCollisionStep);
-
-    private static string PrivateCollisionScript() =>
-        Run(Job(Parse(PublishFile), "verify-private-collision"), PrivateCollisionStep);
-
-    private static IEnumerable<string> CollisionChecks()
-    {
-        yield return PublicCollisionScript();
-        yield return PrivateCollisionScript();
-        yield return Run(
-            Job(Parse(PublishFile), "publish-public"),
-            "Recheck calculated state and public collision before publication");
-        yield return Run(
-            Job(Parse(PublishFile), "publish-private"),
-            "Recheck calculated state and private collision before publication");
-    }
-
     private static string Run(YamlMappingNode job, string name) =>
         YamlWorkflowReader.ScalarChild(Step(job, name), "run");
 
     private static List<string> StepNames(YamlMappingNode job) =>
         Steps(job).Select(step => YamlWorkflowReader.ScalarChild(step, "name")).ToList();
-
-    private static IEnumerable<string> Scripts(YamlMappingNode job) =>
-        Steps(job)
-            .Where(step => YamlWorkflowReader.HasChild(step, "run"))
-            .Select(step => YamlWorkflowReader.ScalarChild(step, "run"));
 
     private static IReadOnlyList<YamlMappingNode> CheckoutSteps(YamlMappingNode job) =>
         Steps(job)
@@ -1368,14 +892,6 @@ public sealed class ReusableWorkflowContractTests
                 YamlWorkflowReader.HasChild(step, "uses")
                 && YamlWorkflowReader.ScalarChild(step, "uses").StartsWith("actions/checkout@", StringComparison.Ordinal))
             .ToArray();
-
-    private static IReadOnlyList<string> Needs(YamlMappingNode job) =>
-        YamlWorkflowReader.Child(job, "needs") switch
-        {
-            YamlScalarNode scalar => (IReadOnlyList<string>)new[] { scalar.Value ?? string.Empty },
-            YamlSequenceNode sequence => YamlWorkflowReader.ScalarSequence(sequence),
-            _ => throw new XunitException($"Job 'needs' in '{YamlWorkflowReader.ScalarChild(job, "name")}' is not a scalar or sequence."),
-        };
 
     private static YamlMappingNode? WorkflowCallInputs(YamlMappingNode root) =>
         YamlWorkflowReader.Child(YamlWorkflowReader.MappingChild(root, "on"), "workflow_call") is YamlMappingNode call
