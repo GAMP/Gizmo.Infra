@@ -1,6 +1,9 @@
 name: Reconcile immutable NuGet release tag
 description: Recheck caller tag state and create the missing immutable package-qualified release tag.
 inputs:
+  branch-role:
+    description: Preparation branch role; tagging fails closed unless this is exactly release.
+    required: true
   release-tag:
     description: Package-qualified release tag, for example Gizmo.Shared/v3.0.0.
     required: true
@@ -19,6 +22,7 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         REF_NAME: ${{ github.ref }}
         REF_PROTECTED: ${{ github.ref_protected }}
+        BRANCH_ROLE: ${{ inputs.branch-role }}
       run: |
         set -euo pipefail
         if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
@@ -27,6 +31,10 @@ runs:
         fi
         if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
           echo "Tagging requires a protected branch ref." >&2
+          exit 1
+        fi
+        if [[ "$BRANCH_ROLE" != release ]]; then
+          echo "Tagging requires the preparation branch role 'release'; refusing to tag a '$BRANCH_ROLE' run." >&2
           exit 1
         fi
 

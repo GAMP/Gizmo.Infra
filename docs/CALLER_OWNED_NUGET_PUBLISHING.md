@@ -21,104 +21,29 @@ publisher needs.
 
 ## Canonical caller shape
 
-Pin both the reusable workflow and every composite action to the same complete
-40-character Gizmo.Infra commit SHA. Keep the caller workflow on a protected
-branch and trigger it only from `push` or `workflow_dispatch`; every publisher
-composite repeats the protected-branch and event check and fails closed. Do not
-name the development or release branches in the trigger: the caller's
-`.github/package.yml` configuration and the preflight `branch-role` output are
-the only branch-role authority, and any other ref resolves to `none` and
-publishes nothing.
+The versioned, tested caller workflow is
+[`.github/templates/package-publish.yml`](../.github/templates/package-publish.yml).
+Copy it to the caller repository as `.github/workflows/package-publish.yml` and
+replace every `<40-character-infra-commit-sha>` placeholder with the same
+immutable, complete 40-character Gizmo.Infra commit SHA. Do not rename the file:
+the caller workflow name is also the NuGet.org Trusted Publishing binding.
 
-```yaml
-name: Publish package
+Pinning every Gizmo.Infra workflow and composite-action reference to one
+immutable 40-character commit SHA is a GitHub supply-chain invariant. It is
+enforced by the caller template and is separate from the NuGet.org policy
+described below.
 
-on:
-  push:
-  workflow_dispatch:
+Keep the caller workflow on a protected branch and trigger it only from `push`
+or `workflow_dispatch`; every publisher and the tag action repeats the
+protected-branch and event check and fails closed. Do not name the development or
+release branches in the trigger: the caller's `.github/package.yml` configuration
+and the preflight `branch-role` output are the only branch-role authority, and
+any other ref resolves to `none` and publishes nothing.
 
-permissions:
-  contents: read
-
-concurrency:
-  group: nuget-${{ github.repository }}
-  cancel-in-progress: false
-
-jobs:
-  prepare:
-    uses: GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@<40-character-infra-commit-sha>
-    permissions:
-      contents: read
-
-  publish-public:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Publish public package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-public-publish@<40-character-infra-commit-sha>
-        with:
-          package-id: ${{ needs.prepare.outputs.package-id }}
-          nuget-user: ${{ vars.NUGET_USER }}
-          package-artifact: ${{ needs.prepare.outputs.package-artifact }}
-          package-version: ${{ needs.prepare.outputs.package-version }}
-          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
-          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}
-          repository-visibility: ${{ needs.prepare.outputs.repository-visibility }}
-
-  publish-private:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Publish private package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-private-publish@<40-character-infra-commit-sha>
-        with:
-          package-id: ${{ needs.prepare.outputs.package-id }}
-          package-artifact: ${{ needs.prepare.outputs.package-artifact }}
-          package-version: ${{ needs.prepare.outputs.package-version }}
-          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
-          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}
-          repository-visibility: ${{ needs.prepare.outputs.repository-visibility }}
-
-  reject-unsupported-visibility:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - name: Fail closed for unsupported visibility
-        shell: bash
-        env:
-          REPOSITORY_VISIBILITY: ${{ needs.prepare.outputs.repository-visibility }}
-        run: |
-          set -euo pipefail
-          echo "Unsupported caller repository visibility '$REPOSITORY_VISIBILITY' for this branch role; refusing to publish or tag." >&2
-          exit 1
-
-  tag:
-    needs:
-      - prepare
-      - publish-public
-      - publish-private
-    if: ${{ always() && needs.prepare.outputs.branch-role == 'release' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Reconcile immutable release tag
-        uses: GAMP/Gizmo.Infra/.github/actions/package-release-tag@<40-character-infra-commit-sha>
-        with:
-          release-tag: ${{ needs.prepare.outputs.release-tag }}
-          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
-          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}
-```
+The caller template owns the single non-cancelling caller-repository concurrency
+group `nuget-${{ github.repository }}` around preparation, publication, and
+tagging. The reusable preparation workflow declares no concurrency of its own, so
+one run is never evaluated against the same lock twice.
 
 ## Routing and authentication
 
@@ -134,6 +59,12 @@ the preparation output and branch role:
 - Any other visibility (including `internal`) runs only
   `reject-unsupported-visibility`, which fails closed, and runs no publisher and
   no tag.
+
+The tag job runs only when the preparation resolved `release` and the selected
+publisher succeeded, so a development run never tags. It also passes the
+prepared `branch-role` to `package-release-tag`, whose own validation fails
+closed unless that value is exactly `release`; a caller wiring mistake cannot
+produce a tag from a development or unresolved run.
 
 The visibility used for routing is only
 `needs.prepare.outputs.repository-visibility`, the authenticated value from the
@@ -155,12 +86,26 @@ same-SHA rerun recovery without a permanent key and without moving a tag.
 
 ## NuGet.org trusted publishing
 
-Configure NuGet.org Trusted Publishing for the caller repository to trust the
-caller's own publishing workflow file, because the OIDC-requesting job is
-defined by that caller workflow. Bind the exact caller repository and the
-approved immutable Gizmo.Infra revision used to pin `package-public-publish`,
-without wildcards. The repository or organization variable `NUGET_USER` remains
-a NuGet.org profile identifier, not a secret or API key.
+Public publishing uses NuGet.org Trusted Publishing instead of a stored API key.
+The OIDC-requesting job is the caller-owned normal job, so the NuGet.org policy
+binds the caller identity and the caller workflow file, never Gizmo.Infra:
+
+- **Repository owner and repository** — the exact GitHub owner and repository
+  that publishes, without wildcards, for example `GAMP` and `Gizmo.Widget`.
+- **Workflow file** — exactly the caller `package-publish.yml`. That caller
+  workflow defines the OIDC-requesting job, so it is the trusted identity; the
+  same policy covers both development and stable publication.
+- **Environment and scopes** — set only when the caller deliberately deploys the
+  job through a GitHub environment or narrows package scopes; otherwise leave
+  them unset.
+
+Do not bind the Gizmo.Infra SHA in the NuGet.org policy. The immutable
+Gizmo.Infra commit SHA pinned on every Infra workflow and action reference is a
+separate GitHub supply-chain invariant and must not appear in the Trusted
+Publishing binding.
+
+The repository or organization variable `NUGET_USER` remains a NuGet.org profile
+identifier, not a secret or API key.
 
 Do not use `secrets: inherit`, pass a permanent API key, or create a
 `NUGET_API_KEY` secret. The public path obtains a short-lived API key through

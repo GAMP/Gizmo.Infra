@@ -33,10 +33,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: nuget-${{ github.repository }}
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Prepare package

@@ -37,8 +37,9 @@ public sealed class ReusableWorkflowContractTests
     // name, so the attempt discriminator is part of the contract.
     private const string ArtifactName = "nuget-package-${{ github.run_id }}-${{ github.run_attempt }}";
 
-    // Every operation shares one caller-repository lock; the preflight derives
-    // the package from the workspace, so the group is not per-package.
+    // The caller template and the direct validation workflow share one
+    // caller-repository lock; the preflight derives the package from the
+    // workspace, so the group is not per-package.
     private const string ConcurrencyGroup = "nuget-${{ github.repository }}";
 
     // The preflight action is the only authority for the publish branch role; the
@@ -252,20 +253,31 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void Concurrency_UsesANonCancellingCallerRepositoryGroup()
+    public void ValidationWorkflow_UsesANonCancellingCallerRepositoryGroup()
     {
-        foreach (var file in ContractFiles)
-        {
-            var concurrency = YamlWorkflowReader.MappingChild(Parse(file), "concurrency");
-            var group = YamlWorkflowReader.ScalarChild(concurrency, "group");
+        // Validation is called directly and owns its own caller-repository lock.
+        var concurrency = YamlWorkflowReader.MappingChild(Parse(ValidationFile), "concurrency");
+        var group = YamlWorkflowReader.ScalarChild(concurrency, "group");
 
-            Assert.Equal(ConcurrencyGroup, group);
-            Assert.Contains("github.repository", group, StringComparison.Ordinal);
-            Assert.DoesNotContain("package-id", group, StringComparison.Ordinal);
-            Assert.Equal("false", YamlWorkflowReader.ScalarChild(concurrency, "cancel-in-progress"));
+        Assert.Equal(ConcurrencyGroup, group);
+        Assert.Contains("github.repository", group, StringComparison.Ordinal);
+        Assert.DoesNotContain("package-id", group, StringComparison.Ordinal);
+        Assert.Equal("false", YamlWorkflowReader.ScalarChild(concurrency, "cancel-in-progress"));
 
-            Assert.DoesNotContain("cancel-in-progress: true", Read(file), StringComparison.Ordinal);
-        }
+        Assert.DoesNotContain("cancel-in-progress: true", Read(ValidationFile), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PublishPreparationWorkflow_DeclaresNoConcurrency()
+    {
+        // The canonical caller template owns the caller-repository lock around
+        // prepare -> publish -> tag. The reusable preparation workflow must not
+        // redeclare the same group, because a nested evaluation of the same lock
+        // can deadlock the run against itself.
+        var content = Read(PublishFile);
+
+        Assert.DoesNotContain("concurrency", content, StringComparison.Ordinal);
+        Assert.DoesNotContain(ConcurrencyGroup, content, StringComparison.Ordinal);
     }
 
     [Fact]

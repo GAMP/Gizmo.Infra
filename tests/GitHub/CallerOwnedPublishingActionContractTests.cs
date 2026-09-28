@@ -223,4 +223,66 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.DoesNotContain("--request DELETE", content, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("force", content, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void ReleaseTagAction_DeclaresARequiredReleaseOnlyBranchRoleInput()
+    {
+        var root = YamlWorkflowReader.Parse(Read("package-release-tag"));
+        var branchRole = YamlWorkflowReader.MappingChild(
+            YamlWorkflowReader.MappingChild(root, "inputs"), "branch-role");
+
+        Assert.Equal("true", YamlWorkflowReader.ScalarChild(branchRole, "required"));
+        Assert.Contains(
+            "BRANCH_ROLE: ${{ inputs.branch-role }}",
+            Read("package-release-tag"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReleaseTagAction_AcceptsOnlyTheExactReleaseBranchRole()
+    {
+        var result = RunReleaseTagValidation("release");
+
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    [Theory]
+    [InlineData("development")]
+    [InlineData("none")]
+    [InlineData("Release")]
+    [InlineData("release ")]
+    [InlineData("")]
+    public void ReleaseTagAction_FailsClosedForAnyNonReleaseBranchRole(string branchRole)
+    {
+        // A caller wiring mistake must not be able to tag from a development or
+        // unresolved preparation run; the action repeats the release-only guard.
+        var result = RunReleaseTagValidation(branchRole);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(
+            "Tagging requires the preparation branch role 'release'",
+            result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    private static ShellResult RunReleaseTagValidation(string branchRole)
+    {
+        var root = YamlWorkflowReader.Parse(Read("package-release-tag"));
+        var runs = YamlWorkflowReader.MappingChild(root, "runs");
+        var step = YamlWorkflowReader.MappingSequence(runs, "steps").Single(step =>
+            YamlWorkflowReader.ScalarChild(step, "name") == "Validate trusted tag invocation");
+
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["EVENT_NAME"] = "push",
+            ["REF_NAME"] = "refs/heads/main",
+            ["REF_PROTECTED"] = "true",
+            ["BRANCH_ROLE"] = branchRole,
+        };
+
+        return WorkflowShell.RunBash(
+            YamlWorkflowReader.ScalarChild(step, "run"),
+            Path.GetTempPath(),
+            environment);
+    }
 }

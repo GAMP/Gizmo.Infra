@@ -1,0 +1,98 @@
+# Canonical caller-owned NuGet publishing workflow.
+#
+# Copy this file to the caller repository as `.github/workflows/package-publish.yml`
+# and replace every `<40-character-infra-commit-sha>` placeholder with the same
+# immutable, complete 40-character Gizmo.Infra commit SHA. The caller workflow
+# name `package-publish.yml` is also the NuGet.org Trusted Publishing workflow
+# binding; do not rename it.
+name: Publish package
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The caller workflow owns the single caller-repository lock around
+# preparation, publication, and tagging. The reusable preparation workflow
+# declares no concurrency so this lock is never nested against itself.
+concurrency:
+  group: nuget-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    uses: GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@<40-character-infra-commit-sha>
+    permissions:
+      contents: read
+
+  publish-public:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Publish public package
+        uses: GAMP/Gizmo.Infra/.github/actions/package-public-publish@<40-character-infra-commit-sha>
+        with:
+          package-id: ${{ needs.prepare.outputs.package-id }}
+          nuget-user: ${{ vars.NUGET_USER }}
+          package-artifact: ${{ needs.prepare.outputs.package-artifact }}
+          package-version: ${{ needs.prepare.outputs.package-version }}
+          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
+          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}
+          repository-visibility: ${{ needs.prepare.outputs.repository-visibility }}
+
+  publish-private:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Publish private package
+        uses: GAMP/Gizmo.Infra/.github/actions/package-private-publish@<40-character-infra-commit-sha>
+        with:
+          package-id: ${{ needs.prepare.outputs.package-id }}
+          package-artifact: ${{ needs.prepare.outputs.package-artifact }}
+          package-version: ${{ needs.prepare.outputs.package-version }}
+          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
+          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}
+          repository-visibility: ${{ needs.prepare.outputs.repository-visibility }}
+
+  reject-unsupported-visibility:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Fail closed for unsupported visibility
+        shell: bash
+        env:
+          REPOSITORY_VISIBILITY: ${{ needs.prepare.outputs.repository-visibility }}
+        run: |
+          set -euo pipefail
+          echo "Unsupported caller repository visibility '$REPOSITORY_VISIBILITY' for this branch role; refusing to publish or tag." >&2
+          exit 1
+
+  tag:
+    needs:
+      - prepare
+      - publish-public
+      - publish-private
+    if: ${{ always() && needs.prepare.outputs.branch-role == 'release' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Reconcile immutable release tag
+        uses: GAMP/Gizmo.Infra/.github/actions/package-release-tag@<40-character-infra-commit-sha>
+        with:
+          branch-role: ${{ needs.prepare.outputs.branch-role }}
+          release-tag: ${{ needs.prepare.outputs.release-tag }}
+          calculated-state: ${{ needs.prepare.outputs.calculated-state }}
+          tag-state-fingerprint: ${{ needs.prepare.outputs.tag-state-fingerprint }}

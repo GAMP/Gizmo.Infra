@@ -107,7 +107,7 @@ Gizmo.Infra composite actions:
 | --- | --- | --- | --- |
 | `package-public-publish` | NuGet.org | OIDC (`id-token: write`) | development and release |
 | `package-private-publish` | GitHub Packages | Caller `GITHUB_TOKEN` (`packages: write`) | development and release |
-| `package-release-tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | release only |
+| `package-release-tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | release only; requires a `release` preparation `branch-role` and fails closed otherwise |
 
 Each publisher re-downloads the exact prepared artifact, refetches the complete
 package tag state under the exact `<package-id>/` prefix, rechecks the
@@ -158,10 +158,15 @@ version, complete calculated state, and a tag-state fingerprint only for
 resolves `none`, the version calculation, restore, build, pack, and upload are
 skipped and the caller performs no publication or tag work.
 
-Development, release, and validation use a shared caller-repository concurrency
-group `nuget-${{ github.repository }}` with `cancel-in-progress: false`. It
-never cancels running work. GitHub does not guarantee FIFO: the latest pending
-run may replace an earlier pending run, so this is not a durable queue.
+The canonical caller publish template owns the single non-cancelling
+caller-repository concurrency group `nuget-${{ github.repository }}` around
+preparation, publication, and tagging, so development and release do not overlap
+unbounded. The reusable publish preparation workflow declares no concurrency of
+its own: GitHub evaluates a called workflow against the caller's lock, and a
+nested declaration of the same group can deadlock the run against itself. The
+direct validation workflow declares the same non-cancelling group, and it never
+cancels running work. GitHub does not guarantee FIFO: the latest pending run may
+replace an earlier pending run, so this is not a durable queue.
 
 ## Artifacts, collision checks, and release recovery
 
@@ -189,6 +194,12 @@ migrate consumers or enable CPM floating-version behavior.
 Public publication requires the caller to configure NuGet.org Trusted
 Publishing to trust the caller repository's own publishing workflow file,
 because the OIDC-requesting job is a caller-owned normal job. Bind the exact
-caller repository and the approved immutable Gizmo.Infra revision used to pin
-the composite action, without wildcards. The repository or organization
+caller owner and repository and the caller `package-publish.yml` workflow file,
+without wildcards, plus an optional GitHub environment or package scopes if the
+caller uses them. The same caller policy covers both development and stable
+publication.
+
+Do not bind the Gizmo.Infra commit SHA in the NuGet.org policy. Pinning every
+Gizmo.Infra workflow and action reference to one immutable 40-character commit
+SHA is a separate GitHub supply-chain invariant. The repository or organization
 variable `NUGET_USER` is a NuGet.org profile identifier, not a secret or API key.
