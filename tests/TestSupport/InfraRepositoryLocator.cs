@@ -1,10 +1,6 @@
 namespace Gizmo.Infra.Tests.TestSupport;
 
-/// <summary>
-/// Finds the local Gizmo.Infra repository root so tests can assert on committed
-/// documentation the tool ships with. <see cref="EnvironmentVariable"/> overrides
-/// the walk-up default for other layouts.
-/// </summary>
+/// <summary>Finds the local Gizmo.Infra repository root; <see cref="EnvironmentVariable"/> overrides the walk-up default.</summary>
 public static class InfraRepositoryLocator
 {
     public const string EnvironmentVariable = "GIZMO_INFRA_ROOT";
@@ -34,6 +30,4 @@ public static class InfraRepositoryLocator
             $"Could not locate the Gizmo.Infra repository (expected {SolutionFile}). "
             + $"Set {EnvironmentVariable} to the repository root.");
     }
-
-    public static string DocsPath(string root, string fileName) => Path.Combine(root, "docs", fileName);
 }

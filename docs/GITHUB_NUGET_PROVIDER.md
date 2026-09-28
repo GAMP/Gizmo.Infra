@@ -1,8 +1,11 @@
 # GitHub NuGet provider
 
 This is the callable-workflow contract for GitHub Actions NuGet pipelines in
-Gizmo.Infra. It documents workflows only; it does not configure GitHub, NuGet,
-or a caller repository, and it does not perform a publication or tag write.
+Gizmo.Infra. It documents workflows and composite actions only; it does not
+configure GitHub, NuGet, or a caller repository, and the reusable publish
+workflow does not perform a publication or tag write. The caller-owned routing
+and authentication shape is in
+[CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md).
 
 ## Callable workflows
 
@@ -12,7 +15,7 @@ descriptor version, workflow version, or equivalent version input.
 | Workflow | Purpose | Caller permissions |
 | --- | --- | --- |
 | `.github/workflows/package-validation.yml` | Calculate, restore, audit, build, pack, and retain a nonpublished validation package. It cannot publish or tag. | `contents: read` |
-| `.github/workflows/package-publish.yml` | Resolves the caller branch role, then calculates, builds, packs, and retains a nonpublished development or stable package. A `none` role stops before tag lookup, restore, build, pack, publication, or tagging work. | `contents: read` |
+| `.github/workflows/package-publish.yml` | Resolve the caller branch role, calculate the development or stable version and tag state, build, pack, and upload the exact package artifact, then export caller-routing outputs. It never requests OIDC, never contacts a package feed, never publishes, and never creates a tag. | `contents: read` |
 
 Every caller must use an immutable, complete 40-character Gizmo.Infra commit
 SHA. A branch, tag, abbreviated SHA, or expression is not an acceptable
@@ -53,11 +56,7 @@ authenticated repository metadata with bounded connect and total request
 timeouts, then emits the `repository-visibility` output. Only `public`,
 `private`, and `internal` visibility values are accepted; transport failures,
 timeouts, non-success responses, malformed metadata, and unknown values fail
-closed. It never reads
-`github.event.repository.visibility`. This release only discovers and validates
-visibility; it does not introduce registry-routing behavior. Consequently, the
-public/private collision, publication, and release-tag jobs are disabled until a
-separate routing contract is authorized.
+closed. It never reads `github.event.repository.visibility`.
 
 The reusable workflow validates its own repository and file path through the
 caller-independent `job.workflow_*` contexts. It validates `job.workflow_ref` as
@@ -66,21 +65,59 @@ SHA reported by `job.workflow_sha`, then checks out that exact commit into
 `.gizmo-infra` and runs the bundled preflight action there; it never assumes a
 caller-local `./.github/actions` path belongs to Gizmo.Infra. `job.workflow_sha`
 alone is a resolved commit and cannot establish that a caller used a full SHA;
-the original `job.workflow_ref` check enforces that invariant. Repository
-visibility discovery is diagnostic and fail-closed only; it does not select a
-collision check or publishing registry.
+the original `job.workflow_ref` check enforces that invariant.
+
+## Preparation outputs for caller-owned routing
+
+The publish workflow is a preparation authority. It exports `package-artifact`,
+`package-version`, `release-tag`, `release-tag-state`, `calculated-state`,
+`tag-state-fingerprint`, `package-id`, `branch-role`, and
+`repository-visibility` from its `build` job. The caller-owned jobs consume
+those outputs; the reusable workflow itself does not read its own
+`repository-visibility` output to select a registry, gate a job, or branch a
+step.
+
+Discovered visibility, selected registry, and authentication are three separate
+concerns:
+
+| Discovered visibility | Selected registry | Authentication |
+| --- | --- | --- |
+| `public` | NuGet.org | Caller-owned OIDC (`id-token: write`), exchanged for a short-lived NuGet.org API key |
+| `private` | GitHub Packages | Caller `GITHUB_TOKEN` with `packages: write` |
+| `internal` | none | None; the caller must fail closed with no publication or tag work |
+
+The reusable publish workflow only discovers and exports visibility. The caller
+owns the registry decision and every credential. Internal visibility is
+explicitly fail-closed: a caller must not route it to either registry.
 
 Callers grant permissions on the calling job; a called workflow cannot elevate
 them. Do not use `secrets: inherit`, pass an API key, or create a
-`NUGET_API_KEY` secret. The active workflows do not request publication
-credentials or publish to either registry.
+`NUGET_API_KEY` secret. The public publisher requests only `contents: read` and
+`id-token: write`; the private publisher requests only `contents: read` and
+`packages: write`; the tag job requests only `contents: write`. The reusable
+preparation workflow requests only `contents: read` and never requests OIDC.
 
-## Publisher invocation trust boundary
+## Composite actions
 
-The public/private collision, publisher, and release-tag jobs remain disabled.
-They do not obtain OIDC or package credentials, download artifacts, contact a
-package feed, or create tags. A separate routing contract must restore an
-operation-specific publisher path and its protected-branch trust boundary.
+The reusable preparation workflow runs the bundled `package-preflight`
+composite action for discovery. The caller-owned jobs then compose these pinned
+Gizmo.Infra composite actions:
+
+| Action | Registry | Credentials | Modes |
+| --- | --- | --- | --- |
+| `package-public-publish` | NuGet.org | OIDC (`id-token: write`) | development and release |
+| `package-private-publish` | GitHub Packages | Caller `GITHUB_TOKEN` (`packages: write`) | development and release |
+| `package-release-tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | release only; requires a `release` preparation `branch-role` and fails closed otherwise |
+
+Each publisher re-downloads the exact prepared artifact, refetches the complete
+package tag state under the exact `<package-id>/` prefix, rechecks the
+calculated-state and tag-state fingerprint, and only then contacts its feed. A
+version that already exists with the caller SHA embedded as provenance is
+treated as an already-published success so the immutable release tag can be
+reconciled; a version that exists without matching provenance fails closed. The
+public publisher rejects any visibility other than `public`, and the private
+publisher rejects any visibility other than `private`, so internal visibility
+cannot be silently routed by a caller mistake.
 
 ## Automatic versioning
 
@@ -117,24 +154,32 @@ moves or overwrites a tag.
 The publish workflow uses the preflight action as the only authority for branch
 role and never parses `.github/package.yml` itself. Its build job emits package
 version, complete calculated state, and a tag-state fingerprint only for
-`development` or `release`. The inactive publisher and tag jobs retain their
-fail-closed rechecks but do not run until a routing contract authorizes them.
+`development` or `release`, plus the caller-routing outputs. When the preflight
+resolves `none`, the version calculation, restore, build, pack, and upload are
+skipped and the caller performs no publication or tag work.
 
-Development, release, and validation use a shared caller-repository concurrency
-group `nuget-${{ github.repository }}` with `cancel-in-progress: false`. It
-never cancels running work. GitHub does not guarantee FIFO: the latest pending
-run may replace an earlier pending run, so this is not a durable queue.
+The canonical caller publish template owns the single non-cancelling
+caller-repository concurrency group `nuget-${{ github.repository }}` around
+preparation, publication, and tagging, so development and release do not overlap
+unbounded. The reusable publish preparation workflow declares no concurrency of
+its own: GitHub evaluates a called workflow against the caller's lock, and a
+nested declaration of the same group can deadlock the run against itself. The
+direct validation workflow declares the same non-cancelling group, and it never
+cancels running work. GitHub does not guarantee FIFO: the latest pending run may
+replace an earlier pending run, so this is not a durable queue.
 
 ## Artifacts, collision checks, and release recovery
 
 The build job packs the calculated version with the caller commit as repository
 metadata and uploads only its exact `.nupkg` path. Artifact names include both
-`github.run_id` and `github.run_attempt`. No active job downloads the artifact,
-queries a package feed, publishes, or creates a release tag.
+`github.run_id` and `github.run_attempt`, so a rerun can download the exact
+artifact that its preparation produced. The caller-owned publisher actions
+download that artifact by name and never rebuild it; they recheck collision and
+provenance immediately before publishing.
 
 All action references are pinned to full commit SHAs, checkout credentials are
 disabled, and caller-supplied strings enter shell commands only through quoted
-environment variables. No third-party GitHub Action is used.
+environment variables.
 
 ## Consumer development ranges
 
@@ -146,7 +191,15 @@ migrate consumers or enable CPM floating-version behavior.
 
 ## Public NuGet trusted publishing
 
-Do not configure NuGet.org Trusted Publishing for these inactive publishers.
-Any future publisher is a confirmation-gated operator action and must bind the
-exact caller repository and approved immutable Gizmo.Infra revision without
-wildcards.
+Public publication requires the caller to configure NuGet.org Trusted
+Publishing to trust the caller repository's own publishing workflow file,
+because the OIDC-requesting job is a caller-owned normal job. Bind the exact
+caller owner and repository and the caller `package-publish.yml` workflow file,
+without wildcards, plus an optional GitHub environment or package scopes if the
+caller uses them. The same caller policy covers both development and stable
+publication.
+
+Do not bind the Gizmo.Infra commit SHA in the NuGet.org policy. Pinning every
+Gizmo.Infra workflow and action reference to one immutable 40-character commit
+SHA is a separate GitHub supply-chain invariant. The repository or organization
+variable `NUGET_USER` is a NuGet.org profile identifier, not a secret or API key.
