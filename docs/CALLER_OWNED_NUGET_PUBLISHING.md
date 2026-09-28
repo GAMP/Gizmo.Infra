@@ -84,6 +84,38 @@ push, and succeeds so the tag job can reconcile the immutable release tag. A
 version that exists without matching provenance fails closed. This preserves
 same-SHA rerun recovery without a permanent key and without moving a tag.
 
+## One-time existing-package adoption
+
+The unified workflow never adopts an existing package on its own. A package that
+was published before the compatibility line had a matching tag, or by another
+mechanism, leaves the line unbootstrapped. Steady-state publishing for the
+calculated version then fails closed, because the existing package does not carry
+the caller commit as `RepositoryCommit` and the workflow refuses to publish or
+create a recovery tag.
+
+Adoption is a separate, deliberate, one-time caller action. It is not part of the
+reusable workflow, the caller template, or either publisher action. Before
+creating a tag, prove the existing package's provenance conclusively:
+
+1. Resolve the package version the line must adopt. An unbootstrapped
+   compatibility line adopts its first `3.X.0`.
+2. Download the exact published package and read the `RepositoryCommit` value
+   from its `.nuspec` metadata. The value must be a well-formed 40-character
+   commit SHA.
+3. Prove that commit is a real commit in the caller repository, for example with
+   the Git-refs or commits API or `git cat-file -e <sha>^{commit}`, and that it is
+   the commit that produced the published package. Do not adopt a package whose
+   provenance is absent, malformed, or not a caller commit.
+4. Deliberately create the immutable package-qualified tag `<package-id>/v3.X.Y`
+   pointing at that exact commit, outside the workflow. This is the one-time
+   adoption. Never move or overwrite an existing tag.
+5. Re-run the normal caller workflow. The line now has a matching stable tag, so
+   the next release claims `Y+1` and steady-state publishing and tagging resume.
+
+Any ambiguous, conflicting, or unproven state fails closed: do not guess a tag
+target, do not create a synthetic tag, and do not route the package through a
+publisher to force adoption.
+
 ## NuGet.org trusted publishing
 
 Public publishing uses NuGet.org Trusted Publishing instead of a stored API key.

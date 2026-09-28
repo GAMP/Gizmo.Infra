@@ -168,6 +168,44 @@ direct validation workflow declares the same non-cancelling group, and it never
 cancels running work. GitHub does not guarantee FIFO: the latest pending run may
 replace an earlier pending run, so this is not a durable queue.
 
+## One-time existing-package bootstrap and adoption
+
+Stable package and tag state is scoped per package and per compatibility line.
+For each package the workflow considers only the complete tag set under the exact
+`<package-id>/` prefix and only the matching compatibility line; tags for another
+package or another compatibility line never advance the candidate.
+
+An unbootstrapped compatibility line has no matching stable tag and starts at the
+first `3.X.0`: validation and development advertise that patch and a new release
+calculates `3.X.0` with `release-tag-state=missing`. The preparation workflow
+never creates a synthetic tag. The immutable release tag is created only by the
+caller-owned `package-release-tag` action, in a resolved `release` run, after the
+selected publisher succeeded, and only for the exact calculated release tag.
+
+A stable package and its `<package-id>/v3.X.Y` tag must stay consistent. When the
+matching stable tag already exists, the next release claims `Y+1`, and a
+same-commit rerun reuses the exact tagged version. A tag is never moved or
+overwritten, and a claimed tag that resolves to a different commit is a failure.
+
+The steady-state workflow does not adopt an existing package. The publisher's
+provenance recheck accepts an already-published calculated version only when the
+package carries the exact caller commit in its `RepositoryCommit` metadata;
+same-SHA recovery is the only automatic success. A stable package at the
+calculated version with absent, malformed, or different provenance fails closed,
+and the workflow neither publishes nor creates a recovery tag. Adopting a stable
+package whose matching tag is missing into the compatibility line is a separate,
+deliberate, one-time operator action outside the workflow and requires
+conclusive `RepositoryCommit` provenance tied to a real caller commit in the
+caller repository before the tag is created; see
+[CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md).
+
+Ambiguous, conflicting, or unproven state fails closed. Multiple tags that
+resolve to the caller commit, a malformed tag under the package prefix, a tag
+outside the requested prefix, an unresolvable or non-commit tag, and a
+calculated-state or tag-state drift all abort the run. The workflow carries no
+legacy bootstrap logic: the only bootstrap behavior is the generic next-patch
+derivation from the complete line tag state.
+
 ## Artifacts, collision checks, and release recovery
 
 The build job packs the calculated version with the caller commit as repository
