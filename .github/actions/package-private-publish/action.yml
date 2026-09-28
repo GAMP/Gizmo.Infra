@@ -104,12 +104,36 @@ runs:
         if [[ "$EXPECTED_STATE" != *";tag-state=${tag_state}" || "$fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then echo "Calculated package state drifted before publication; refusing to publish." >&2; exit 1; fi
         package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
         version_lower=$(printf '%s' "$PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
-        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/flatcontainer/${package_id_lower}/index.json"); then echo "Could not recheck whether the private package version already exists." >&2; exit 1; fi
+        service_index_url="https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json"
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$service_index_url"); then echo "Could not read the GitHub Packages NuGet service index for the private package recheck." >&2; exit 1; fi
+        if [[ "$status" != 200 ]]; then echo "GitHub Packages returned HTTP $status for the NuGet service index during publication recheck." >&2; exit 1; fi
+        if ! package_base_address=$(jq -er '
+          if type == "object" and (.resources | type == "array") then
+            [.resources[]
+             | select(
+                 (.["@type"] | type == "string" and . == "PackageBaseAddress/3.0.0")
+                 or (.["@type"] | type == "array" and (index("PackageBaseAddress/3.0.0") != null))
+               )
+             | .["@id"]
+            ]
+            | if length == 1 and (.[0] | type == "string") and (.[0] | length > 0) then .[0] else empty end
+          else
+            error("malformed service index")
+          end
+        ' "$response_file"); then echo "GitHub Packages returned a malformed, missing, or ambiguous PackageBaseAddress resource in its NuGet service index." >&2; exit 1; fi
+        if [[ "$package_base_address" != https://* || "$package_base_address" == *[[:space:]]* || "$package_base_address" == *\\* || "$package_base_address" == *..* || "$package_base_address" == *\?* || "$package_base_address" == *\#* ]]; then
+          echo "GitHub Packages returned a malformed PackageBaseAddress @id in its NuGet service index." >&2
+          exit 1
+        fi
+        package_base_address=${package_base_address%/}
+        package_index_url="$package_base_address/${package_id_lower}/index.json"
+        package_download_url="$package_base_address/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$package_index_url"); then echo "Could not recheck whether the private package version already exists." >&2; exit 1; fi
         case "$status" in
           200)
             jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null || { echo "GitHub Packages returned a malformed package-version response." >&2; exit 1; }
             if jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then
-              if ! status=$(curl --silent --show-error --location --output "$package_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"); then echo "Could not read the published private package for collision provenance." >&2; exit 1; fi
+              if ! status=$(curl --silent --show-error --location --output "$package_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$package_download_url"); then echo "Could not read the published private package for collision provenance." >&2; exit 1; fi
               if [[ "$status" != 200 ]]; then echo "GitHub Packages returned HTTP $status for the published private package; treating the existing version as an unverifiable collision." >&2; exit 1; fi
               nuspec=$(unzip -p "$package_file" '*.nuspec' 2>/dev/null || true)
               repository_commit=$(printf '%s' "$nuspec" | grep -oE 'commit="[0-9a-fA-F]{40}"' | head -n 1 | sed -E 's/.*"([0-9a-fA-F]{40})".*/\1/' | tr 'A-F' 'a-f' || true)

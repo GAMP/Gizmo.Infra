@@ -116,7 +116,7 @@ public sealed class CallerOwnedPublishingActionContractTests
 
         Assert.Contains("github.ref_protected", content, StringComparison.Ordinal);
         Assert.Contains("github.event_name", content, StringComparison.Ordinal);
-        Assert.Contains("https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/flatcontainer/", content, StringComparison.Ordinal);
+        Assert.Contains("service_index_url=\"https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json\"", content, StringComparison.Ordinal);
         Assert.Contains(@"--user ""$GITHUB_ACTOR:$GH_TOKEN""", content, StringComparison.Ordinal);
         Assert.Contains(
             @"dotnet nuget push ""$PACKAGE_ARTIFACT"" --source ""https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json"" --api-key ""$GH_TOKEN""",
@@ -131,6 +131,82 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}", content, StringComparison.Ordinal);
         Assert.Contains("if [[ \"$REPOSITORY_VISIBILITY\" != private ]]; then", content, StringComparison.Ordinal);
         Assert.DoesNotContain("nuget-user", content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PrivatePublisher_ResolvesPackageBaseAddressFromTheAuthenticatedServiceIndex()
+    {
+        var content = Read("package-private-publish");
+
+        // The collision recheck discovers the flat-container base from the
+        // authenticated NuGet V3 service index instead of assuming a path shape.
+        Assert.Contains(
+            "service_index_url=\"https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$service_index_url\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains("\"PackageBaseAddress/3.0.0\"", content, StringComparison.Ordinal);
+        Assert.Contains(".[\"@id\"]", content, StringComparison.Ordinal);
+        Assert.Contains("if length == 1 and (.[0] | type == \"string\")", content, StringComparison.Ordinal);
+        Assert.Contains(
+            "GitHub Packages returned HTTP $status for the NuGet service index during publication recheck.",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "malformed, missing, or ambiguous PackageBaseAddress resource",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains("malformed PackageBaseAddress @id", content, StringComparison.Ordinal);
+
+        // The package, version, and provenance URLs derive only from the
+        // discovered base plus the lower-cased ids.
+        Assert.Contains(
+            "package_index_url=\"$package_base_address/${package_id_lower}/index.json\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "package_download_url=\"$package_base_address/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$package_index_url\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$package_download_url\"",
+            content,
+            StringComparison.Ordinal);
+
+        // No flat-container or download path may be hardcoded.
+        Assert.DoesNotContain("flatcontainer", content, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/download/", content, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter()
+    {
+        // The executable tests stub jq, so the committed discovery filter is
+        // pinned here rather than by behavior. It must accept a string or an array
+        // @type, require exactly one PackageBaseAddress/3.0.0 resource, and reject
+        // anything else.
+        var match = Regex.Match(
+            Read("package-private-publish"),
+            @"if ! package_base_address=\$\(jq -er '(?<filter>.*?)' ""\$response_file""\); then",
+            RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        Assert.True(match.Success, "the private publisher has no service-index discovery filter.");
+
+        var normalized = Regex.Replace(match.Groups["filter"].Value, @"\s+", " ").Trim();
+        var expected =
+            "if type == \"object\" and (.resources | type == \"array\") then "
+            + "[.resources[] | select( (.[\"@type\"] | type == \"string\" and . == \"PackageBaseAddress/3.0.0\") "
+            + "or (.[\"@type\"] | type == \"array\" and (index(\"PackageBaseAddress/3.0.0\") != null)) ) "
+            + "| .[\"@id\"] ] "
+            + "| if length == 1 and (.[0] | type == \"string\") and (.[0] | length > 0) then .[0] else empty end "
+            + "else error(\"malformed service index\") end";
+        Assert.Equal(expected, normalized);
     }
 
     [Fact]
