@@ -1,16 +1,9 @@
+using System.Text.RegularExpressions;
 using Gizmo.Infra.Tests.TestSupport;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Executable coverage for the private publisher's PackageBaseAddress discovery.
-/// The committed discovery block is extracted from the action and run against
-/// stubbed curl and jq processes, so the authenticated service-index request, the
-/// fail-closed control flow, and the package/version/provenance URL derivation
-/// are exercised as behavior instead of source text. Network and jq are
-/// unavailable locally, so both are replaced by deterministic stubs; the jq
-/// selection filter itself is pinned by the companion action contract test.
-/// </summary>
+/// <summary>Executable coverage for the private publisher's PackageBaseAddress discovery, origin validation, and fail-closed control flow.</summary>
 public sealed class PrivatePublisherServiceIndexTests
 {
     private const string Action = "package-private-publish";
@@ -52,8 +45,6 @@ public sealed class PrivatePublisherServiceIndexTests
         Assert.Equal(ExpectedIndexUrl, printed["index"]);
         Assert.Equal(ExpectedDownloadUrl, printed["download"]);
 
-        // The one authenticated request is the service index, and curl must have
-        // written the discovered index into the file jq then consumed.
         Assert.Equal(ServiceIndexUrl, File.ReadAllText(requestLog).Trim());
         Assert.Equal("actor:token", File.ReadAllText(authLog).Trim());
         Assert.Equal(ServiceIndex, File.ReadAllText(responseFile).Trim());
@@ -118,11 +109,18 @@ public sealed class PrivatePublisherServiceIndexTests
     }
 
     [Theory]
-    [InlineData("http://nuget.pkg.github.com/owner/download")]      // not https
-    [InlineData("https://nuget.pkg.github.com/owner/download?x=1")] // query injection
-    [InlineData("https://nuget.pkg.github.com/owner/../../evil")]  // path traversal
-    [InlineData("https://nuget.pkg.github.com/owner/down load")]   // embedded whitespace
-    public void Discovery_FailsClosedOnAMalformedDiscoveredBaseAddress(string baseAddress)
+    [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
+    [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
+    [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
+    [InlineData("https://user:pass@nuget.pkg.github.com/owner/download")]  // embedded credentials
+    [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
+    [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
+    [InlineData("https://nuget.pkg.github.com/owner/download?")]           // empty query marker
+    [InlineData("https://nuget.pkg.github.com/owner/download#")]           // empty fragment marker
+    [InlineData("https://nuget.pkg.github.com/owner/../../evil")]          // path traversal
+    [InlineData("https://nuget.pkg.github.com/owner/down load")]           // embedded whitespace
+    [InlineData("not-a-url")]                                              // malformed / ambiguous
+    public void Discovery_FailsClosedOnAnUntrustedDiscoveredBaseAddress(string baseAddress)
     {
         var result = RunFailure(baseAddress: baseAddress);
 
@@ -131,6 +129,49 @@ public sealed class PrivatePublisherServiceIndexTests
             "malformed PackageBaseAddress @id",
             result.StandardError,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Discovery_FailsClosedOnATerminalNewlineInTheDiscoveredBaseAddress()
+    {
+        var result = RunFailure(baseAddress: BaseAddress + "\n");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(
+            "malformed PackageBaseAddress @id",
+            result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(BaseAddress)]
+    [InlineData(BaseAddress + "/")]
+    public void TrustedOriginValidator_AcceptsTheCanonicalPackageBaseAddress(string baseAddress)
+    {
+        var result = WorkflowShell.RunNode(TrustedOriginProgram(), baseAddress);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(baseAddress, result.StandardOutput);
+    }
+
+    [Theory]
+    [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
+    [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
+    [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
+    [InlineData("https://user:pass@nuget.pkg.github.com/owner/download")]  // embedded credentials
+    [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
+    [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
+    [InlineData("https://nuget.pkg.github.com/owner/download?")]           // WHATWG round-trips an empty query marker
+    [InlineData("https://nuget.pkg.github.com/owner/download#")]           // WHATWG round-trips an empty fragment marker
+    [InlineData("https://nuget.pkg.github.com/owner/../../evil")]          // path traversal
+    [InlineData("https://nuget.pkg.github.com/owner/down load")]           // embedded whitespace
+    [InlineData("not-a-url")]                                              // malformed / ambiguous
+    public void TrustedOriginValidator_RejectsAnyUntrustedOrAmbiguousOrigin(string baseAddress)
+    {
+        var result = WorkflowShell.RunNode(TrustedOriginProgram(), baseAddress);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Empty(result.StandardOutput);
     }
 
     private static ShellResult RunFailure(
@@ -189,6 +230,17 @@ public sealed class PrivatePublisherServiceIndexTests
         }
 
         return values;
+    }
+
+    /// <summary>Extracts the action's embedded Node trusted-origin validator so the URL matrices exercise the committed parser.</summary>
+    private static string TrustedOriginProgram()
+    {
+        var match = Regex.Match(
+            ActionContent,
+            @"node -e '(?<program>.*?)' ""\$package_base_address""",
+            RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        Assert.True(match.Success, "the private publisher has no embedded trusted-origin validator.");
+        return match.Groups["program"].Value;
     }
 
     private static string DiscoveryScript()

@@ -1,10 +1,6 @@
 namespace Gizmo.Infra.Tests.TestSupport;
 
-/// <summary>
-/// Finds the local Gizmo.Infra repository root so tests can read the committed
-/// workflow and action sources. <see cref="EnvironmentVariable"/> overrides the
-/// walk-up default for other layouts.
-/// </summary>
+/// <summary>Finds the local Gizmo.Infra repository root; <see cref="EnvironmentVariable"/> overrides the walk-up default.</summary>
 public static class InfraRepositoryLocator
 {
     public const string EnvironmentVariable = "GIZMO_INFRA_ROOT";

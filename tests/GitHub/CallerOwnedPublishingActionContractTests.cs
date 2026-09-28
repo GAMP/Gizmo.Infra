@@ -4,12 +4,7 @@ using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Contract coverage for the caller-owned composite actions: the bundled
-/// preflight, the unified public and private publishers, and the immutable
-/// release-tag reconciler. The tests read the committed action YAML; they never
-/// render or execute a GitHub job.
-/// </summary>
+/// <summary>Read-only contract coverage for the committed caller-owned composite action YAML; never renders or executes a GitHub job.</summary>
 public sealed class CallerOwnedPublishingActionContractTests
 {
     private static readonly string[] ActionDirectories =
@@ -138,8 +133,7 @@ public sealed class CallerOwnedPublishingActionContractTests
     {
         var content = Read("package-private-publish");
 
-        // The collision recheck discovers the flat-container base from the
-        // authenticated NuGet V3 service index instead of assuming a path shape.
+        // The collision recheck discovers the flat-container base from the authenticated service index; no path shape is assumed.
         Assert.Contains(
             "service_index_url=\"https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json\"",
             content,
@@ -161,8 +155,17 @@ public sealed class CallerOwnedPublishingActionContractTests
             StringComparison.Ordinal);
         Assert.Contains("malformed PackageBaseAddress @id", content, StringComparison.Ordinal);
 
-        // The package, version, and provenance URLs derive only from the
-        // discovered base plus the lower-cased ids.
+        // The discovered @id is pinned to the exact origin, protocol, authority, and empty query/fragment before any URL is derived.
+        Assert.Contains("node -e '", content, StringComparison.Ordinal);
+        Assert.Contains("new URL(candidate)", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.protocol !== \"https:\"", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.hostname !== \"nuget.pkg.github.com\"", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.port !== \"\"", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.username !== \"\" || parsed.password !== \"\"", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.search !== \"\" || parsed.hash !== \"\"", content, StringComparison.Ordinal);
+        Assert.Contains("parsed.href !== candidate", content, StringComparison.Ordinal);
+
+        // Derived URLs use only the discovered base and lower-cased ids.
         Assert.Contains(
             "package_index_url=\"$package_base_address/${package_id_lower}/index.json\"",
             content,
@@ -186,15 +189,49 @@ public sealed class CallerOwnedPublishingActionContractTests
     }
 
     [Fact]
+    public void PrivatePublisher_ValidatesTheTrustedOriginBeforeAuthenticatingDerivedRequests()
+    {
+        var content = Read("package-private-publish");
+
+        // Ordering proof: validation and base normalization must precede derived authenticated requests.
+        var validationIndex = content.IndexOf("new URL(candidate)", StringComparison.Ordinal);
+        var normalizeIndex = content.IndexOf(
+            "package_base_address=${package_base_address%/}",
+            StringComparison.Ordinal);
+        var indexUrlIndex = content.IndexOf("package_index_url=", StringComparison.Ordinal);
+        var downloadUrlIndex = content.IndexOf("package_download_url=", StringComparison.Ordinal);
+        var indexRequestIndex = content.IndexOf(
+            "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$package_index_url\"",
+            StringComparison.Ordinal);
+        var downloadRequestIndex = content.IndexOf(
+            "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$package_download_url\"",
+            StringComparison.Ordinal);
+
+        Assert.True(validationIndex >= 0, "the structural validator is missing.");
+        Assert.True(normalizeIndex > validationIndex, "the base is normalized before structural validation.");
+        Assert.True(indexUrlIndex > normalizeIndex, "the package index URL is derived before validation.");
+        Assert.True(downloadUrlIndex > indexUrlIndex, "the download URL is derived before the index URL.");
+        Assert.True(indexRequestIndex > indexUrlIndex, "the package index is requested before it is derived.");
+        Assert.True(downloadRequestIndex > downloadUrlIndex, "the package download is requested before it is derived.");
+
+        // Only the known service-index URL and the two URLs derived from the validated base are authenticated.
+        var authenticatedVariables = Regex
+            .Matches(content, @"--user ""\$GITHUB_ACTOR:\$GH_TOKEN"" ""\$(?<variable>[A-Za-z_]+)""")
+            .Cast<Match>()
+            .Select(match => match.Groups["variable"].Value)
+            .ToArray();
+        Assert.Equal(
+            new[] { "service_index_url", "package_index_url", "package_download_url" },
+            authenticatedVariables);
+    }
+
+    [Fact]
     public void PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter()
     {
-        // The executable tests stub jq, so the committed discovery filter is
-        // pinned here rather than by behavior. It must accept a string or an array
-        // @type, require exactly one PackageBaseAddress/3.0.0 resource, and reject
-        // anything else.
+        // jq is stubbed in the executable tests, so the committed discovery filter is pinned here instead of by behavior.
         var match = Regex.Match(
             Read("package-private-publish"),
-            @"if ! package_base_address=\$\(jq -er '(?<filter>.*?)' ""\$response_file""\); then",
+            @"if ! raw_package_base_address=\$\(jq -er '(?<filter>.*?)' ""\$response_file"" && printf 'x'\); then",
             RegexOptions.Singleline | RegexOptions.CultureInvariant);
         Assert.True(match.Success, "the private publisher has no service-index discovery filter.");
 
@@ -204,7 +241,7 @@ public sealed class CallerOwnedPublishingActionContractTests
             + "[.resources[] | select( (.[\"@type\"] | type == \"string\" and . == \"PackageBaseAddress/3.0.0\") "
             + "or (.[\"@type\"] | type == \"array\" and (index(\"PackageBaseAddress/3.0.0\") != null)) ) "
             + "| .[\"@id\"] ] "
-            + "| if length == 1 and (.[0] | type == \"string\") and (.[0] | length > 0) then .[0] else empty end "
+            + "| if length == 1 and (.[0] | type == \"string\") and (.[0] | length > 0) and (.[0] | test(\"[[:cntrl:]]\") | not) then .[0] else empty end "
             + "else error(\"malformed service index\") end";
         Assert.Equal(expected, normalized);
     }
@@ -229,8 +266,7 @@ public sealed class CallerOwnedPublishingActionContractTests
             Assert.Contains("Malformed tag under the exact package prefix: $ref", content, StringComparison.Ordinal);
             Assert.Contains("Could not resolve an annotated package tag during publication recheck.", content, StringComparison.Ordinal);
 
-            // The existing version must carry the caller commit as provenance, and
-            // a matching version short-circuits the push so same-SHA recovery works.
+            // The existing version must carry the caller commit, and a matching version short-circuits the push.
             Assert.Contains("nuspec=$(unzip -p \"$package_file\" '*.nuspec' 2>/dev/null || true)", content, StringComparison.Ordinal);
             Assert.Contains(provenanceComparison, content, StringComparison.Ordinal);
             Assert.Contains("no authenticated provenance for this caller SHA", content, StringComparison.Ordinal);
@@ -238,8 +274,7 @@ public sealed class CallerOwnedPublishingActionContractTests
             Assert.Contains("package-state=unpublished", content, StringComparison.Ordinal);
             Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", content, StringComparison.Ordinal);
 
-            // A version collision with matching provenance is a success, so the
-            // recheck emits the published signal after the commit comparison.
+            // A version collision with matching provenance is success, so the published signal is emitted after the comparison.
             var comparisonIndex = content.IndexOf("repository_commit", StringComparison.Ordinal);
             var publishedIndex = content.IndexOf("package-state=published", StringComparison.Ordinal);
             Assert.True(comparisonIndex >= 0 && publishedIndex > comparisonIndex);
@@ -330,8 +365,7 @@ public sealed class CallerOwnedPublishingActionContractTests
     [InlineData("")]
     public void ReleaseTagAction_FailsClosedForAnyNonReleaseBranchRole(string branchRole)
     {
-        // A caller wiring mistake must not be able to tag from a development or
-        // unresolved preparation run; the action repeats the release-only guard.
+        // A caller wiring mistake must not tag from a development or unresolved run; the action re-guards release-only.
         var result = RunReleaseTagValidation(branchRole);
 
         Assert.NotEqual(0, result.ExitCode);

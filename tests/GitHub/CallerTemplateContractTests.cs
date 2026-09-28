@@ -4,19 +4,12 @@ using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Contract coverage for the canonical caller-owned publish template at
-/// <c>.github/templates/package-publish.yml</c>. The template is the versioned
-/// source callers copy, so the tests parse it and execute its fail-closed step
-/// to verify the exact mutually exclusive registry routing without GitHub, NuGet,
-/// or remote setup.
-/// </summary>
+/// <summary>Contract coverage for the canonical caller-owned publish template at <c>.github/templates/package-publish.yml</c>.</summary>
 public sealed class CallerTemplateContractTests
 {
     private const string TemplatePath = ".github/templates/package-publish.yml";
 
-    // Callers replace this one marker with the same immutable 40-character
-    // Gizmo.Infra commit SHA in every Infra workflow and action reference.
+    // Callers replace this one marker with the same immutable 40-character Gizmo.Infra commit SHA in every reference.
     private const string InfraShaPlaceholder = "<40-character-infra-commit-sha>";
     private const string InfraWorkflowRef =
         "GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@" + InfraShaPlaceholder;
@@ -109,8 +102,7 @@ public sealed class CallerTemplateContractTests
         Assert.Equal(VisibilityInput, StepWithValue("publish-public", "repository-visibility"));
         Assert.Equal(VisibilityInput, StepWithValue("publish-private", "repository-visibility"));
 
-        // Routing consumes the single authenticated preparation output; nothing
-        // may re-derive visibility from the event payload or a caller input.
+        // Routing consumes the authenticated preparation output; nothing may re-derive visibility from the event or an input.
         Assert.DoesNotContain("github.event.repository.visibility", Content(), StringComparison.Ordinal);
         Assert.DoesNotContain("inputs.", Content(), StringComparison.Ordinal);
     }
@@ -161,8 +153,7 @@ public sealed class CallerTemplateContractTests
         Assert.Contains("branch-role == 'release'", JobIf("tag"), StringComparison.Ordinal);
         Assert.DoesNotContain("development", JobIf("tag"), StringComparison.Ordinal);
 
-        // Two mutually exclusive publishers publish at most one success, so the OR
-        // engages only after the selected publisher actually succeeded.
+        // Two mutually exclusive publishers yield at most one success, so the OR engages only after the selected publisher succeeded.
         Assert.Contains("needs.publish-public.result == 'success'", JobIf("tag"), StringComparison.Ordinal);
         Assert.Contains("needs.publish-private.result == 'success'", JobIf("tag"), StringComparison.Ordinal);
 

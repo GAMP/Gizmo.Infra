@@ -1,10 +1,6 @@
 # Canonical caller-owned NuGet publishing workflow.
-#
-# Copy this file to the caller repository as `.github/workflows/package-publish.yml`
-# and replace every `<40-character-infra-commit-sha>` placeholder with the same
-# immutable, complete 40-character Gizmo.Infra commit SHA. The caller workflow
-# name `package-publish.yml` is also the NuGet.org Trusted Publishing workflow
-# binding; do not rename it.
+# Replace every `<40-character-infra-commit-sha>` with one immutable Gizmo.Infra commit SHA.
+# The workflow filename binds NuGet.org Trusted Publishing and must not be renamed.
 name: Publish package
 
 on:
@@ -14,9 +10,7 @@ on:
 permissions:
   contents: read
 
-# The caller workflow owns the single caller-repository lock around
-# preparation, publication, and tagging. The reusable preparation workflow
-# declares no concurrency so this lock is never nested against itself.
+# The caller owns the only lock; the reusable preparation workflow declares none so it cannot nest.
 concurrency:
   group: nuget-${{ github.repository }}
   cancel-in-progress: false

@@ -4,12 +4,7 @@ using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Static contract coverage for the two direct reusable <c>workflow_call</c>
-/// workflows Gizmo.Infra publishes: the validation workflow and the non-mutating
-/// publish preparation workflow. The tests read the committed YAML and never
-/// render or execute it, so they hold without GitHub, NuGet, or remote setup.
-/// </summary>
+/// <summary>Static contract coverage for the two direct reusable <c>workflow_call</c> workflows; reads committed YAML without GitHub or NuGet.</summary>
 public sealed class ReusableWorkflowContractTests
 {
     private const string ValidationFile = "package-validation.yml";
@@ -17,9 +12,7 @@ public sealed class ReusableWorkflowContractTests
 
     private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
 
-    // The publish workflow is a preparation authority only: it must export the
-    // caller-routing outputs and never request a publication credential, contact a
-    // package feed, publish, or mutate a tag.
+    // The publish workflow is a preparation authority: it exports routing outputs and never publishes, tags, or requests credentials.
     private static readonly string[] CallerRoutingOutputs =
     [
         "package-artifact",
@@ -33,22 +26,16 @@ public sealed class ReusableWorkflowContractTests
         "repository-visibility",
     ];
 
-    // Reruns of the same workflow run must not collide on the uploaded artifact
-    // name, so the attempt discriminator is part of the contract.
+    // Reruns must not collide on the artifact name, so the attempt discriminator is part of the contract.
     private const string ArtifactName = "nuget-package-${{ github.run_id }}-${{ github.run_attempt }}";
 
-    // The caller template and the direct validation workflow share one
-    // caller-repository lock; the preflight derives the package from the
-    // workspace, so the group is not per-package.
+    // The caller template and validation workflow share one caller-repository lock, not a per-package group.
     private const string ConcurrencyGroup = "nuget-${{ github.repository }}";
 
-    // The preflight action is the only authority for the publish branch role; the
-    // expensive steps all skip when it resolves to none.
+    // The preflight is the sole branch-role authority; expensive steps skip when it resolves to none.
     private const string PublishableBranchRole = "${{ steps.metadata.outputs.branch-role != 'none' }}";
 
-    // Finalized Node 24 action releases. Every workflow that declares one of
-    // these actions must use exactly this commit and matching release comment, so
-    // a partial upgrade that leaves any action on a stale major fails here.
+    // Finalized Node 24 action releases; every declaration must match the pin and release comment exactly.
     private const string CheckoutPin =
         "uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0";
     private const string SetupDotnetPin =
@@ -56,9 +43,7 @@ public sealed class ReusableWorkflowContractTests
     private const string UploadArtifactPin =
         "uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0";
 
-    // Validation run 35636544410 failed in setup because actions/setup-dotnet
-    // resolved an invalid v4.0.0 commit; the corrected pin above must hold and
-    // the rejected commit must never come back.
+    // The rejected setup-dotnet commit must never be reintroduced.
     private const string RejectedSetupDotnetSha = "d4c94342e560b34958e1a5f7d17e66c4b9131d1f";
 
     private static readonly Regex UsesLine = new(
@@ -77,8 +62,7 @@ public sealed class ReusableWorkflowContractTests
     {
         var directory = Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "workflows");
 
-        // Both .yml and .yaml are workflow files, so enumerating only *.yml would
-        // silently accept an extra workflow spelled with the other extension.
+        // Enumerating only *.yml or *.yaml would silently accept an extra workflow; both extensions are workflows.
         var files = Directory.EnumerateFiles(directory)
             .Where(path =>
                 string.Equals(Path.GetExtension(path), ".yml", StringComparison.OrdinalIgnoreCase)
@@ -104,8 +88,7 @@ public sealed class ReusableWorkflowContractTests
             Assert.False(YamlWorkflowReader.HasChild(triggers, "pull_request"), $"{file} must not run on pull_request.");
             Assert.False(YamlWorkflowReader.HasChild(triggers, "workflow_dispatch"), $"{file} must not run on dispatch.");
 
-            // Direct files replace the retired renderer output; a generated header would
-            // mean a consumer-installed tool still owns the workflow.
+            // A generated header would mean a consumer-installed tool still owns the workflow.
             Assert.DoesNotContain("<gizmo-infra-generated>", content, StringComparison.Ordinal);
             Assert.DoesNotContain("dotnet tool install Gizmo.Infra", content, StringComparison.Ordinal);
         }
@@ -114,9 +97,7 @@ public sealed class ReusableWorkflowContractTests
     [Fact]
     public void EachFile_DeclaresNoCallerSuppliedInputs()
     {
-        // The preflight discovers the project, package ID, compatibility line,
-        // branch role, and visibility; the publish workflow adds only outputs, so
-        // no workflow declares any caller-supplied input.
+        // The preflight discovers all caller state, so no workflow declares a caller-supplied input.
         foreach (var file in ContractFiles)
         {
             var root = Parse(file);
@@ -132,9 +113,7 @@ public sealed class ReusableWorkflowContractTests
 
             Assert.Null(WorkflowCallInputs(root));
 
-            // The compatibility line comes from the caller project; no descriptor,
-            // patch, project path, package ID, visibility, nuget user, or workflow
-            // version input may exist.
+            // The caller project owns the compatibility line; no descriptor, version, path, ID, or visibility input may exist.
             foreach (var forbidden in new[]
                      {
                          "version", "package-version", "version-override", "patch", "prerelease",
@@ -168,8 +147,7 @@ public sealed class ReusableWorkflowContractTests
                 $"the build job must expose the '{output}' output.");
         }
 
-        // Identity and routing outputs come from the always-running discovery step,
-        // not from a step that skips when the branch role is none.
+        // Identity and routing outputs come from the always-running discovery step, not a skipping step.
         Assert.Equal(
             "${{ steps.metadata.outputs.branch-role }}",
             YamlWorkflowReader.ScalarChild(jobOutputs, "branch-role"));
@@ -177,8 +155,7 @@ public sealed class ReusableWorkflowContractTests
             "${{ steps.metadata.outputs.repository-visibility }}",
             YamlWorkflowReader.ScalarChild(jobOutputs, "repository-visibility"));
 
-        // The exported visibility is routing data only; the workflow must not
-        // branch on it or read an event-specific visibility.
+        // The exported visibility is routing data only; the workflow must not branch on it.
         Assert.DoesNotContain(
             "github.event.repository.visibility",
             Read(PublishFile),
@@ -270,10 +247,7 @@ public sealed class ReusableWorkflowContractTests
     [Fact]
     public void PublishPreparationWorkflow_DeclaresNoConcurrency()
     {
-        // The canonical caller template owns the caller-repository lock around
-        // prepare -> publish -> tag. The reusable preparation workflow must not
-        // redeclare the same group, because a nested evaluation of the same lock
-        // can deadlock the run against itself.
+        // The caller template owns the lock around prepare -> publish -> tag; redeclaring it here can deadlock the run.
         var content = Read(PublishFile);
 
         Assert.DoesNotContain("concurrency", content, StringComparison.Ordinal);
@@ -327,8 +301,7 @@ public sealed class ReusableWorkflowContractTests
 
             Assert.NotEmpty(declared);
 
-            // The bundled preflight is a local action reference; every remote
-            // action must be pinned to a full commit SHA with a release comment.
+            // The bundled preflight is local; every remote action must be pinned to a full SHA with a release comment.
             Assert.Equal(
                 declared.Length,
                 PinnedUsesLine.Matches(content).Count + LocalUsesLine.Matches(content).Count);
@@ -379,8 +352,7 @@ public sealed class ReusableWorkflowContractTests
     {
         foreach (var file in ContractFiles)
         {
-            // The direct workflows intentionally moved to the user-configured
-            // .NET 11 SDK; a reintroduced 10.x pin must fail here.
+            // A reintroduced 10.x SDK pin must fail; the workflows target .NET 11.
             Assert.Contains("dotnet-version: 11.0.x", Read(file), StringComparison.Ordinal);
             Assert.DoesNotContain("dotnet-version: 10.", Read(file), StringComparison.Ordinal);
         }
@@ -393,8 +365,7 @@ public sealed class ReusableWorkflowContractTests
         {
             var checkouts = CheckoutSteps(BuildJob(Parse(file), file));
 
-            // Both the caller checkout and the immutable Gizmo.Infra source checkout
-            // must run without persisted credentials.
+            // Both checkout steps must run without persisted credentials.
             Assert.Equal(2, checkouts.Count);
             Assert.All(checkouts, checkout =>
                 Assert.Equal(
@@ -416,8 +387,7 @@ public sealed class ReusableWorkflowContractTests
             var content = Read(file);
             var build = BuildJob(Parse(file), file);
 
-            // github.workflow_* describes the caller's workflow, not this called
-            // reusable workflow, so only job.workflow_* can pin the source commit.
+            // github.workflow_* describes the caller, so only job.workflow_* can pin the source commit.
             Assert.DoesNotContain("github.workflow_ref", content, StringComparison.Ordinal);
             Assert.DoesNotContain("github.workflow_sha", content, StringComparison.Ordinal);
 
@@ -432,9 +402,7 @@ public sealed class ReusableWorkflowContractTests
             Assert.Contains("\"$WORKFLOW_REPOSITORY\" != GAMP/Gizmo.Infra", run, StringComparison.Ordinal);
             Assert.Contains($"\"$WORKFLOW_FILE_PATH\" != .github/workflows/{file}", run, StringComparison.Ordinal);
 
-            // The resolved job.workflow_sha is a commit, not proof the caller used
-            // a full SHA; job.workflow_ref's path@sha must carry the same complete
-            // 40-character commit before the source is trusted.
+            // job.workflow_sha alone is not proof of a full SHA; job.workflow_ref must carry the same 40-character commit.
             Assert.Contains($"expected_workflow_ref=\"GAMP/Gizmo.Infra/.github/workflows/{file}@\"", run, StringComparison.Ordinal);
             Assert.Contains("workflow_ref_sha=${WORKFLOW_REF#\"$expected_workflow_ref\"}", run, StringComparison.Ordinal);
             Assert.Contains("\"$workflow_ref_sha\" == \"$WORKFLOW_REF\"", run, StringComparison.Ordinal);
@@ -469,9 +437,7 @@ public sealed class ReusableWorkflowContractTests
                 content,
                 StringComparison.Ordinal);
 
-            // Caller package metadata is discovered and validated inside the
-            // preflight, never accepted as an input and never read from an
-            // event-specific repository context.
+            // Caller metadata is discovered in the preflight, never accepted as input or read from an event context.
             Assert.DoesNotContain("github.event.repository.visibility", content, StringComparison.Ordinal);
         }
     }
@@ -483,9 +449,7 @@ public sealed class ReusableWorkflowContractTests
         {
             var content = Read(file);
 
-            // The evaluated project Version is a compatibility line only; the
-            // workflow consumes the preflight's value rather than re-evaluating
-            // MSBuild itself.
+            // The workflow consumes the preflight's compatibility line rather than re-evaluating MSBuild.
             Assert.Contains(
                 "COMPATIBILITY_LINE: ${{ steps.metadata.outputs.compatibility-line }}",
                 content,
@@ -497,8 +461,7 @@ public sealed class ReusableWorkflowContractTests
             Assert.DoesNotContain("dotnet msbuild", content, StringComparison.Ordinal);
             Assert.DoesNotContain("-getProperty:", content, StringComparison.Ordinal);
 
-            // The project Version is a compatibility line only; no pack-time project
-            // version override is passed.
+            // No pack-time project version override is passed.
             Assert.DoesNotContain("-p:Version=", content, StringComparison.Ordinal);
             Assert.DoesNotContain("-p:VersionPrefix=", content, StringComparison.Ordinal);
             Assert.DoesNotContain("-p:VersionSuffix=", content, StringComparison.Ordinal);
@@ -548,8 +511,7 @@ public sealed class ReusableWorkflowContractTests
                 build,
                 StringComparison.Ordinal);
 
-            // Malformed tags under the exact package prefix are a hard failure,
-            // never silently ignored or treated as another package's tag.
+            // Malformed tags under the exact package prefix are a hard failure, never ignored.
             Assert.Contains("GitHub returned a tag outside the requested package prefix.", build, StringComparison.Ordinal);
             Assert.Contains("Malformed tag under the exact package prefix: $ref", build, StringComparison.Ordinal);
             Assert.Contains("exit 1", build, StringComparison.Ordinal);
@@ -668,8 +630,7 @@ public sealed class ReusableWorkflowContractTests
     {
         var content = Read(PublishFile);
 
-        // The preflight resolver output is the sole mode authority for the
-        // preparation workflow; the workflow must not reparse the caller config.
+        // The preflight resolver is the sole mode authority; the workflow must not reparse the caller config.
         Assert.Contains(
             "BRANCH_ROLE: ${{ steps.metadata.outputs.branch-role }}",
             content,
@@ -681,8 +642,7 @@ public sealed class ReusableWorkflowContractTests
             content,
             StringComparison.Ordinal);
 
-        // No duplicate branch-name interpretation: the caller config is never
-        // parsed here and no static branch filter shadows the resolver.
+        // The caller config is never parsed here and no static branch filter shadows the resolver.
         Assert.DoesNotContain(".github/package.yml", content, StringComparison.Ordinal);
         Assert.DoesNotContain("package.yml", content, StringComparison.Ordinal);
         Assert.DoesNotContain("refs/heads/", content, StringComparison.Ordinal);
@@ -696,9 +656,7 @@ public sealed class ReusableWorkflowContractTests
     {
         var build = BuildJob(Parse(PublishFile), PublishFile);
 
-        // The version calculation performs the tag lookup, and the restore, build,
-        // pack, and upload all cost work; every one must skip for none while the
-        // cheap preflight still resolves the role.
+        // The tag lookup, restore, build, pack, and upload all skip for none; the cheap preflight still resolves the role.
         foreach (var step in new[]
                  {
                      "Calculate package version and tag state",
@@ -723,8 +681,7 @@ public sealed class ReusableWorkflowContractTests
             var build = BuildJob(Parse(file), file);
             var metadata = StepById(build, "metadata");
 
-            // The bundled preflight is the single discovery step; every later step
-            // consumes its outputs instead of re-discovering caller metadata.
+            // The preflight is the single discovery step; later steps consume its outputs.
             Assert.Equal(
                 "./.gizmo-infra/.github/actions/package-preflight",
                 YamlWorkflowReader.ScalarChild(metadata, "uses"));
@@ -801,8 +758,7 @@ public sealed class ReusableWorkflowContractTests
             Assert.True(YamlWorkflowReader.HasChild(outputs, "package-version"));
         }
 
-        // The publish preparation advertises the exact artifact path its
-        // caller-owned publishers download; validation only retains it.
+        // Publish preparation advertises the artifact path its publishers download; validation only retains it.
         Assert.True(
             YamlWorkflowReader.HasChild(Outputs(Job(Parse(PublishFile), "build")), "package-artifact"));
     }
@@ -818,10 +774,7 @@ public sealed class ReusableWorkflowContractTests
             Assert.Contains("-p:NuGetAuditMode=all", script, StringComparison.Ordinal);
             Assert.Contains("-p:NuGetAuditLevel=low", script, StringComparison.Ordinal);
 
-            // MSBuild parses a '-p:' value as semicolon-separated name=value
-            // pairs, so an unescaped 'NU1904;NU1903' splits 'NU1903' into its
-            // own switch and fails the Bash restore with MSB1006. Only the %3B
-            // escape survives, with or without shell quoting around the value.
+            // MSBuild splits an unescaped ';' in a '-p:' value into separate switches and fails with MSB1006, so the %3B escape is required.
             Assert.Contains("-p:WarningsAsErrors=NU1904%3BNU1903", script, StringComparison.Ordinal);
             Assert.Contains("-p:WarningsNotAsErrors=NU1901%3BNU1902", script, StringComparison.Ordinal);
             Assert.DoesNotMatch(@"-p:Warnings(?:Not)?AsErrors=(?:""[^""\r\n]*;|NU\d+;)", script);
@@ -837,8 +790,7 @@ public sealed class ReusableWorkflowContractTests
         {
             var content = Read(file);
 
-            // The preflight discovers the package identity and publishes it as an
-            // evaluated output; it is never a caller-supplied input.
+            // The preflight discovers package identity as an evaluated output, never a caller-supplied input.
             Assert.Contains("PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}", content, StringComparison.Ordinal);
             Assert.DoesNotContain("inputs.package-id", content, StringComparison.Ordinal);
             Assert.Contains("tag_prefix=\"refs/tags/${PACKAGE_ID}/\"", content, StringComparison.Ordinal);
