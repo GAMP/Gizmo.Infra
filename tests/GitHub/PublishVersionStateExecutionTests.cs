@@ -7,11 +7,14 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// Executes the committed <c>version-state</c> bash block from
 /// <c>package-publish.yml</c> against a stubbed GitHub tag API, so the version
 /// and release-tag rules are verified by behavior instead of by matching source
-/// text. Development and a new release share one derivation: bootstrap patch 0
-/// when the compatibility line has no stable tag, otherwise numeric
-/// <c>max(Y)+1</c>. Development appends <c>-dev.N</c> without creating a tag,
-/// while release reuses the exact version of a current-SHA tag or claims the
-/// next stable version.
+/// text. Development and a new release share one derivation: patch 0 when the
+/// compatibility line has no stable tag, otherwise numeric <c>max(Y)+1</c>.
+/// Development appends <c>-dev.N</c> without creating a tag, while release
+/// reuses the exact version of a current-SHA tag or claims the next stable
+/// version. The calculation is tag-derived and never consults a registry, so an
+/// empty line tag state starts at its first <c>3.X.0</c> without a synthetic tag;
+/// stable state is scoped to the exact package prefix and compatibility line, and
+/// malformed, foreign-prefix, or ambiguous state fails closed.
 /// </summary>
 public sealed class PublishVersionStateExecutionTests
 {
@@ -154,6 +157,35 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
+    public void Development_WithSparseStableTags_AdvancesPastTheObservedLineMaximum()
+    {
+        // The runtime derives from the tag set alone, so a gap in the tag sequence
+        // does not reset the maximum and published packages never raise the patch.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag("3.0.2", OtherSha), Tag("3.0.4", OtherSha), Tag("3.0.5", ThirdSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.6", run.Outputs["base-version"]);
+        Assert.Equal("3.0.6-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Fact]
+    public void Release_AfterAnAdoptionTagAtTheHighestLineVersion_ClaimsTheNextPatch()
+    {
+        // An adoption tag at the proven highest version 3.0.5 resumes
+        // steady state one patch later at 3.0.6.
+        var run = RunVersionState("release", "7", [Tag("3.0.5", OtherSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.6", run.Outputs["base-version"]);
+        Assert.Equal("3.0.6", run.Outputs["package-version"]);
+        Assert.Equal($"{PackageId}/v3.0.6", run.Outputs["release-tag"]);
+        Assert.Equal("missing", run.Outputs["release-tag-state"]);
+    }
+
+    [Fact]
     public void ReleaseRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersion()
     {
         var run = RunVersionState(
@@ -184,6 +216,84 @@ public sealed class PublishVersionStateExecutionTests
             "Multiple package/compatibility-line tags point to the caller commit; refusing ambiguous release rerun.",
             run.Result.StandardError,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Development_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
+    {
+        // A 3.1.x tag is valid stable state but not on the 3.0 line, so the line
+        // has an empty tag state and starts at its first 3.0.0.
+        var run = RunVersionState("development", "7", [Tag("3.1.5", OtherSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.0", run.Outputs["base-version"]);
+        Assert.Equal("3.0.0-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Fact]
+    public void Release_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
+    {
+        var run = RunVersionState("release", "7", [Tag("3.1.5", OtherSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.0", run.Outputs["base-version"]);
+        Assert.Equal("3.0.0", run.Outputs["package-version"]);
+        Assert.Equal($"{PackageId}/v3.0.0", run.Outputs["release-tag"]);
+        Assert.Equal("missing", run.Outputs["release-tag-state"]);
+    }
+
+    [Fact]
+    public void Release_OnEmptyLineTagState_ReportsTheTagMissingAndClaimsNoSyntheticCurrentTag()
+    {
+        var run = RunVersionState("release", "7", []);
+
+        AssertSucceeded(run);
+        Assert.Equal("missing", run.Outputs["release-tag-state"]);
+
+        // The preparation advertises the tag it would create but reports no
+        // current-SHA tag and invents none; only the release-only tag action may
+        // create the tag, and only after a successful release publication.
+        Assert.Contains(";current-sha-tags=;", run.Outputs["calculated-state"], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Release_ForeignPackagePrefixTag_FailsClosedInsteadOfCountingIt()
+    {
+        var run = RunVersionState("release", "7", [("refs/tags/Other.Package/v3.0.0", OtherSha)]);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            "GitHub returned a tag outside the requested package prefix.",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Release_MalformedTagUnderThePackagePrefix_FailsClosed()
+    {
+        var run = RunVersionState("release", "7", [($"refs/tags/{PackageId}/v3.0", OtherSha)]);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            "Malformed tag under the exact package prefix:",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Release_CarriesTheObservedStableTagStateIntoTheConsistencyRecheck()
+    {
+        var run = RunVersionState("release", "7", [Tag("3.0.0", OtherSha)]);
+
+        AssertSucceeded(run);
+
+        // The exact observed snapshot travels with the calculated state so the
+        // publisher and tag rechecks cannot observe a drifted package/tag state.
+        var decoded = System.Text.Encoding.UTF8.GetString(
+            Convert.FromBase64String(CalculatedTagState(run.Outputs)));
+
+        Assert.Equal($"refs/tags/{PackageId}/v3.0.0={OtherSha}", decoded);
+        Assert.Equal($"{PackageId}/v3.0.1", run.Outputs["release-tag"]);
     }
 
     private sealed record VersionStateRun(ShellResult Result, IReadOnlyDictionary<string, string> Outputs);

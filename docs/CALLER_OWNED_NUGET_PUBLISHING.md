@@ -84,6 +84,97 @@ push, and succeeds so the tag job can reconcile the immutable release tag. A
 version that exists without matching provenance fails closed. This preserves
 same-SHA rerun recovery without a permanent key and without moving a tag.
 
+## One-time existing-package bootstrap and adoption
+
+Steady-state publishing is tag-derived. The reusable workflow reads only the
+complete tag set under `<package-id>/`; it never queries a registry, and the
+publisher rechecks only the calculated package version. Runtime fail-closed
+therefore covers exactly the calculated version and the governed tags: it can
+refuse an existing package at that calculated version without matching caller
+provenance, and it aborts on malformed, foreign, ambiguous, or drifted state, but
+it cannot discover any other published version, including a higher stable one.
+
+Enabling steady state for an active compatibility line is therefore gated on a
+migration operator inspecting every stable registry version for the exact package
+ID before steady state is enabled. The runtime never performs that inspection, so
+the operator must, and must do it first.
+
+### Enable steady state only after registry inspection
+
+1. **Inspect the registry before enabling steady state.** List every stable
+   package version for the exact package ID in the selected registry, then keep
+   only versions on the active compatibility line. Versions for another
+   compatibility line are excluded and never raise or lower the conclusion.
+2. **Natural bootstrap — no stable line package and no matching line tag.** Only
+   when the active compatibility line has no stable package in the selected
+   registry *and* no tag under `<package-id>/` for that line is steady state safe
+   from the start: the workflow derives the first `3.X.0`, the selected publisher
+   publishes it, and the caller-owned `package-release-tag` action creates
+   `<package-id>/v3.X.0`. No manual step is required.
+3. **Any stable line package — keep steady state disabled until migration.** If
+   the active line has one or more stable packages in the selected registry, do
+   not enable or run steady state yet. A tag-derived calculation can sit below
+   the published packages and the runtime will not catch it: for example, with
+   registry versions `3.X.4` and `3.X.5` and no line tags, the workflow calculates
+   `3.X.0`, and the publisher sees no package at `3.X.0` and would publish a new
+   lower `3.X.0` instead of failing closed. Complete the migration procedure
+   below before enabling steady state.
+4. **Adopt the highest proven version, then advance one patch.** The migration
+   candidate is the highest stable `3.X.Y` already published for the line: for
+   example, registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never
+   the first `3.X.0`. Prove the candidate's provenance, create the immutable
+   `<package-id>/v3.X.Y` tag deliberately, and only then enable steady state: the
+   next release claims `Y+1`, so a candidate of `3.X.5` resumes at `3.X.6`.
+5. **Unprovable highest — migration stays disabled.** When the highest stable
+   `3.X.Y` on the line has missing, malformed, or foreign provenance, migration
+   remains disabled: do not enable or run steady state, do not create a tag, and
+   do not publish. The runtime provides no safety net for the unadopted higher
+   version.
+
+### Prove the migration candidate's provenance
+
+Download that exact published candidate package and read the `RepositoryCommit`
+value from its `.nuspec` metadata. The value must be a well-formed 40-character
+commit SHA. Show that commit is a real commit in the caller repository, for
+example with the Git-refs or commits API or `git cat-file -e <sha>^{commit}`, and
+that it is the commit that produced the published package. Missing, malformed, or
+foreign provenance fails migration.
+
+A tag/package version conflict, or a valid lower candidate that sits below an
+unproven higher line version, fails migration and adopts nothing: never tag a
+valid lower version while a higher line version exists whose provenance is
+missing, malformed, or foreign, and never reconcile a tag and a package that
+disagree about the same version.
+
+### Runtime fail-closed versus migration fail-closed
+
+- **Runtime fail-closed** — the workflow and publishers abort on malformed,
+  foreign, or ambiguous tag state, on calculated-state or tag-state drift, and on
+  an existing package at the calculated version whose provenance is not the
+  caller commit. This guards the calculated version and the governed tags only.
+- **Migration fail-closed** — the operator keeps steady state disabled whenever
+  the registry shows a stable line package that cannot be adopted. The runtime
+  never sees those higher versions, so this is an operator obligation and not a
+  workflow guarantee.
+
+### Gizmo.Shared 3.0 conclusion
+
+`Gizmo.Shared` is on compatibility line 3.0 with no stable `3.0.Y` NuGet package
+in the selected registry and no `Gizmo.Shared/v3.0.Y` tag. Nothing is adopted and
+no migration step applies: the line qualifies for natural bootstrap. The first
+development build is `3.0.0-dev.N`, the first stable release publishes `3.0.0`,
+and the caller-owned `package-release-tag` action creates the immutable
+`Gizmo.Shared/v3.0.0` tag. Legacy `1.0.x` packages are another compatibility
+line and never raise or lower the 3.0 conclusion.
+
+An existing package is never adopted as a side effect of a run. Adoption is a
+separate, deliberate, one-time caller action, outside the workflow; it is not
+part of the reusable workflow, the caller template, or either publisher action.
+Any ambiguous, conflicting, or unproven state fails closed: do not guess a tag
+target, do not create a synthetic tag, and do not route the package through a
+publisher to force adoption. The runtime workflow and actions carry no registry
+migration or adoption code: this remains an operator contract.
+
 ## NuGet.org trusted publishing
 
 Public publishing uses NuGet.org Trusted Publishing instead of a stored API key.
