@@ -159,9 +159,8 @@ public sealed class PublishVersionStateExecutionTests
     [Fact]
     public void Development_WithSparseStableTags_AdvancesPastTheObservedLineMaximum()
     {
-        // Sparse published history (3.0.2, 3.0.4, 3.0.5) is the legacy adoption
-        // shape: the operator adopts the highest published version, 3.0.5. Once
-        // that adoption tag exists, the next stable candidate is Y+1 = 3.0.6.
+        // The runtime derives from the tag set alone, so a gap in the tag sequence
+        // does not reset the maximum and published packages never raise the patch.
         var run = RunVersionState(
             "development",
             "7",

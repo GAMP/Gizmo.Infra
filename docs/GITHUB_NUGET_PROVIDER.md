@@ -173,27 +173,37 @@ replace an earlier pending run, so this is not a durable queue.
 The workflow derives every version from tags. For each package it considers only
 the complete tag set under the exact `<package-id>/` prefix and only the matching
 compatibility line; tags for another package or another compatibility line never
-advance the candidate. It never queries a registry, so a calculation is always
-the next patch implied by the observed tags, not by published packages, and
-natural bootstrap and legacy adoption remain different operator situations.
+advance the candidate. It never queries a registry, and the publisher rechecks
+only the calculated package version. The runtime can therefore refuse an existing
+package at that exact calculated version, but it cannot discover any other
+published version, including a higher stable one.
+
+Enabling steady state for an active compatibility line is gated on a migration
+operator inspecting all stable registry versions first, before steady state is
+enabled:
 
 - **Natural bootstrap** — the active compatibility line has no stable package in
   the selected registry *and* no matching stable tag. Validation and development
   advertise the first `3.X.0`, and a new release calculates `3.X.0` with
-  `release-tag-state=missing`. The preparation workflow never creates a synthetic tag;
-  the immutable release tag is created only by the caller-owned
+  `release-tag-state=missing`. The preparation workflow never creates a synthetic
+  tag; the immutable release tag is created only by the caller-owned
   `package-release-tag` action, in a resolved `release` run, after the selected
-  publisher succeeded, and only for the exact calculated release tag.
-- **Legacy adoption** — the active compatibility line already has stable package
-  versions in the selected registry but the matching tag history is missing or
-  incomplete. The calculated version collides with an existing package that does
-  not carry the caller commit, so the run fails closed. Recovering the line is
-  the separate, deliberate, one-time operator procedure in
-  [CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md): adopt the
-  highest stable `3.X.Y` published for the line, prove its `RepositoryCommit` is
-  a real caller commit, deliberately create `<package-id>/v3.X.Y`, and let the
-  next release claim `Y+1`. Adoption never selects the first `3.X.0` when higher
+  publisher succeeded, and only for the exact calculated release tag. This is the
+  only case where steady state is safe without a migration step.
+- **Migration required** — the active compatibility line already has any stable
+  package in the selected registry. Do not enable or run steady state until the
+  migration procedure in
+  [CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md) completes.
+  With no line tags the tag-derived calculation is `3.X.0`, and the publisher
+  sees no package at `3.X.0`, so a steady-state run would publish a new lower
+  `3.X.0` rather than detect the higher packages. Migration adopts the highest
+  stable `3.X.Y` published for the line, proves its `RepositoryCommit` is a real
+  caller commit, deliberately creates `<package-id>/v3.X.Y`, and lets the next
+  release claim `Y+1`. Adoption never selects the first `3.X.0` when higher
   stable line versions already exist.
+- **Migration stays disabled** — when the highest stable line version cannot be
+  provenance-proven, do not enable steady state, do not publish, and do not
+  create a tag. The runtime cannot detect the unadopted higher version.
 
 A stable package and its `<package-id>/v3.X.Y` tag must stay consistent. When the
 matching stable tag already exists, the next release claims `Y+1`, and a
@@ -201,8 +211,8 @@ same-commit rerun reuses the exact tagged version. A tag is never moved or
 overwritten, and a claimed tag that resolves to a different commit is a failure.
 
 The steady-state workflow does not adopt an existing package. The publisher's
-provenance recheck accepts an already-published calculated version only when the
-package carries the exact caller commit in its `RepositoryCommit` metadata;
+provenance recheck accepts an already-published *calculated* version only when
+the package carries the exact caller commit in its `RepositoryCommit` metadata;
 same-SHA recovery is the only automatic success. A stable package at the
 calculated version with absent, malformed, or different provenance fails closed,
 and the workflow neither publishes nor creates a recovery tag. Adopting a stable
@@ -210,14 +220,15 @@ package whose matching tag is missing into the compatibility line requires
 conclusive `RepositoryCommit` provenance tied to a real caller commit in the
 caller repository before the tag is created.
 
-Ambiguous, conflicting, or unproven state fails closed. Multiple tags that
-resolve to the caller commit, a malformed tag under the package prefix, a tag
-outside the requested prefix, an unresolvable or non-commit tag, a
-calculated-state or tag-state drift, a tag/package version conflict, and a valid
-lower candidate under an unproven higher line version all abort the run. The
-workflow carries no legacy bootstrap logic: the only bootstrap behavior is the
-generic next-patch derivation from the complete line tag state, and no workflow
-or action carries registry migration or adoption code.
+Runtime and migration fail closed separately. The runtime aborts on malformed,
+conflicting, or ambiguous tag state, on calculated-state or tag-state drift, and
+on an existing calculated version without matching provenance; that protects the
+calculated version and the governed tags only. The operator must keep steady
+state disabled whenever the registry shows a stable line package that cannot be
+adopted, because the runtime never observes those higher versions. The workflow
+carries no legacy bootstrap logic: the only bootstrap behavior is the generic
+next-patch derivation from the complete line tag state, and no workflow or action
+carries registry migration or adoption code.
 
 ## Artifacts, collision checks, and release recovery
 

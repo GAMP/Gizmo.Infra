@@ -4,16 +4,16 @@ namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
 /// Contract and executable coverage for the one-time existing-package
-/// bootstrap/adoption boundary. Natural bootstrap (no stable registry package
-/// <em>and</em> no matching line tag) and legacy adoption (existing stable line
-/// versions without complete tag history) are documented operator situations, not
-/// steady-state workflow features. The reusable workflows only derive the next
-/// patch from the complete compatibility-line tag state and never query a
-/// registry, and a publisher accepts an already-published calculated version only
-/// when the package carries the exact caller commit as <c>RepositoryCommit</c>.
-/// Every absent, malformed, foreign, conflicting, or partially proven state fails
-/// closed, so adopting an existing stable package stays a separate deliberate
-/// operator action documented outside the workflow.
+/// bootstrap/adoption boundary. The runtime calculates only from the governed
+/// package tags and the publisher rechecks only the calculated package version,
+/// so it cannot discover a higher stable registry version. Natural bootstrap
+/// (no stable registry package <em>and</em> no matching line tag) is the only
+/// case where steady state is safe from the start; any stable line package
+/// requires a migration operator to inspect the registry, prove the highest
+/// stable version, and create its immutable tag before steady state is enabled.
+/// The executable provenance guards prove the committed publishers still fail
+/// closed on an existing calculated version without the caller commit, and the
+/// steady-state workflows and actions carry no migration or adoption code.
 /// </summary>
 public sealed class PackageBootstrapAdoptionContractTests
 {
@@ -130,102 +130,170 @@ public sealed class PackageBootstrapAdoptionContractTests
     }
 
     [Fact]
+    public void RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled()
+    {
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
+
+        // The runtime never sees higher registry versions, so registry inspection
+        // is a migration gate that must complete before steady state is enabled.
+        Assert.Contains(
+            "gated on a migration operator inspecting every stable registry version for the exact package ID before steady state is enabled",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "gated on a migration operator inspecting all stable registry versions first, before steady state is enabled",
+            provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages()
+    {
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
+
+        // The publisher's collision recheck reads only the calculated version, so
+        // any other published version stays invisible to the runtime.
+        Assert.Contains("the publisher rechecks only the calculated package version", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "it cannot discover any other published version, including a higher stable one",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "the publisher rechecks only the calculated package version",
+            provider,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "it cannot discover any other published version, including a higher stable one",
+            provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime()
+    {
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
+
+        // Registry 3.X.4 and 3.X.5 with no line tags calculate 3.X.0, which the
+        // publisher sees as unpublished, so it would publish a new lower version
+        // rather than detect the higher packages.
+        Assert.Contains("versions `3.X.4` and `3.X.5` and no line tags", caller, StringComparison.Ordinal);
+        Assert.Contains("the runtime will not catch it", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "would publish a new lower `3.X.0` instead of failing closed",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "would publish a new lower `3.X.0` rather than detect the higher packages",
+            provider,
+            StringComparison.Ordinal);
+
+        Assert.DoesNotContain("fails closed on the existing-package collision", caller, StringComparison.Ordinal);
+        Assert.DoesNotContain("so the run fails closed", caller, StringComparison.Ordinal);
+        Assert.DoesNotContain("so the run fails closed", provider, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
     {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
         // Bootstrap is the conjunction: the line starts at its first 3.X.0 only
         // when the registry has no stable package for the line *and* no matching
         // tag exists. "No tag" alone is not bootstrap.
         Assert.Contains(
-            "the selected registry *and* no tag under `<package-id>/` for that line",
+            "the active compatibility line has no stable package in the selected registry *and* no tag under `<package-id>/` for that line",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("derives the first `3.X.0`", caller, StringComparison.Ordinal);
+        Assert.Contains("the workflow derives the first `3.X.0`", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "the selected registry *and* no matching stable tag",
+            "the active compatibility line has no stable package in the selected registry *and* no matching stable tag",
             provider,
             StringComparison.Ordinal);
+        Assert.Contains("only case where steady state is safe without a migration step", provider, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void LegacyAdoption_SelectsTheHighestStableLineVersion()
+    public void Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch()
     {
-        var caller = CallerDoc();
+        var caller = Flatten(CallerDoc());
 
-        // Adoption is not bootstrap: when the line already has published stable
-        // versions, the candidate is the highest of them, never the first 3.X.0.
-        Assert.Contains("The candidate is the highest stable", caller, StringComparison.Ordinal);
+        // The migration candidate is the highest published line version, and the
+        // next release after its immutable tag claims one patch later.
+        Assert.Contains("The migration candidate is the highest stable `3.X.Y`", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "registry versions `3.X.2`, `3.X.4`, and `3.X.5`",
+            "registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never the first `3.X.0`",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("line yield candidate `3.X.5`", caller, StringComparison.Ordinal);
-        Assert.Contains("never the first `3.X.0`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "create the immutable `<package-id>/v3.X.Y` tag deliberately",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("a candidate of `3.X.5` resumes at `3.X.6`", caller, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void LegacyAdoption_EstablishesTheProvenHighestTagThenAdvancesToTheNextPatch()
+    public void MigrationFailure_LeavesPublishingDisabled()
     {
-        var caller = CallerDoc();
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
-        // A proven candidate 3.X.5 is tagged outside the workflow,
-        // and the next release resumes one patch later at 3.X.6.
-        Assert.Contains("Create the immutable package-qualified tag", caller, StringComparison.Ordinal);
+        // An unprovable highest version is not a runtime failure the workflow can
+        // detect; the operator must keep steady state disabled.
+        Assert.Contains("Unprovable highest — migration stays disabled", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "outside the workflow. This is the one-time adoption.",
+            "migration remains disabled: do not enable or run steady state, do not create a tag, and do not publish",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("next release claims `Y+1`", caller, StringComparison.Ordinal);
-        Assert.Contains("resumes at the next stable `3.X.6`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "The runtime provides no safety net for the unadopted higher version",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("Migration stays disabled", provider, StringComparison.Ordinal);
+        Assert.Contains(
+            "do not enable steady state, do not publish, and do not create a tag",
+            provider,
+            StringComparison.Ordinal);
+        Assert.Contains("The runtime cannot detect the unadopted higher version", provider, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void LegacyAdoption_UnprovenProvenanceFailsClosed()
+    public void MigrationAndRuntime_FailClosedSeparately()
     {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
-        // Missing, malformed, or foreign provenance can never be adopted.
+        // Runtime fail-closed guards the calculated version and governed tags;
+        // migration fail-closed is the operator's obligation for unseen versions.
+        Assert.Contains("Runtime fail-closed", caller, StringComparison.Ordinal);
+        Assert.Contains("Migration fail-closed", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "Missing, malformed, or foreign provenance fails closed",
+            "the operator keeps steady state disabled whenever the registry shows a stable line package that cannot be adopted",
             caller,
             StringComparison.Ordinal);
+        Assert.Contains("this is an operator obligation and not a workflow guarantee", caller, StringComparison.Ordinal);
+        Assert.Contains("Runtime and migration fail closed separately", provider, StringComparison.Ordinal);
+        Assert.Contains("because the runtime never observes those higher versions", provider, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MigrationProvenanceRequirements_AreDocumented()
+    {
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
+
+        Assert.Contains("Missing, malformed, or foreign provenance fails migration", caller, StringComparison.Ordinal);
         Assert.Contains("git cat-file -e <sha>^{commit}", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "conclusive `RepositoryCommit` provenance tied to a real caller commit",
-            provider,
-            StringComparison.Ordinal);
-        Assert.Contains("fails closed", provider, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void LegacyAdoption_TagPackageConflictFailsClosed()
-    {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
-
-        // A tag and a package that disagree about the same version adopt nothing.
-        Assert.Contains("tag/package conflict", caller, StringComparison.Ordinal);
-        Assert.Contains("adopts nothing", caller, StringComparison.Ordinal);
-        Assert.Contains("a tag/package version conflict", provider, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void LegacyAdoption_LowerValidCandidateBelowUnprovenHigherVersionFailsClosed()
-    {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
-
-        // A valid lower candidate must not be tagged while a higher line version
-        // remains unproven; the whole adoption fails closed instead.
-        Assert.Contains(
-            "valid lower candidate that sits below an unproven higher line version",
+            "a valid lower candidate that sits below an unproven higher line version",
             caller,
             StringComparison.Ordinal);
+        Assert.Contains("fails migration and adopts nothing", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "lower candidate under an unproven higher line version",
+            "conclusive `RepositoryCommit` provenance tied to a real caller commit",
             provider,
             StringComparison.Ordinal);
     }
@@ -233,15 +301,13 @@ public sealed class PackageBootstrapAdoptionContractTests
     [Fact]
     public void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
     {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
+        Assert.Contains("Versions for another compatibility line are excluded", caller, StringComparison.Ordinal);
+        Assert.Contains("never raise or lower the conclusion", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "Versions for another compatibility line are excluded",
-            caller,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "package or another compatibility line never",
+            "tags for another package or another compatibility line never advance the candidate",
             provider,
             StringComparison.Ordinal);
     }
@@ -249,8 +315,8 @@ public sealed class PackageBootstrapAdoptionContractTests
     [Fact]
     public void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
     {
-        var caller = CallerDoc();
-        var provider = ProviderDoc();
+        var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
         // The runtime is tag-derived and carries no registry query for candidate
         // selection, so bootstrap and adoption stay an operator contract. The
@@ -271,6 +337,29 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains(
             "or action carries registry migration or adoption code",
             provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GizmoShared30_StaysDisabledUntilTheHighestVersionIsProvenAndTagged()
+    {
+        var caller = Flatten(CallerDoc());
+
+        // The concrete 3.0 line: published 3.0.4 and 3.0.5 with no line tags must
+        // not be enabled, and the next release after the adopted 3.0.5 is 3.0.6.
+        Assert.Contains("Gizmo.Shared 3.0 conclusion", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "`Gizmo.Shared` 3.0 has published stable packages `3.0.4` and `3.0.5` but no matching 3.0 line tags",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "calculate and publish `3.0.0` instead of detecting the higher packages",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("makes the next release `3.0.6`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "If `3.0.5` cannot be proven, migration and publishing remain disabled",
+            caller,
             StringComparison.Ordinal);
     }
 
@@ -341,6 +430,11 @@ public sealed class PackageBootstrapAdoptionContractTests
 
         return values;
     }
+
+    // The docs wrap Markdown by hand, so phrase assertions read against a single
+    // whitespace-normalized line instead of one physical line.
+    private static string Flatten(string content) =>
+        string.Join(' ', content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     private static string CallerDoc() => Read("docs", "CALLER_OWNED_NUGET_PUBLISHING.md");
 
