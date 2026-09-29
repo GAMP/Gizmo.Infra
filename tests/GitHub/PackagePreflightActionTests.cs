@@ -11,8 +11,9 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// resolution, authenticated caller-repository visibility, and the guarantee that
 /// the preflight adds no publishing or registry-routing behavior.
 ///
-/// Executable tests run the action's own extracted bash and Node blocks against a
-/// real working tree, so the committed source, not a hand copy, is under test.
+/// Executable tests run the action's own extracted bash blocks and checked-in Node
+/// modules against a real working tree, so the committed source, not a hand copy, is
+/// under test.
 /// Network and GitHub are unavailable locally, so the visibility transport is
 /// exercised through its exact command text plus a curl test double, and the
 /// visibility parsing block runs its committed jq filter through a Node jq shim.
@@ -26,6 +27,14 @@ public sealed class PackagePreflightActionTests
     private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
 
     private static readonly string Action = WorkflowShell.ReadAction(PreflightAction);
+
+    private static readonly string ParserScript = Path.Combine(
+        InfraRepositoryLocator.ResolveRoot(),
+        ".github",
+        "actions",
+        PreflightAction,
+        "scripts",
+        "parse-package-config.mjs");
 
     private const string PackableProject = """
         <Project Sdk="Microsoft.NET.Sdk">
@@ -164,6 +173,19 @@ public sealed class PackagePreflightActionTests
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Empty(result.StandardOutput);
+    }
+
+    [Fact]
+    public void BranchConfig_IsParsedByACheckedInModuleThroughActionPath()
+    {
+        Assert.Contains(
+            "config_json=$(node \"$GITHUB_ACTION_PATH/scripts/parse-package-config.mjs\" .github/package.yml)",
+            Action,
+            StringComparison.Ordinal);
+
+        // The inline interpreter program must not return; a named module is the contract.
+        Assert.DoesNotContain("node -e", Action, StringComparison.Ordinal);
+        Assert.DoesNotContain("<<'NODE'", Action, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -413,7 +435,7 @@ public sealed class PackagePreflightActionTests
     {
         using var repository = new TempRepository();
         var configPath = repository.WriteFile(".github/package.yml", yaml);
-        return WorkflowShell.RunNode(NodeProgram(), configPath);
+        return WorkflowShell.RunNodeScript(ParserScript, configPath);
     }
 
     private static ShellResult RunBranchRole(string currentRef)
@@ -482,17 +504,6 @@ public sealed class PackagePreflightActionTests
             printf 'count=%s\n' "${#candidates[@]}"
             printf 'project_path=%s\n' "${project_path:-}"
             """;
-    }
-
-    private static string NodeProgram()
-    {
-        var match = Regex.Match(
-            Action,
-            "<<'NODE'\\r?\\n(?<program>.*?)\\r?\\n\\s*NODE",
-            RegexOptions.Singleline | RegexOptions.CultureInvariant);
-
-        Assert.True(match.Success, "action.yml has no embedded Node config parser.");
-        return match.Groups["program"].Value;
     }
 
     private static IEnumerable<string> MappingKeys(YamlMappingNode mapping) =>
