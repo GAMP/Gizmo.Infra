@@ -230,6 +230,15 @@ carries no legacy bootstrap logic: the only bootstrap behavior is the generic
 next-patch derivation from the complete line tag state, and no workflow or action
 carries registry migration or adoption code.
 
+### Gizmo.Shared 3.0 conclusion
+
+`Gizmo.Shared` is on compatibility line 3.0 with no stable `3.0.Y` NuGet package
+in the selected registry and no `Gizmo.Shared/v3.0.Y` tag, so it needs no
+migration: natural bootstrap derives the first `3.0.0-dev.N` development build
+and the first stable release calculates `3.0.0`, whose immutable
+`Gizmo.Shared/v3.0.0` tag the caller-owned tag action creates. Legacy `1.0.x`
+packages are another compatibility line and never advance the 3.0 candidate.
+
 ## Artifacts, collision checks, and release recovery
 
 The build job packs the calculated version with the caller commit as repository

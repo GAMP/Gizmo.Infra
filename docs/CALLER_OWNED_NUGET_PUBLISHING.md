@@ -114,15 +114,15 @@ the operator must, and must do it first.
 3. **Any stable line package — keep steady state disabled until migration.** If
    the active line has one or more stable packages in the selected registry, do
    not enable or run steady state yet. A tag-derived calculation can sit below
-   the published packages and the runtime will not catch it: with registry
-   versions `3.X.4` and `3.X.5` and no line tags, the workflow calculates
+   the published packages and the runtime will not catch it: for example, with
+   registry versions `3.X.4` and `3.X.5` and no line tags, the workflow calculates
    `3.X.0`, and the publisher sees no package at `3.X.0` and would publish a new
    lower `3.X.0` instead of failing closed. Complete the migration procedure
    below before enabling steady state.
 4. **Adopt the highest proven version, then advance one patch.** The migration
-   candidate is the highest stable `3.X.Y` already published for the line:
-   registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never the
-   first `3.X.0`. Prove the candidate's provenance, create the immutable
+   candidate is the highest stable `3.X.Y` already published for the line: for
+   example, registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never
+   the first `3.X.0`. Prove the candidate's provenance, create the immutable
    `<package-id>/v3.X.Y` tag deliberately, and only then enable steady state: the
    next release claims `Y+1`, so a candidate of `3.X.5` resumes at `3.X.6`.
 5. **Unprovable highest — migration stays disabled.** When the highest stable
@@ -159,12 +159,13 @@ disagree about the same version.
 
 ### Gizmo.Shared 3.0 conclusion
 
-`Gizmo.Shared` 3.0 has published stable packages `3.0.4` and `3.0.5` but no
-matching 3.0 line tags. Steady state must stay disabled: a tag-derived run would
-calculate and publish `3.0.0` instead of detecting the higher packages. Enable
-steady state only after `3.0.5` provenance is proven and the immutable
-`Gizmo.Shared/v3.0.5` tag is created, which makes the next release `3.0.6`. If
-`3.0.5` cannot be proven, migration and publishing remain disabled.
+`Gizmo.Shared` is on compatibility line 3.0 with no stable `3.0.Y` NuGet package
+in the selected registry and no `Gizmo.Shared/v3.0.Y` tag. Nothing is adopted and
+no migration step applies: the line qualifies for natural bootstrap. The first
+development build is `3.0.0-dev.N`, the first stable release publishes `3.0.0`,
+and the caller-owned `package-release-tag` action creates the immutable
+`Gizmo.Shared/v3.0.0` tag. Legacy `1.0.x` packages are another compatibility
+line and never raise or lower the 3.0 conclusion.
 
 An existing package is never adopted as a side effect of a run. Adoption is a
 separate, deliberate, one-time caller action, outside the workflow; it is not

@@ -341,26 +341,31 @@ public sealed class PackageBootstrapAdoptionContractTests
     }
 
     [Fact]
-    public void GizmoShared30_StaysDisabledUntilTheHighestVersionIsProvenAndTagged()
+    public void GizmoShared30_NaturalBootstrapStartsAtTheFirstStableVersion()
     {
         var caller = Flatten(CallerDoc());
+        var provider = Flatten(ProviderDoc());
 
-        // The concrete 3.0 line: published 3.0.4 and 3.0.5 with no line tags must
-        // not be enabled, and the next release after the adopted 3.0.5 is 3.0.6.
+        // No stable line package and no line tag makes Gizmo.Shared a natural bootstrap.
         Assert.Contains("Gizmo.Shared 3.0 conclusion", caller, StringComparison.Ordinal);
+        Assert.Contains("no stable `3.0.Y` NuGet package", caller, StringComparison.Ordinal);
+        Assert.Contains("no `Gizmo.Shared/v3.0.Y` tag", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "`Gizmo.Shared` 3.0 has published stable packages `3.0.4` and `3.0.5` but no matching 3.0 line tags",
+            "Nothing is adopted and no migration step applies",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains(
-            "calculate and publish `3.0.0` instead of detecting the higher packages",
-            caller,
-            StringComparison.Ordinal);
-        Assert.Contains("makes the next release `3.0.6`", caller, StringComparison.Ordinal);
-        Assert.Contains(
-            "If `3.0.5` cannot be proven, migration and publishing remain disabled",
-            caller,
-            StringComparison.Ordinal);
+        Assert.Contains("the line qualifies for natural bootstrap", caller, StringComparison.Ordinal);
+        Assert.Contains("first development build is `3.0.0-dev.N`", caller, StringComparison.Ordinal);
+        Assert.Contains("first stable release publishes `3.0.0`", caller, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared/v3.0.0` tag", caller, StringComparison.Ordinal);
+        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", caller, StringComparison.Ordinal);
+
+        Assert.Contains("Gizmo.Shared 3.0 conclusion", provider, StringComparison.Ordinal);
+        Assert.Contains("no stable `3.0.Y` NuGet package", provider, StringComparison.Ordinal);
+        Assert.Contains("natural bootstrap derives the first `3.0.0-dev.N`", provider, StringComparison.Ordinal);
+        Assert.Contains("first stable release calculates `3.0.0`", provider, StringComparison.Ordinal);
+        Assert.Contains("Gizmo.Shared/v3.0.0", provider, StringComparison.Ordinal);
+        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", provider, StringComparison.Ordinal);
     }
 
     private sealed record ProvenanceRun(ShellResult Result, string RepositoryCommit);
