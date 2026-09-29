@@ -72,7 +72,7 @@ runs:
         is_packable=$(dotnet msbuild "$project_path" -nologo -getProperty:IsPackable) || fail "Could not re-evaluate IsPackable for the discovered project."
         [[ "$is_packable" == true ]] || fail "The discovered project is not packable."
         [[ "$package_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "The discovered project PackageId has an invalid format."
-        [[ "$compatibility_line" =~ ^3\.(0|[1-9][0-9]*)$ ]] || fail "The discovered project Version must be exactly 3.X, with numeric X and no leading zero."
+        [[ "$compatibility_line" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "The discovered project Version must be exactly <major>.<minor>, with numeric components and no leading zero."
 
         response_file=$(mktemp)
         trap 'rm -f "$response_file"' EXIT

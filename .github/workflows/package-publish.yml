@@ -150,8 +150,8 @@ jobs:
             [[ -z "$ref" ]] && continue
             if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
             tag_leaf=${ref#"$tag_prefix"}
-            if [[ ! "$tag_leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
-            tag_line="3.${BASH_REMATCH[1]}"; tag_patch=${BASH_REMATCH[2]}
+            if [[ ! "$tag_leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; tag_patch=${BASH_REMATCH[3]}
             tag_commit=$(resolve_commit "$object_type" "$object_sha")
             tag_snapshot+="${ref}=${object_sha}"$'\n'
             if [[ "$tag_line" == "$COMPATIBILITY_LINE" ]]; then
@@ -169,7 +169,7 @@ jobs:
             release)
               case ${#current_tags[@]} in
                 0) if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi; release_tag_state=missing ;;
-                1) if [[ ! "${current_tags[0]}" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Current-SHA package tag is malformed." >&2; exit 1; fi; base_version="3.${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; patch=${BASH_REMATCH[2]}; release_tag_state=present ;;
+                1) if [[ ! "${current_tags[0]}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Current-SHA package tag is malformed." >&2; exit 1; fi; tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; base_version="${tag_line}.${BASH_REMATCH[3]}"; patch=${BASH_REMATCH[3]}; release_tag_state=present ;;
                 *) echo "Multiple package/compatibility-line tags point to the caller commit; refusing ambiguous release rerun." >&2; exit 1 ;;
               esac
               if [[ "$release_tag_state" == missing ]]; then base_version="${COMPATIBILITY_LINE}.${patch}"; fi

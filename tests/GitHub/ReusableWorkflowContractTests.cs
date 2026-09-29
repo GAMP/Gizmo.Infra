@@ -538,15 +538,22 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void TagGrammar_IsPackageQualifiedThreeXStable()
+    public void TagGrammar_IsGenericPackageQualifiedStableTag()
     {
         foreach (var file in ContractFiles)
         {
             var build = VersionStateScript(file);
 
-            Assert.Contains(@"^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$", build, StringComparison.Ordinal);
-            Assert.Contains(@"tag_line=""3.${BASH_REMATCH[1]}""", build, StringComparison.Ordinal);
-            Assert.Contains("tag_patch=${BASH_REMATCH[2]}", build, StringComparison.Ordinal);
+            // Generic canonical grammar: <package-id>/v<major>.<minor>.<patch>.
+            Assert.Contains(
+                @"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$",
+                build,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                @"tag_line=""${BASH_REMATCH[1]}.${BASH_REMATCH[2]}""",
+                build,
+                StringComparison.Ordinal);
+            Assert.Contains("tag_patch=${BASH_REMATCH[3]}", build, StringComparison.Ordinal);
         }
     }
 

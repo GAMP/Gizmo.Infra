@@ -5,10 +5,11 @@ namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
 /// Executable coverage for the package-preflight MSBuild single-property
-/// captures and the exact `&lt;Version&gt;3.X&lt;/Version&gt;` and
-/// package-qualified stable-tag grammars. Each test runs the exact command or
-/// pattern read from the committed action or workflow, so changing the source,
-/// not just the wording of an assertion, fails the suite.
+/// captures and the canonical generic `<major>.<minor>` and
+/// package-qualified `<major>.<minor>.<patch>` stable-tag grammars. Each test
+/// runs the exact command or pattern read from the committed action or
+/// workflow, so changing the source, not just the wording of an assertion,
+/// fails the suite.
 /// </summary>
 public sealed class ProjectVersionCaptureTests
 {
@@ -81,10 +82,16 @@ public sealed class ProjectVersionCaptureTests
     }
 
     [Fact]
-    public void CompatibilityLineGrammar_RequiresExactlyThreeDotX()
+    public void CompatibilityLineGrammar_RequiresCanonicalMajorDotMinor()
     {
-        var accepted = new[] { "3.0", "3.1", "3.42", "3.100" };
-        var rejected = new[] { "3", "3.01", "4.0", "3.1.0", "3.x", "3.1-dev", " 3.1", "3.1 ", "03.1", "3.-1" };
+        // The evaluated <Version> selects the active compatibility line; the
+        // contract is canonical numeric <major>.<minor> with no leading zero.
+        var accepted = new[] { "0.0", "0.1", "1.0", "1.13", "3.0", "3.4", "4.7", "10.2", "100.200" };
+        var rejected = new[]
+        {
+            "3", "3.01", "3.1.0", "3.x", "3.1-dev", " 3.1", "3.1 ", "03.1", "3.-1",
+            "-1.0", "01.0", "00.0", "3.01.1", "1.", ".1", "",
+        };
 
         AssertPolicy(
             WorkflowShell.AcceptancePattern(
@@ -94,12 +101,19 @@ public sealed class ProjectVersionCaptureTests
     }
 
     [Fact]
-    public void TagGrammar_RequiresAPackageQualifiedStableThreeXTag()
+    public void TagGrammar_RequiresAPackageQualifiedCanonicalStableTag()
     {
-        var accepted = new[] { "v3.0.0", "v3.1.2", "v3.42.7" };
+        // Stable tags live under <package-id>/ and parse as
+        // v<major>.<minor>.<patch> with canonical numeric components. The
+        // generic grammar rejects leading zeros and any suffix or prefix drift.
+        var accepted = new[]
+        {
+            "v0.0.0", "v1.0.0", "v1.0.13", "v3.2.4", "v4.7.0", "v10.20.300",
+        };
         var rejected = new[]
         {
-            "v3.01.0", "v3.1.02", "v3.1", "v3.1.2-dev", "V3.1.2", "v3.1.2.4", "v3.1.2-", "3.1.2", "v3.x.2",
+            "v3.01.0", "v3.1.02", "v3.1", "v3.1.2-dev", "V3.1.2", "v3.1.2.4", "v3.1.2-",
+            "3.1.2", "v3.x.2", "v01.0.0", "v0.01.0", "v0.0.01", "v-1.0.0",
         };
 
         foreach (var file in ContractFiles)

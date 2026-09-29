@@ -47,9 +47,9 @@ The workflows deterministically discover exactly one SDK-style packable
 `.csproj` from the caller workspace and read `PackageId`, `Version`, and
 `IsPackable` through MSBuild. Zero or multiple candidates, non-packable or
 non-SDK-style projects, invalid project metadata, or invalid package
-configuration fail closed. The evaluated project `Version` remains the `3.X`
-compatibility line; callers do not supply a project path, package ID, version,
-or package visibility.
+configuration fail closed. The evaluated project `Version` remains a canonical
+`<major>.<minor>` compatibility line; callers do not supply a project path,
+package ID, version, or package visibility.
 
 The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
 authenticated repository metadata with bounded connect and total request
@@ -122,34 +122,37 @@ cannot be silently routed by a caller mistake.
 ## Automatic versioning
 
 The evaluated project `<Version>` is a compatibility-line input and must be
-exactly `3.X`: generation is fixed at `3`, and `X` is a non-negative decimal
-integer with no leading zero except `0`. Callers supply no patch or prerelease
+exactly `<major>.<minor>`: each component is `0` or a non-zero digit followed by
+digits, so leading zeros are rejected. The major selects the active
+compatibility line; it is not fixed. Callers supply no patch or prerelease
 version. Project descriptor values and workflow version inputs are not
 authoritative.
 
 For each package independently, the workflow uses the caller job's
 token-supported GitHub Git-refs API to paginate the complete caller-repository
 tag set under the exact prefix `<package-id>/`. Each tag there must be exactly
-`<package-id>/v3.X.Y`; malformed prefix tags fail closed. Validation, development,
-and a new release select `Y=0` when the matching line has no tags, otherwise
-`max(Y)+1`. The GitHub run number supplies `N`:
+`<package-id>/v<major>.<minor>.<patch>` with canonical numeric components;
+malformed prefix tags fail closed. Validation, development, and a new release
+select `patch=0` when the matching line has no tags, otherwise `max(patch)+1`.
+The GitHub run number supplies `N`:
 
 | Operation | Calculated package version |
 | --- | --- |
-| Validation | `3.X.Y-pr.${{ github.run_number }}` (packed only) |
-| Development | `3.X.Y-dev.${{ github.run_number }}` |
-| Release | `3.X.Y` and `<package-id>/v3.X.Y` |
+| Validation | `<major>.<minor>.<patch>-pr.${{ github.run_number }}` (packed only) |
+| Development | `<major>.<minor>.<patch>-dev.${{ github.run_number }}` |
+| Release | `<major>.<minor>.<patch>` and `<package-id>/v<major>.<minor>.<patch>` |
 
 Validation and development calculate the next patch from the complete stable
 tag state: `0` when the matching compatibility line has no stable tag, otherwise
-numeric `max(Y)+1`. Development does not create a stable tag, so repeated
-development runs use that same next-release base until a release creates its
-stable tag. Release first resolves every matching line tag to its commit. A
-rerun reuses a base only if exactly one package/line tag resolves to the caller
-SHA. No current-SHA tag calculates the next base. Multiple current-SHA tags are
-ambiguous and fail closed. A claimed calculated tag on another commit, a
-malformed tag response, or a changed tag state is a failure; the workflow never
-moves or overwrites a tag.
+numeric `max(patch)+1`. Only tags whose `<major>.<minor>` equals the evaluated
+compatibility line contribute to the patch calculation. Development does not
+create a stable tag, so repeated development runs use that same next-release base
+until a release creates its stable tag. Release first resolves every matching
+line tag to its commit. A rerun reuses a base only if exactly one package/line
+tag resolves to the caller SHA. No current-SHA tag calculates the next base.
+Multiple current-SHA tags are ambiguous and fail closed. A claimed calculated tag
+on another commit, a malformed tag response, or a changed tag state is a failure;
+the workflow never moves or overwrites a tag.
 
 The publish workflow uses the preflight action as the only authority for branch
 role and never parses `.github/package.yml` itself. Its build job emits package
@@ -184,31 +187,33 @@ enabled:
 
 - **Natural bootstrap** — the active compatibility line has no stable package in
   the selected registry *and* no matching stable tag. Validation and development
-  advertise the first `3.X.0`, and a new release calculates `3.X.0` with
-  `release-tag-state=missing`. The preparation workflow never creates a synthetic
-  tag; the immutable release tag is created only by the caller-owned
-  `package-release-tag` action, in a resolved `release` run, after the selected
-  publisher succeeded, and only for the exact calculated release tag. This is the
-  only case where steady state is safe without a migration step.
+  advertise the first `<major>.<minor>.0`, and a new release calculates
+  `<major>.<minor>.0` with `release-tag-state=missing`. The preparation workflow
+  never creates a synthetic tag; the immutable release tag is created only by the
+  caller-owned `package-release-tag` action, in a resolved `release` run, after the
+  selected publisher succeeded, and only for the exact calculated release tag.
+  This is the only case where steady state is safe without a migration step.
 - **Migration required** — the active compatibility line already has any stable
   package in the selected registry. Do not enable or run steady state until the
   migration procedure in
   [CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md) completes.
-  With no line tags the tag-derived calculation is `3.X.0`, and the publisher
-  sees no package at `3.X.0`, so a steady-state run would publish a new lower
-  `3.X.0` rather than detect the higher packages. Migration adopts the highest
-  stable `3.X.Y` published for the line, proves its `RepositoryCommit` is a real
-  caller commit, deliberately creates `<package-id>/v3.X.Y`, and lets the next
-  release claim `Y+1`. Adoption never selects the first `3.X.0` when higher
+  With no line tags the tag-derived calculation is `<major>.<minor>.0`, and the
+  publisher sees no package at `<major>.<minor>.0`, so a steady-state run would
+  publish a new lower `<major>.<minor>.0` rather than detect the higher packages.
+  Migration adopts the highest stable `<major>.<minor>.<patch>` published for the
+  line, proves its `RepositoryCommit` is a real caller commit, deliberately
+  creates `<package-id>/v<major>.<minor>.<patch>`, and lets the next release claim
+  `patch+1`. Adoption never selects the first `<major>.<minor>.0` when higher
   stable line versions already exist.
 - **Migration stays disabled** — when the highest stable line version cannot be
   provenance-proven, do not enable steady state, do not publish, and do not
   create a tag. The runtime cannot detect the unadopted higher version.
 
-A stable package and its `<package-id>/v3.X.Y` tag must stay consistent. When the
-matching stable tag already exists, the next release claims `Y+1`, and a
-same-commit rerun reuses the exact tagged version. A tag is never moved or
-overwritten, and a claimed tag that resolves to a different commit is a failure.
+A stable package and its `<package-id>/v<major>.<minor>.<patch>` tag must stay
+consistent. When the matching stable tag already exists, the next release claims
+`patch+1`, and a same-commit rerun reuses the exact tagged version. A tag is never
+moved or overwritten, and a claimed tag that resolves to a different commit is a
+failure.
 
 The steady-state workflow does not adopt an existing package. The publisher's
 provenance recheck accepts an already-published *calculated* version only when
@@ -255,7 +260,7 @@ environment variables.
 ## Consumer development ranges
 
 Consumer Central Package Management may explicitly opt into the floating
-development range `3.X.*-dev.*` when it intentionally tracks the latest
+development range `<major>.<minor>.*-dev.*` when it intentionally tracks the latest
 development build for one compatibility line. Exact development versions remain
 the safer default. This is consumer documentation only: Gizmo.Infra does not
 migrate consumers or enable CPM floating-version behavior.

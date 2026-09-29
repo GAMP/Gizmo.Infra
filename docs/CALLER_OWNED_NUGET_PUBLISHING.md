@@ -108,28 +108,31 @@ the operator must, and must do it first.
 2. **Natural bootstrap — no stable line package and no matching line tag.** Only
    when the active compatibility line has no stable package in the selected
    registry *and* no tag under `<package-id>/` for that line is steady state safe
-   from the start: the workflow derives the first `3.X.0`, the selected publisher
-   publishes it, and the caller-owned `package-release-tag` action creates
-   `<package-id>/v3.X.0`. No manual step is required.
+   from the start: the workflow derives the first `<major>.<minor>.0`, the
+   selected publisher publishes it, and the caller-owned `package-release-tag`
+   action creates `<package-id>/v<major>.<minor>.0`. No manual step is required.
 3. **Any stable line package — keep steady state disabled until migration.** If
    the active line has one or more stable packages in the selected registry, do
    not enable or run steady state yet. A tag-derived calculation can sit below
    the published packages and the runtime will not catch it: for example, with
-   registry versions `3.X.4` and `3.X.5` and no line tags, the workflow calculates
-   `3.X.0`, and the publisher sees no package at `3.X.0` and would publish a new
-   lower `3.X.0` instead of failing closed. Complete the migration procedure
-   below before enabling steady state.
+   registry versions `<major>.<minor>.4` and `<major>.<minor>.5` and no line tags,
+   the workflow calculates `<major>.<minor>.0`, and the publisher sees no package
+   at `<major>.<minor>.0` and would publish a new lower `<major>.<minor>.0`
+   instead of failing closed. Complete the migration procedure below before
+   enabling steady state.
 4. **Adopt the highest proven version, then advance one patch.** The migration
-   candidate is the highest stable `3.X.Y` already published for the line: for
-   example, registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never
-   the first `3.X.0`. Prove the candidate's provenance, create the immutable
-   `<package-id>/v3.X.Y` tag deliberately, and only then enable steady state: the
-   next release claims `Y+1`, so a candidate of `3.X.5` resumes at `3.X.6`.
+   candidate is the highest stable `<major>.<minor>.<patch>` already published for
+   the line: for example, registry versions `<major>.<minor>.4` and
+   `<major>.<minor>.5` yield candidate `<major>.<minor>.5`, never the first
+   `<major>.<minor>.0`. Prove the candidate's provenance, create the immutable
+   `<package-id>/v<major>.<minor>.<patch>` tag deliberately, and only then enable
+   steady state: the next release claims `patch+1`, so a candidate of
+   `<major>.<minor>.5` resumes at `<major>.<minor>.6`.
 5. **Unprovable highest — migration stays disabled.** When the highest stable
-   `3.X.Y` on the line has missing, malformed, or foreign provenance, migration
-   remains disabled: do not enable or run steady state, do not create a tag, and
-   do not publish. The runtime provides no safety net for the unadopted higher
-   version.
+   `<major>.<minor>.<patch>` on the line has missing, malformed, or foreign
+   provenance, migration remains disabled: do not enable or run steady state, do
+   not create a tag, and do not publish. The runtime provides no safety net for
+   the unadopted higher version.
 
 ### Prove the migration candidate's provenance
 

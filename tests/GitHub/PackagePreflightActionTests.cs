@@ -134,9 +134,10 @@ public sealed class PackagePreflightActionTests
             Action,
             StringComparison.Ordinal);
 
-        // The evaluated project Version is the 3.X compatibility line only.
+        // The evaluated project Version selects the active compatibility line;
+        // the contract is canonical numeric <major>.<minor> with no leading zero.
         Assert.Contains(
-            "[[ \"$compatibility_line\" =~ ^3\\.(0|[1-9][0-9]*)$ ]] || fail \"The discovered project Version must be exactly 3.X, with numeric X and no leading zero.\"",
+            "[[ \"$compatibility_line\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]] || fail \"The discovered project Version must be exactly <major>.<minor>, with numeric components and no leading zero.\"",
             Action,
             StringComparison.Ordinal);
     }

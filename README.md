@@ -2,7 +2,8 @@
 
 Gizmo.Infra provides centrally maintained GitHub Actions reusable workflows
 for NuGet validation and publish preparation. Callers own the package identity
-and set only the `3.X` compatibility line in their project `<Version>`;
+and set only a canonical `<major>.<minor>` compatibility line in their project
+`<Version>`;
 workflows calculate package patches from caller-repository tags, and callers
 route publication from the preparation outputs.
 

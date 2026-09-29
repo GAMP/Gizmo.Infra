@@ -296,6 +296,151 @@ public sealed class PublishVersionStateExecutionTests
         Assert.Equal($"{PackageId}/v3.0.1", run.Outputs["release-tag"]);
     }
 
+    [Theory]
+    [InlineData("1.0", "1.0.0", "1.0.0-dev.7", "Gizmo.Widget/v1.0.0")]
+    [InlineData("4.7", "4.7.0", "4.7.0-dev.7", "Gizmo.Widget/v4.7.0")]
+    [InlineData("3.2", "3.2.0", "3.2.0-dev.7", "Gizmo.Widget/v3.2.0")]
+    [InlineData("10.0", "10.0.0", "10.0.0-dev.7", "Gizmo.Widget/v10.0.0")]
+    public void Development_BootstrapsTheEmptyLineTagStateAcrossCompatibilityLines(
+        string compatibilityLine,
+        string expectedBase,
+        string expectedPackage,
+        string expectedReleaseTag)
+    {
+        // An empty stable tag state is the natural-bootstrap case for any
+        // canonical numeric <major>.<minor> line; the active line is not fixed
+        // and the first development build is <major>.<minor>.0-dev.N.
+        var run = RunVersionState("development", "7", [], compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal(expectedPackage, run.Outputs["package-version"]);
+        Assert.Equal(expectedReleaseTag, run.Outputs["release-tag"]);
+        Assert.Equal("not-applicable", run.Outputs["release-tag-state"]);
+    }
+
+    [Theory]
+    [InlineData("1.0", "1.0.13", "1.0.14", "1.0.14-dev.7")]
+    [InlineData("3.2", "3.2.4", "3.2.5", "3.2.5-dev.7")]
+    [InlineData("4.7", "4.7.0", "4.7.1", "4.7.1-dev.7")]
+    [InlineData("10.0", "10.0.99", "10.0.100", "10.0.100-dev.7")]
+    public void Development_AdvancesTheCandidatePatchOnTheActiveLineForAnyCompatibilityLine(
+        string compatibilityLine,
+        string existingTag,
+        string expectedBase,
+        string expectedPackage)
+    {
+        // The single stable tag on the matching line sets the line maximum and
+        // the next development build is exactly max(patch)+1; other lines are
+        // excluded from the candidate calculation.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(existingTag, OtherSha)],
+            compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal(expectedPackage, run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("1.0", new[] { "3.0.0", "2.5.7", "1.0.13", "0.9.9" }, "1.0.14")]
+    [InlineData("4.7", new[] { "4.7.2", "4.8.0", "4.6.99", "5.0.0" }, "4.7.3")]
+    [InlineData("3.2", new[] { "3.0.0", "3.1.5", "3.2.4", "3.3.0" }, "3.2.5")]
+    [InlineData("10.0", new[] { "10.1.0", "9.99.99", "10.0.0" }, "10.0.1")]
+    public void Development_OnlyTagsMatchingTheActiveMajorMinorLineContribute(
+        string compatibilityLine,
+        string[] tagVersions,
+        string expectedBase)
+    {
+        // Tags for other major or minor lines never advance the candidate; only
+        // tags whose <major>.<minor> equals the evaluated compatibility line
+        // contribute to the patch calculation.
+        var tags = tagVersions.Select(version => Tag(version, OtherSha)).ToArray();
+        var run = RunVersionState("development", "7", tags, compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal($"{expectedBase}-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("1.0", "1.0.0", "1.0.1", "1.0.1")]
+    [InlineData("3.2", "3.2.4", "3.2.5", "3.2.5")]
+    [InlineData("4.7", "4.7.0", "4.7.1", "4.7.1")]
+    [InlineData("10.0", "10.0.99", "10.0.100", "10.0.100")]
+    public void Release_AdvancesTheCandidatePatchOnTheActiveLineForAnyCompatibilityLine(
+        string compatibilityLine,
+        string existingTag,
+        string expectedBase,
+        string expectedPackage)
+    {
+        var run = RunVersionState(
+            "release",
+            "7",
+            [Tag(existingTag, OtherSha)],
+            compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal(expectedPackage, run.Outputs["package-version"]);
+        Assert.Equal($"{PackageId}/v{expectedBase}", run.Outputs["release-tag"]);
+        Assert.Equal("missing", run.Outputs["release-tag-state"]);
+    }
+
+    [Theory]
+    [InlineData("1.0", "1.0.0")]
+    [InlineData("3.2", "3.2.4")]
+    [InlineData("4.7", "4.7.0")]
+    [InlineData("10.0", "10.0.99")]
+    public void ReleaseRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersionOnAnyLine(
+        string compatibilityLine,
+        string tagVersion)
+    {
+        // The same-SHA rerun recovery is a generic property: any active
+        // compatibility line reuses its exact tagged version when the caller
+        // commit already owns exactly one matching stable tag.
+        var run = RunVersionState(
+            "release",
+            "7",
+            [Tag(tagVersion, CurrentSha)],
+            compatibilityLine: compatibilityLine,
+            githubSha: CurrentSha);
+
+        AssertSucceeded(run);
+        Assert.Equal(tagVersion, run.Outputs["base-version"]);
+        Assert.Equal(tagVersion, run.Outputs["package-version"]);
+        Assert.Equal($"{PackageId}/v{tagVersion}", run.Outputs["release-tag"]);
+        Assert.Equal("present", run.Outputs["release-tag-state"]);
+        Assert.Contains($";current-sha-tags=v{tagVersion};", run.Outputs["calculated-state"], StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("1.0", "v1.0")]
+    [InlineData("3.2", "v3.2.4-dev")]
+    [InlineData("4.7", "V4.7.0")]
+    [InlineData("10.0", "v10.0.0.1")]
+    public void Release_FailsClosedOnMalformedTagForAnyCompatibilityLine(
+        string compatibilityLine,
+        string malformedLeaf)
+    {
+        // Malformed tags under the exact package prefix are a hard failure on
+        // every active line; the ref prefix is unchanged but the leaf does not
+        // match the canonical numeric grammar.
+        var run = RunVersionState(
+            "release",
+            "7",
+            [($"refs/tags/{PackageId}/{malformedLeaf}", OtherSha)],
+            compatibilityLine: compatibilityLine);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            "Malformed tag under the exact package prefix:",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
     private sealed record VersionStateRun(ShellResult Result, IReadOnlyDictionary<string, string> Outputs);
 
     private static void AssertSucceeded(VersionStateRun run) =>

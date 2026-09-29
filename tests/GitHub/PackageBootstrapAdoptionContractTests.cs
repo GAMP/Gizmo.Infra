@@ -176,17 +176,21 @@ public sealed class PackageBootstrapAdoptionContractTests
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // Registry 3.X.4 and 3.X.5 with no line tags calculate 3.X.0, which the
-        // publisher sees as unpublished, so it would publish a new lower version
-        // rather than detect the higher packages.
-        Assert.Contains("versions `3.X.4` and `3.X.5` and no line tags", caller, StringComparison.Ordinal);
+        // Registry <major>.<minor>.4 and <major>.<minor>.5 with no line tags
+        // calculate <major>.<minor>.0, which the publisher sees as unpublished,
+        // so it would publish a new lower version rather than detect the higher
+        // packages.
+        Assert.Contains(
+            "versions `<major>.<minor>.4` and `<major>.<minor>.5` and no line tags",
+            caller,
+            StringComparison.Ordinal);
         Assert.Contains("the runtime will not catch it", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "would publish a new lower `3.X.0` instead of failing closed",
+            "would publish a new lower `<major>.<minor>.0` instead of failing closed",
             caller,
             StringComparison.Ordinal);
         Assert.Contains(
-            "would publish a new lower `3.X.0` rather than detect the higher packages",
+            "would publish a new lower `<major>.<minor>.0` rather than detect the higher packages",
             provider,
             StringComparison.Ordinal);
 
@@ -201,14 +205,17 @@ public sealed class PackageBootstrapAdoptionContractTests
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // Bootstrap is the conjunction: the line starts at its first 3.X.0 only
-        // when the registry has no stable package for the line *and* no matching
-        // tag exists. "No tag" alone is not bootstrap.
+        // Bootstrap is the conjunction: the line starts at its first
+        // <major>.<minor>.0 only when the registry has no stable package for the
+        // line *and* no matching tag exists. "No tag" alone is not bootstrap.
         Assert.Contains(
             "the active compatibility line has no stable package in the selected registry *and* no tag under `<package-id>/` for that line",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("the workflow derives the first `3.X.0`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "the workflow derives the first `<major>.<minor>.0`",
+            caller,
+            StringComparison.Ordinal);
         Assert.Contains(
             "the active compatibility line has no stable package in the selected registry *and* no matching stable tag",
             provider,
@@ -223,16 +230,22 @@ public sealed class PackageBootstrapAdoptionContractTests
 
         // The migration candidate is the highest published line version, and the
         // next release after its immutable tag claims one patch later.
-        Assert.Contains("The migration candidate is the highest stable `3.X.Y`", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never the first `3.X.0`",
+            "The migration candidate is the highest stable `<major>.<minor>.<patch>`",
             caller,
             StringComparison.Ordinal);
         Assert.Contains(
-            "create the immutable `<package-id>/v3.X.Y` tag deliberately",
+            "registry versions `<major>.<minor>.4` and `<major>.<minor>.5` yield candidate `<major>.<minor>.5`, never the first `<major>.<minor>.0`",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("a candidate of `3.X.5` resumes at `3.X.6`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "create the immutable `<package-id>/v<major>.<minor>.<patch>` tag deliberately",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "a candidate of `<major>.<minor>.5` resumes at `<major>.<minor>.6`",
+            caller,
+            StringComparison.Ordinal);
     }
 
     [Fact]

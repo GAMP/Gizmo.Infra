@@ -90,7 +90,7 @@ runs:
             [[ -z "$ref" ]] && continue
             if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
             leaf=${ref#"$tag_prefix"}
-            if [[ ! "$leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            if [[ ! "$leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
             resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
             snapshot+="${ref}=${object_sha}"$'\n'
           done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")
