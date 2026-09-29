@@ -7,14 +7,14 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// Executes the committed <c>version-state</c> bash block from
 /// <c>package-publish.yml</c> against a stubbed GitHub tag API, so the version
 /// and release-tag rules are verified by behavior instead of by matching source
-/// text. Development and a new release share one derivation: bootstrap patch 0
-/// when the compatibility line has no stable tag, otherwise numeric
-/// <c>max(Y)+1</c>. Development appends <c>-dev.N</c> without creating a tag,
-/// while release reuses the exact version of a current-SHA tag or claims the
-/// next stable version. Stable state is scoped to the exact package prefix and
-/// compatibility line, an unbootstrapped line starts at its first <c>3.X.0</c>
-/// without a synthetic tag, and malformed, foreign-prefix, or ambiguous state
-/// fails closed.
+/// text. Development and a new release share one derivation: patch 0 when the
+/// compatibility line has no stable tag, otherwise numeric <c>max(Y)+1</c>.
+/// Development appends <c>-dev.N</c> without creating a tag, while release
+/// reuses the exact version of a current-SHA tag or claims the next stable
+/// version. The calculation is tag-derived and never consults a registry, so an
+/// empty line tag state starts at its first <c>3.X.0</c> without a synthetic tag;
+/// stable state is scoped to the exact package prefix and compatibility line, and
+/// malformed, foreign-prefix, or ambiguous state fails closed.
 /// </summary>
 public sealed class PublishVersionStateExecutionTests
 {
@@ -157,6 +157,36 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
+    public void Development_WithSparseStableTags_AdvancesPastTheObservedLineMaximum()
+    {
+        // Sparse published history (3.0.2, 3.0.4, 3.0.5) is the legacy adoption
+        // shape: the operator adopts the highest published version, 3.0.5. Once
+        // that adoption tag exists, the next stable candidate is Y+1 = 3.0.6.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag("3.0.2", OtherSha), Tag("3.0.4", OtherSha), Tag("3.0.5", ThirdSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.6", run.Outputs["base-version"]);
+        Assert.Equal("3.0.6-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Fact]
+    public void Release_AfterAnAdoptionTagAtTheHighestLineVersion_ClaimsTheNextPatch()
+    {
+        // An adoption tag at the proven highest version 3.0.5 resumes
+        // steady state one patch later at 3.0.6.
+        var run = RunVersionState("release", "7", [Tag("3.0.5", OtherSha)]);
+
+        AssertSucceeded(run);
+        Assert.Equal("3.0.6", run.Outputs["base-version"]);
+        Assert.Equal("3.0.6", run.Outputs["package-version"]);
+        Assert.Equal($"{PackageId}/v3.0.6", run.Outputs["release-tag"]);
+        Assert.Equal("missing", run.Outputs["release-tag-state"]);
+    }
+
+    [Fact]
     public void ReleaseRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersion()
     {
         var run = RunVersionState(
@@ -190,10 +220,10 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Development_WithOnlyOtherCompatibilityLineTags_BootstrapsTheUnbootstrappedLine()
+    public void Development_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
     {
         // A 3.1.x tag is valid stable state but not on the 3.0 line, so the line
-        // is still unbootstrapped and starts at its first 3.0.0.
+        // has an empty tag state and starts at its first 3.0.0.
         var run = RunVersionState("development", "7", [Tag("3.1.5", OtherSha)]);
 
         AssertSucceeded(run);
@@ -202,7 +232,7 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_WithOnlyOtherCompatibilityLineTags_BootstrapsTheUnbootstrappedLine()
+    public void Release_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
     {
         var run = RunVersionState("release", "7", [Tag("3.1.5", OtherSha)]);
 
@@ -214,7 +244,7 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_OnUnbootstrappedLine_ReportsTheTagMissingAndClaimsNoSyntheticCurrentTag()
+    public void Release_OnEmptyLineTagState_ReportsTheTagMissingAndClaimsNoSyntheticCurrentTag()
     {
         var run = RunVersionState("release", "7", []);
 

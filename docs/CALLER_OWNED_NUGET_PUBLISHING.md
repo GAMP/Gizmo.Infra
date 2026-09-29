@@ -84,37 +84,65 @@ push, and succeeds so the tag job can reconcile the immutable release tag. A
 version that exists without matching provenance fails closed. This preserves
 same-SHA rerun recovery without a permanent key and without moving a tag.
 
-## One-time existing-package adoption
+## One-time existing-package bootstrap and adoption
 
-The unified workflow never adopts an existing package on its own. A package that
-was published before the compatibility line had a matching tag, or by another
-mechanism, leaves the line unbootstrapped. Steady-state publishing for the
-calculated version then fails closed, because the existing package does not carry
-the caller commit as `RepositoryCommit` and the workflow refuses to publish or
-create a recovery tag.
+Steady-state publishing is tag-derived. The reusable workflow reads only the
+complete tag set under `<package-id>/`; it never queries a registry, so it cannot
+tell whether a matching stable package already exists. Natural bootstrap and
+legacy adoption are therefore different situations and must not be conflated:
 
-Adoption is a separate, deliberate, one-time caller action. It is not part of the
-reusable workflow, the caller template, or either publisher action. Before
-creating a tag, prove the existing package's provenance conclusively:
+- **Natural bootstrap** — the active compatibility line has no stable package in
+  the selected registry *and* no tag under `<package-id>/` for that line. This is
+  the first-ever release of the line: the workflow derives the first `3.X.0`, the
+  selected publisher publishes it, and the caller-owned `package-release-tag`
+  action creates `<package-id>/v3.X.0`. No manual step is required.
+- **Legacy adoption** — the active compatibility line already has one or more
+  stable package versions in the selected registry, but the tag history under
+  `<package-id>/` is missing or incomplete for those versions. The workflow still
+  calculates a patch from the incomplete tag set and then fails closed on the
+  existing-package collision, because the existing package does not carry the
+  caller commit as `RepositoryCommit`. This case requires the deliberate
+  one-time operator procedure below, and the adopted version is the highest
+  stable `3.X.Y` already published for the line, never the first `3.X.0`.
 
-1. Resolve the package version the line must adopt. An unbootstrapped
-   compatibility line adopts its first `3.X.0`.
-2. Download the exact published package and read the `RepositoryCommit` value
-   from its `.nuspec` metadata. The value must be a well-formed 40-character
-   commit SHA.
-3. Prove that commit is a real commit in the caller repository, for example with
-   the Git-refs or commits API or `git cat-file -e <sha>^{commit}`, and that it is
-   the commit that produced the published package. Do not adopt a package whose
-   provenance is absent, malformed, or not a caller commit.
-4. Deliberately create the immutable package-qualified tag `<package-id>/v3.X.Y`
-   pointing at that exact commit, outside the workflow. This is the one-time
-   adoption. Never move or overwrite an existing tag.
-5. Re-run the normal caller workflow. The line now has a matching stable tag, so
-   the next release claims `Y+1` and steady-state publishing and tagging resume.
+An existing package is never adopted as a side effect of a run. Adoption is a
+separate, deliberate, one-time caller action, outside the workflow; it is not part
+of the reusable workflow, the caller template, or either publisher action.
+
+1. **Select the candidate.** List every stable package version for the exact
+   package ID in the target registry, then keep only versions on the active
+   compatibility line. Versions for another compatibility line are excluded and
+   never raise or lower the candidate. The candidate is the highest stable
+   `3.X.Y` on the line: registry versions `3.X.2`, `3.X.4`, and `3.X.5` for the
+   line yield candidate `3.X.5`. Never select an unpublished, prerelease, or
+   out-of-line version.
+2. **Prove the candidate's provenance.** Download that exact published package
+   and read the `RepositoryCommit` value from its `.nuspec` metadata. The value
+   must be a well-formed 40-character commit SHA.
+3. **Prove the commit is real caller provenance.** Show that commit is a real
+   commit in the caller repository, for example with the Git-refs or commits API
+   or `git cat-file -e <sha>^{commit}`, and that it is the commit that produced the
+   published package. Missing, malformed, or foreign provenance fails closed: do
+   not adopt a package whose provenance is absent, malformed, or not a caller
+   commit.
+4. **Refuse conflicting or partially proven state.** A tag/package conflict, or a
+   valid lower candidate that sits below an unproven higher line version, fails
+   closed and adopts nothing: never tag a valid lower version while a higher line
+   version exists whose provenance is missing, malformed, or foreign, and never
+   reconcile a tag and a package that disagree about the same version.
+5. **Create the tag deliberately.** Create the immutable package-qualified tag
+   `<package-id>/v3.X.Y` for the selected candidate, pointing at that exact
+   commit, outside the workflow. This is the one-time adoption. Never move or
+   overwrite an existing tag.
+6. **Resume steady state.** Re-run the normal caller workflow. The line now has a
+   matching stable tag, so the next release claims `Y+1`; a candidate of `3.X.5`
+   resumes at the next stable `3.X.6`, and steady-state publishing and tagging
+   resume.
 
 Any ambiguous, conflicting, or unproven state fails closed: do not guess a tag
 target, do not create a synthetic tag, and do not route the package through a
-publisher to force adoption.
+publisher to force adoption. The runtime workflow and actions carry no registry
+migration or adoption code: this remains an operator contract.
 
 ## NuGet.org trusted publishing
 

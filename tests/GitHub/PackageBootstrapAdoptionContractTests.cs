@@ -4,13 +4,16 @@ namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
 /// Contract and executable coverage for the one-time existing-package
-/// bootstrap/adoption boundary. Bootstrap and adoption are not steady-state
-/// workflow features: the reusable workflows only derive the next patch from the
-/// complete compatibility-line tag state, and a publisher accepts an
-/// already-published calculated version only when the package carries the exact
-/// caller commit as <c>RepositoryCommit</c>. Every absent, malformed, or different
-/// provenance fails closed, so adopting an existing stable package stays a
-/// separate deliberate operator action documented outside the workflow.
+/// bootstrap/adoption boundary. Natural bootstrap (no stable registry package
+/// <em>and</em> no matching line tag) and legacy adoption (existing stable line
+/// versions without complete tag history) are documented operator situations, not
+/// steady-state workflow features. The reusable workflows only derive the next
+/// patch from the complete compatibility-line tag state and never query a
+/// registry, and a publisher accepts an already-published calculated version only
+/// when the package carries the exact caller commit as <c>RepositoryCommit</c>.
+/// Every absent, malformed, foreign, conflicting, or partially proven state fails
+/// closed, so adopting an existing stable package stays a separate deliberate
+/// operator action documented outside the workflow.
 /// </summary>
 public sealed class PackageBootstrapAdoptionContractTests
 {
@@ -24,8 +27,9 @@ public sealed class PackageBootstrapAdoptionContractTests
         "package-release-tag",
     ];
 
-    // Legacy bootstrap/adoption branches must never reenter the steady-state
-    // workflow; the generic empty-line next-patch derivation is the only bootstrap.
+    // Legacy bootstrap/adoption or registry-migration branches must never enter
+    // the steady-state workflow or actions; the generic empty-tag next-patch
+    // derivation is the only bootstrap, and adoption stays an operator contract.
     private static readonly string[] LegacyTokens =
     [
         "adopt", "bootstrap", "migrat", "legacy", "synthetic", "backfill", "pre-existing", "seed",
@@ -126,24 +130,148 @@ public sealed class PackageBootstrapAdoptionContractTests
     }
 
     [Fact]
-    public void AdoptionProcedure_IsDocumentedOutsideTheSteadyStateWorkflow()
+    public void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
     {
-        var provider = Read("docs", "GITHUB_NUGET_PROVIDER.md");
-        var caller = Read("docs", "CALLER_OWNED_NUGET_PUBLISHING.md");
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
 
-        // The provider contract states the steady-state bootstrap/fail-closed rules.
-        Assert.Contains("never creates a synthetic tag", provider, StringComparison.Ordinal);
+        // Bootstrap is the conjunction: the line starts at its first 3.X.0 only
+        // when the registry has no stable package for the line *and* no matching
+        // tag exists. "No tag" alone is not bootstrap.
+        Assert.Contains(
+            "the selected registry *and* no tag under `<package-id>/` for that line",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("derives the first `3.X.0`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "the selected registry *and* no matching stable tag",
+            provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LegacyAdoption_SelectsTheHighestStableLineVersion()
+    {
+        var caller = CallerDoc();
+
+        // Adoption is not bootstrap: when the line already has published stable
+        // versions, the candidate is the highest of them, never the first 3.X.0.
+        Assert.Contains("The candidate is the highest stable", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "registry versions `3.X.2`, `3.X.4`, and `3.X.5`",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("line yield candidate `3.X.5`", caller, StringComparison.Ordinal);
+        Assert.Contains("never the first `3.X.0`", caller, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LegacyAdoption_EstablishesTheProvenHighestTagThenAdvancesToTheNextPatch()
+    {
+        var caller = CallerDoc();
+
+        // A proven candidate 3.X.5 is tagged outside the workflow,
+        // and the next release resumes one patch later at 3.X.6.
+        Assert.Contains("Create the immutable package-qualified tag", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "outside the workflow. This is the one-time adoption.",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("next release claims `Y+1`", caller, StringComparison.Ordinal);
+        Assert.Contains("resumes at the next stable `3.X.6`", caller, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LegacyAdoption_UnprovenProvenanceFailsClosed()
+    {
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
+
+        // Missing, malformed, or foreign provenance can never be adopted.
+        Assert.Contains(
+            "Missing, malformed, or foreign provenance fails closed",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("git cat-file -e <sha>^{commit}", caller, StringComparison.Ordinal);
         Assert.Contains(
             "conclusive `RepositoryCommit` provenance tied to a real caller commit",
             provider,
             StringComparison.Ordinal);
         Assert.Contains("fails closed", provider, StringComparison.Ordinal);
+    }
 
-        // The caller contract owns the separate, deliberate one-time procedure.
-        Assert.Contains("Adoption is a separate, deliberate, one-time caller action", caller, StringComparison.Ordinal);
-        Assert.Contains("outside the workflow", caller, StringComparison.Ordinal);
+    [Fact]
+    public void LegacyAdoption_TagPackageConflictFailsClosed()
+    {
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
+
+        // A tag and a package that disagree about the same version adopt nothing.
+        Assert.Contains("tag/package conflict", caller, StringComparison.Ordinal);
+        Assert.Contains("adopts nothing", caller, StringComparison.Ordinal);
+        Assert.Contains("a tag/package version conflict", provider, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LegacyAdoption_LowerValidCandidateBelowUnprovenHigherVersionFailsClosed()
+    {
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
+
+        // A valid lower candidate must not be tagged while a higher line version
+        // remains unproven; the whole adoption fails closed instead.
+        Assert.Contains(
+            "valid lower candidate that sits below an unproven higher line version",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "lower candidate under an unproven higher line version",
+            provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
+    {
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
+
+        Assert.Contains(
+            "Versions for another compatibility line are excluded",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "package or another compatibility line never",
+            provider,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
+    {
+        var caller = CallerDoc();
+        var provider = ProviderDoc();
+
+        // The runtime is tag-derived and carries no registry query for candidate
+        // selection, so bootstrap and adoption stay an operator contract. The
+        // provider also states the same-SHA recovery and no-synthetic-tag rules.
+        Assert.Contains("Steady-state publishing is tag-derived", caller, StringComparison.Ordinal);
+        Assert.Contains("it never queries a registry", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "separate, deliberate, one-time caller action, outside the workflow",
+            caller,
+            StringComparison.Ordinal);
         Assert.Contains("do not create a synthetic tag", caller, StringComparison.Ordinal);
-        Assert.Contains("git cat-file -e <sha>^{commit}", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "The steady-state workflow does not adopt an existing package",
+            provider,
+            StringComparison.Ordinal);
+        Assert.Contains("same-SHA recovery is the only automatic success", provider, StringComparison.Ordinal);
+        Assert.Contains("never creates a synthetic tag", provider, StringComparison.Ordinal);
+        Assert.Contains(
+            "or action carries registry migration or adoption code",
+            provider,
+            StringComparison.Ordinal);
     }
 
     private sealed record ProvenanceRun(ShellResult Result, string RepositoryCommit);
@@ -213,6 +341,10 @@ public sealed class PackageBootstrapAdoptionContractTests
 
         return values;
     }
+
+    private static string CallerDoc() => Read("docs", "CALLER_OWNED_NUGET_PUBLISHING.md");
+
+    private static string ProviderDoc() => Read("docs", "GITHUB_NUGET_PROVIDER.md");
 
     private static string Read(string directory, string file) =>
         File.ReadAllText(Path.Combine(InfraRepositoryLocator.ResolveRoot(), directory, file));
