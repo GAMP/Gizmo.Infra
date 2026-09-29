@@ -1,8 +1,9 @@
 // The private publisher keeps this validator in a named file instead of an inline
 // interpreter argument: a credential-shaped URL on an interpreter command line is
 // the process pattern endpoint security flags, and parsing still has to fail closed.
+// The untrusted candidate arrives on stdin, so it never appears in argv at all.
 
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const TRUSTED_HOSTNAME = "nuget.pkg.github.com";
@@ -33,8 +34,11 @@ export function validatePackageBaseAddress(candidate) {
   return parsed.href;
 }
 
-function main(argv) {
-  const href = validatePackageBaseAddress(argv[2]);
+function main() {
+  // Read the exact candidate bytes from fd 0. The caller sends them with no trailing
+  // newline; any trailing byte would break the parsed.href === candidate equality.
+  const candidate = readFileSync(0, "utf8");
+  const href = validatePackageBaseAddress(candidate);
   if (href === null) {
     process.exitCode = 1;
     return;
@@ -55,5 +59,5 @@ function isDirectInvocation() {
 }
 
 if (isDirectInvocation()) {
-  main(process.argv);
+  main();
 }

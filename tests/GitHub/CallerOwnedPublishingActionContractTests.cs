@@ -159,12 +159,19 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("malformed PackageBaseAddress @id", content, StringComparison.Ordinal);
 
         // The discovered @id is validated by the checked-in named module, pinned to the exact origin, protocol, authority, and empty query/fragment before any URL is derived.
+        // The untrusted candidate travels on stdin, never on the interpreter command line.
         Assert.Contains(
-            "node \"$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs\" \"$package_base_address\"",
+            "printf '%s' \"$package_base_address\" | node \"$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "validate-package-base-address.mjs\" \"$package_base_address\"",
             content,
             StringComparison.Ordinal);
 
         var validator = ReadPrivatePublisherValidator();
+        Assert.Contains("readFileSync(0, \"utf8\")", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("argv[2]", validator, StringComparison.Ordinal);
         Assert.Contains("new URL(candidate)", validator, StringComparison.Ordinal);
         Assert.Contains("parsed.protocol !== \"https:\"", validator, StringComparison.Ordinal);
         Assert.Contains("const TRUSTED_HOSTNAME = \"nuget.pkg.github.com\"", validator, StringComparison.Ordinal);

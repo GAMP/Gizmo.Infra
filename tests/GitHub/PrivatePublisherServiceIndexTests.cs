@@ -57,6 +57,38 @@ public sealed class PrivatePublisherServiceIndexTests
         Assert.Equal(ServiceIndexUrl, File.ReadAllText(requestLog).Trim());
         Assert.Equal("actor:token", File.ReadAllText(authLog).Trim());
         Assert.Equal(ServiceIndex, File.ReadAllText(responseFile).Trim());
+
+        // Executable proof: the committed action feeds the discovered base on stdin and
+        // passes only the checked-in module path in the node argv.
+        Assert.Equal(BaseAddress, File.ReadAllText(repository.AbsolutePath("node-stdin.log")));
+        var nodeArgv = File.ReadAllText(repository.AbsolutePath("node-argv.log"));
+        Assert.Contains("validate-package-base-address.mjs", nodeArgv, StringComparison.Ordinal);
+        Assert.DoesNotContain(BaseAddress, nodeArgv, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Discovery_PipesTheUntrustedBaseAddressOnStdinAndNeverOnNodeArgv()
+    {
+        const string sentinel = "node-argv-sentinel";
+        var candidate = "https://evil.example.com/owner/" + sentinel;
+        using var repository = new TempRepository();
+
+        var result = Run(
+            repository,
+            repository.AbsolutePath("requests.log"),
+            repository.AbsolutePath("auth.log"),
+            repository.AbsolutePath("response.json"),
+            jqMode: "ok",
+            baseAddress: candidate);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("malformed PackageBaseAddress @id", result.StandardError, StringComparison.Ordinal);
+
+        // Executable proof: the untrusted candidate reaches the validator only on fd 0.
+        var nodeArgv = File.ReadAllText(repository.AbsolutePath("node-argv.log"));
+        Assert.DoesNotContain(sentinel, nodeArgv, StringComparison.Ordinal);
+        Assert.DoesNotContain(candidate, nodeArgv, StringComparison.Ordinal);
+        Assert.Equal(candidate, File.ReadAllText(repository.AbsolutePath("node-stdin.log")));
     }
 
     [Fact]
@@ -156,7 +188,7 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData(BaseAddress + "/")]
     public void TrustedOriginValidator_AcceptsTheCanonicalPackageBaseAddress(string baseAddress)
     {
-        var result = WorkflowShell.RunNodeScript(ValidatorScript, baseAddress);
+        var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal(baseAddress, result.StandardOutput);
@@ -168,9 +200,9 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData("password-only")]
     public void TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo(string caseId)
     {
-        // The userinfo-bearing candidate is built inside the fixture so a
-        // credential-shaped URL never appears in a process command line.
-        var result = WorkflowShell.RunNodeScript(CredentialCasesFixture, caseId);
+        // The case selector travels on stdin and the userinfo-bearing candidate is
+        // built inside the fixture, so no credential-shaped value reaches any argv.
+        var result = WorkflowShell.RunNodeScriptWithStdin(CredentialCasesFixture, caseId);
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal("rejected", result.StandardOutput);
@@ -190,10 +222,23 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData("not-a-url")]                                              // malformed / ambiguous
     public void TrustedOriginValidator_RejectsAnyUntrustedOrAmbiguousOrigin(string baseAddress)
     {
-        var result = WorkflowShell.RunNodeScript(ValidatorScript, baseAddress);
+        var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Empty(result.StandardOutput);
+    }
+
+    [Fact]
+    public void TrustedOriginValidator_ReadsStdinAndIgnoresAnyArgvCandidate()
+    {
+        // The module validates fd 0 only; a distinct candidate in argv must not be read.
+        var result = WorkflowShell.RunNodeScriptWithStdin(
+            ValidatorScript,
+            BaseAddress,
+            "https://nuget.pkg.github.com/owner/other");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(BaseAddress, result.StandardOutput);
     }
 
     private static ShellResult RunFailure(
@@ -236,6 +281,9 @@ public sealed class PrivatePublisherServiceIndexTests
             ["STUB_SERVICE_INDEX_FILE"] = repository.WriteFile("service-index.json", ServiceIndex),
             // The action resolves its named validator relative to GITHUB_ACTION_PATH.
             ["GITHUB_ACTION_PATH"] = ActionDirectory,
+            // The node shim records the validator argv and the bytes it receives on fd 0.
+            ["STUB_NODE_ARGV_LOG"] = repository.AbsolutePath("node-argv.log"),
+            ["STUB_NODE_STDIN_LOG"] = repository.AbsolutePath("node-stdin.log"),
         };
 
         return WorkflowShell.RunBash(DiscoveryScript(), repository.Root, environment);
@@ -299,6 +347,10 @@ public sealed class PrivatePublisherServiceIndexTests
                 empty) return 4 ;;
                 *) echo "unexpected jq mode" >&2; return 5 ;;
               esac
+            }
+            node() {
+              printf '%s\n' "$@" >> "$STUB_NODE_ARGV_LOG"
+              tee "$STUB_NODE_STDIN_LOG" | command node "$@"
             }
             {{block}}
             printf 'base=%s\n' "$package_base_address"

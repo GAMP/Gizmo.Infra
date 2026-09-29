@@ -129,7 +129,8 @@ runs:
           exit 1
         fi
         # The @id is untrusted; the checked-in validator rejects raw query/fragment markers and any WHATWG rewriting (parsed.href !== candidate).
-        if ! package_base_address=$(node "$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs" "$package_base_address"); then
+        # The candidate is piped on stdin so the untrusted value never reaches the interpreter command line.
+        if ! package_base_address=$(printf '%s' "$package_base_address" | node "$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs"); then
           echo "GitHub Packages returned a malformed PackageBaseAddress @id in its NuGet service index." >&2
           exit 1
         fi
