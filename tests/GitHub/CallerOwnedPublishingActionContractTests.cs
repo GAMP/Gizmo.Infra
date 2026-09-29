@@ -29,6 +29,9 @@ public sealed class CallerOwnedPublishingActionContractTests
 
     private static string Read(string directory) => File.ReadAllText(ActionPath(directory));
 
+    private static string ReadPrivatePublisherValidator() => File.ReadAllText(
+        Path.Combine(ActionsRoot(), "package-private-publish", "scripts", "validate-package-base-address.mjs"));
+
     [Fact]
     public void DeclaredActions_AreExactlyThePreflightPublishersAndTag()
     {
@@ -155,15 +158,21 @@ public sealed class CallerOwnedPublishingActionContractTests
             StringComparison.Ordinal);
         Assert.Contains("malformed PackageBaseAddress @id", content, StringComparison.Ordinal);
 
-        // The discovered @id is pinned to the exact origin, protocol, authority, and empty query/fragment before any URL is derived.
-        Assert.Contains("node -e '", content, StringComparison.Ordinal);
-        Assert.Contains("new URL(candidate)", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.protocol !== \"https:\"", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.hostname !== \"nuget.pkg.github.com\"", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.port !== \"\"", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.username !== \"\" || parsed.password !== \"\"", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.search !== \"\" || parsed.hash !== \"\"", content, StringComparison.Ordinal);
-        Assert.Contains("parsed.href !== candidate", content, StringComparison.Ordinal);
+        // The discovered @id is validated by the checked-in named module, pinned to the exact origin, protocol, authority, and empty query/fragment before any URL is derived.
+        Assert.Contains(
+            "node \"$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs\" \"$package_base_address\"",
+            content,
+            StringComparison.Ordinal);
+
+        var validator = ReadPrivatePublisherValidator();
+        Assert.Contains("new URL(candidate)", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.protocol !== \"https:\"", validator, StringComparison.Ordinal);
+        Assert.Contains("const TRUSTED_HOSTNAME = \"nuget.pkg.github.com\"", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.hostname !== TRUSTED_HOSTNAME", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.port !== \"\"", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.username !== \"\" || parsed.password !== \"\"", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.search !== \"\" || parsed.hash !== \"\"", validator, StringComparison.Ordinal);
+        Assert.Contains("parsed.href !== candidate", validator, StringComparison.Ordinal);
 
         // Derived URLs use only the discovered base and lower-cased ids.
         Assert.Contains(
@@ -194,7 +203,9 @@ public sealed class CallerOwnedPublishingActionContractTests
         var content = Read("package-private-publish");
 
         // Ordering proof: validation and base normalization must precede derived authenticated requests.
-        var validationIndex = content.IndexOf("new URL(candidate)", StringComparison.Ordinal);
+        var validationIndex = content.IndexOf(
+            "scripts/validate-package-base-address.mjs",
+            StringComparison.Ordinal);
         var normalizeIndex = content.IndexOf(
             "package_base_address=${package_base_address%/}",
             StringComparison.Ordinal);
@@ -207,7 +218,7 @@ public sealed class CallerOwnedPublishingActionContractTests
             "--user \"$GITHUB_ACTOR:$GH_TOKEN\" \"$package_download_url\"",
             StringComparison.Ordinal);
 
-        Assert.True(validationIndex >= 0, "the structural validator is missing.");
+        Assert.True(validationIndex >= 0, "the checked-in structural validator call is missing.");
         Assert.True(normalizeIndex > validationIndex, "the base is normalized before structural validation.");
         Assert.True(indexUrlIndex > normalizeIndex, "the package index URL is derived before validation.");
         Assert.True(downloadUrlIndex > indexUrlIndex, "the download URL is derived before the index URL.");

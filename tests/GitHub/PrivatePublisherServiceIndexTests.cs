@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using Gizmo.Infra.Tests.TestSupport;
 
 namespace Gizmo.Infra.Tests.GitHub;
@@ -28,6 +27,16 @@ public sealed class PrivatePublisherServiceIndexTests
         """;
 
     private static readonly string ActionContent = WorkflowShell.ReadAction(Action);
+    private static readonly string ActionDirectory =
+        Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "actions", Action);
+    private static readonly string ValidatorScript =
+        Path.Combine(ActionDirectory, "scripts", "validate-package-base-address.mjs");
+    private static readonly string CredentialCasesFixture = Path.Combine(
+        InfraRepositoryLocator.ResolveRoot(),
+        "tests",
+        "GitHub",
+        "fixtures",
+        "package-base-address-credential-cases.mjs");
 
     [Fact]
     public void Discovery_RequestsTheAuthenticatedServiceIndexAndDerivesUrlsFromTheDiscoveredBase()
@@ -112,7 +121,6 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
     [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
     [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
-    [InlineData("https://user:pass@nuget.pkg.github.com/owner/download")]  // embedded credentials
     [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
     [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
     [InlineData("https://nuget.pkg.github.com/owner/download?")]           // empty query marker
@@ -148,17 +156,31 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData(BaseAddress + "/")]
     public void TrustedOriginValidator_AcceptsTheCanonicalPackageBaseAddress(string baseAddress)
     {
-        var result = WorkflowShell.RunNode(TrustedOriginProgram(), baseAddress);
+        var result = WorkflowShell.RunNodeScript(ValidatorScript, baseAddress);
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal(baseAddress, result.StandardOutput);
     }
 
     [Theory]
+    [InlineData("user-and-password")]
+    [InlineData("username-only")]
+    [InlineData("password-only")]
+    public void TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo(string caseId)
+    {
+        // The userinfo-bearing candidate is built inside the fixture so a
+        // credential-shaped URL never appears in a process command line.
+        var result = WorkflowShell.RunNodeScript(CredentialCasesFixture, caseId);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal("rejected", result.StandardOutput);
+        Assert.Empty(result.StandardError);
+    }
+
+    [Theory]
     [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
     [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
     [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
-    [InlineData("https://user:pass@nuget.pkg.github.com/owner/download")]  // embedded credentials
     [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
     [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
     [InlineData("https://nuget.pkg.github.com/owner/download?")]           // WHATWG round-trips an empty query marker
@@ -168,7 +190,7 @@ public sealed class PrivatePublisherServiceIndexTests
     [InlineData("not-a-url")]                                              // malformed / ambiguous
     public void TrustedOriginValidator_RejectsAnyUntrustedOrAmbiguousOrigin(string baseAddress)
     {
-        var result = WorkflowShell.RunNode(TrustedOriginProgram(), baseAddress);
+        var result = WorkflowShell.RunNodeScript(ValidatorScript, baseAddress);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Empty(result.StandardOutput);
@@ -212,6 +234,8 @@ public sealed class PrivatePublisherServiceIndexTests
             ["STUB_HTTP_STATUS"] = httpStatus,
             ["STUB_TRANSPORT_FAIL"] = transportFail ? "1" : string.Empty,
             ["STUB_SERVICE_INDEX_FILE"] = repository.WriteFile("service-index.json", ServiceIndex),
+            // The action resolves its named validator relative to GITHUB_ACTION_PATH.
+            ["GITHUB_ACTION_PATH"] = ActionDirectory,
         };
 
         return WorkflowShell.RunBash(DiscoveryScript(), repository.Root, environment);
@@ -230,17 +254,6 @@ public sealed class PrivatePublisherServiceIndexTests
         }
 
         return values;
-    }
-
-    /// <summary>Extracts the action's embedded Node trusted-origin validator so the URL matrices exercise the committed parser.</summary>
-    private static string TrustedOriginProgram()
-    {
-        var match = Regex.Match(
-            ActionContent,
-            @"node -e '(?<program>.*?)' ""\$package_base_address""",
-            RegexOptions.Singleline | RegexOptions.CultureInvariant);
-        Assert.True(match.Success, "the private publisher has no embedded trusted-origin validator.");
-        return match.Groups["program"].Value;
     }
 
     private static string DiscoveryScript()

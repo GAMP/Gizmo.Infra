@@ -244,6 +244,37 @@ public static class WorkflowShell
         }
     }
 
+    /// <summary>
+    /// Runs a checked-in named Node module by path. This keeps the private publisher
+    /// validator off the interpreter command line that endpoint security flags for a
+    /// credential-shaped URL argument.
+    /// </summary>
+    public static ShellResult RunNodeScript(string modulePath, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo("node")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add(modulePath);
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            return Execute(startInfo);
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            throw new Xunit.Sdk.XunitException(
+                "node is required to exercise the committed PackageBaseAddress validator.");
+        }
+    }
+
     private static ShellResult Execute(ProcessStartInfo startInfo, string? standardInput = null)
     {
         using var process = Process.Start(startInfo)
