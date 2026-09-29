@@ -88,38 +88,7 @@ runs:
           *) fail "GitHub returned an unsupported caller repository visibility." ;;
         esac
 
-        config_json=$(node -e "$(cat <<'NODE'
-          const fs = require("fs");
-          const lines = fs.readFileSync(process.argv[1], "utf8").split(/\r?\n/);
-          const branches = new Map();
-          let foundRoot = false;
-          for (const line of lines) {
-            if (line === "" || /^\s*#/.test(line)) continue;
-            if (line === "branches:") {
-              if (foundRoot) process.exit(1);
-              foundRoot = true;
-              continue;
-            }
-            const match = /^  (development|release): ([^\s].*)$/.exec(line);
-            if (!foundRoot || !match || /\s$/.test(match[2]) || branches.has(match[1])) process.exit(1);
-            let value = match[2];
-            if (value.startsWith("'")) {
-              if (!value.endsWith("'") || value.length < 2) process.exit(1);
-              value = value.slice(1, -1).replace(/''/g, "'");
-            } else if (value.startsWith("\"")) {
-              if (!value.endsWith("\"") || value.length < 2) process.exit(1);
-              try { value = JSON.parse(value); } catch { process.exit(1); }
-              if (typeof value !== "string") process.exit(1);
-            } else if (/^(?:~|null|true|false|[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?)$/i.test(value) || /^[!&*|>@[{]/.test(value)) {
-              process.exit(1);
-            }
-            if (value === "") process.exit(1);
-            branches.set(match[1], value);
-          }
-          if (!foundRoot || branches.size !== 2 || !branches.has("development") || !branches.has("release")) process.exit(1);
-          process.stdout.write(JSON.stringify(Object.fromEntries(branches)));
-        NODE
-        )" .github/package.yml) || fail ".github/package.yml must contain only non-empty string branches.development and branches.release values."
+        config_json=$(node "$GITHUB_ACTION_PATH/scripts/parse-package-config.mjs" .github/package.yml) || fail ".github/package.yml must contain only non-empty string branches.development and branches.release values."
         development_branch=$(jq -er '.development' <<< "$config_json") || fail ".github/package.yml development branch is malformed."
         release_branch=$(jq -er '.release' <<< "$config_json") || fail ".github/package.yml release branch is malformed."
         [[ "$development_branch" != "$release_branch" ]] || fail ".github/package.yml development and release branches must differ."

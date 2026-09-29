@@ -198,49 +198,49 @@ public static class WorkflowShell
     }
 
     /// <summary>
-    /// Runs the exact multi-line <c>node -e</c> program the action embeds, with
-    /// <paramref name="argument"/> available as <c>process.argv[1]</c>. The
-    /// program is loaded from a file so a multi-line program never has to survive
-    /// Windows command-line quoting.
+    /// Runs a checked-in named Node module by path with <paramref name="arguments"/>.
     /// </summary>
-    public static ShellResult RunNode(string program, string argument)
+    public static ShellResult RunNodeScript(string modulePath, params string[] arguments) =>
+        RunNodeProcess(modulePath, standardInput: null, arguments);
+
+    /// <summary>
+    /// Runs a checked-in named Node module by path, feeding the raw
+    /// <paramref name="standardInput"/> on fd 0. This keeps the private publisher's
+    /// untrusted PackageBaseAddress candidate off the interpreter command line that
+    /// endpoint security flags for a credential-shaped URL argument.
+    /// </summary>
+    public static ShellResult RunNodeScriptWithStdin(
+        string modulePath,
+        string standardInput,
+        params string[] arguments) =>
+        RunNodeProcess(modulePath, standardInput, arguments);
+
+    private static ShellResult RunNodeProcess(
+        string modulePath,
+        string? standardInput,
+        IReadOnlyList<string> arguments)
     {
-        var programDirectory = Directory.CreateTempSubdirectory("gizmo-infra-node-");
-        var programPath = Path.Combine(programDirectory.FullName, "program.js");
-        File.WriteAllText(programPath, program);
+        var startInfo = new ProcessStartInfo("node")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        startInfo.ArgumentList.Add(modulePath);
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
         try
         {
-            var startInfo = new ProcessStartInfo("node")
-            {
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            startInfo.ArgumentList.Add("-e");
-            startInfo.ArgumentList.Add("require(process.env.GIZMO_INFRA_PREFLIGHT_PROGRAM)");
-            startInfo.ArgumentList.Add(argument);
-            startInfo.Environment["GIZMO_INFRA_PREFLIGHT_PROGRAM"] = programPath;
-
-            try
-            {
-                return Execute(startInfo);
-            }
-            catch (System.ComponentModel.Win32Exception)
-            {
-                throw new Xunit.Sdk.XunitException("node is required to exercise the embedded preflight config parser.");
-            }
+            return Execute(startInfo, standardInput);
         }
-        finally
+        catch (System.ComponentModel.Win32Exception)
         {
-            try
-            {
-                programDirectory.Delete(recursive: true);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                // Best-effort cleanup: a locked temp directory must not fail the test.
-            }
+            throw new Xunit.Sdk.XunitException(
+                "node is required to exercise the committed package action modules.");
         }
     }
 
