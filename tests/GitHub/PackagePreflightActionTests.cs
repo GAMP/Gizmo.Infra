@@ -7,13 +7,12 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// <summary>
 /// Contract and executable coverage for the bundled <c>package-preflight</c>
 /// composite action: deterministic SDK-style packable project discovery, MSBuild
-/// metadata reads, <c>.github/package.yml</c> branch configuration and role
-/// resolution, authenticated caller-repository visibility, and the guarantee that
-/// the preflight adds no publishing or registry-routing behavior.
+/// metadata reads, branch configuration consumed from the reusable workflow
+/// inputs, authenticated caller-repository visibility, and the guarantee that the
+/// preflight adds no publishing or registry-routing behavior.
 ///
-/// Executable tests run the action's own extracted bash blocks and checked-in Node
-/// modules against a real working tree, so the committed source, not a hand copy, is
-/// under test.
+/// Executable tests run the action's own extracted bash blocks against a real
+/// working tree, so the committed source, not a hand copy, is under test.
 /// Network and GitHub are unavailable locally, so the visibility transport is
 /// exercised through its exact command text plus a curl test double, and the
 /// visibility parsing block runs its committed jq filter through a Node jq shim.
@@ -27,14 +26,6 @@ public sealed class PackagePreflightActionTests
     private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
 
     private static readonly string Action = WorkflowShell.ReadAction(PreflightAction);
-
-    private static readonly string ParserScript = Path.Combine(
-        InfraRepositoryLocator.ResolveRoot(),
-        ".github",
-        "actions",
-        PreflightAction,
-        "scripts",
-        "parse-package-config.mjs");
 
     private const string PackableProject = """
         <Project Sdk="Microsoft.NET.Sdk">
@@ -135,78 +126,45 @@ public sealed class PackagePreflightActionTests
             StringComparison.Ordinal);
 
         // The evaluated project Version selects the active compatibility line;
-        // the contract is canonical numeric <major>.<minor> with no leading zero.
+        // the contract is canonical numeric <major>.<minor> with no leading zero
+        // and major >= 1, so 0.X is rejected even though the components are canonical.
         Assert.Contains(
-            "[[ \"$compatibility_line\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]] || fail \"The discovered project Version must be exactly <major>.<minor>, with numeric components and no leading zero.\"",
+            "[[ \"$compatibility_line\" =~ ^([1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]] || fail \"The discovered project Version must be exactly <major>.<minor>, with major at least 1 and no leading zero.\"",
             Action,
             StringComparison.Ordinal);
-    }
-
-    [Theory]
-    [InlineData("branches:\n  development: develop\n  release: main", "{\"development\":\"develop\",\"release\":\"main\"}")]
-    [InlineData("# comment\nbranches:\n\n  development: version-3\n  release: release", "{\"development\":\"version-3\",\"release\":\"release\"}")]
-    [InlineData("branches:\n  development: 'release candidate'\n  release: \"main\"", "{\"development\":\"release candidate\",\"release\":\"main\"}")]
-    public void BranchConfig_ParsesExactlyTwoStringBranches(string yaml, string expectedJson)
-    {
-        var result = RunConfig(yaml);
-
-        Assert.Equal(0, result.ExitCode);
-        Assert.Equal(expectedJson, result.StandardOutput);
-    }
-
-    [Theory]
-    [InlineData("branches:\n  development: develop")]                                    // missing release
-    [InlineData("branches:\n  release: main")]                                            // missing development
-    [InlineData("branches:\n  development: a\n  development: b\n  release: c")]           // duplicate key
-    [InlineData("branches:\n  development: a\n  release: b\n  extra: c")]                 // unknown key
-    [InlineData("branches:\n  development: 3\n  release: main")]                          // numeric scalar
-    [InlineData("branches:\n  development: true\n  release: main")]                       // boolean scalar
-    [InlineData("branches:\n  development: ~\n  release: main")]                          // null scalar
-    [InlineData("branches:\n  development: develop \n  release: main")]                   // trailing whitespace
-    [InlineData("branches:\n  development:\n  release: main")]                            // empty value
-    [InlineData("branches:\n  development: [a]\n  release: main")]                        // flow sequence
-    [InlineData("branches:\n  development: 'unterminated\n  release: main")]              // malformed quoting
-    [InlineData("development: a\nrelease: b")]                                            // missing root
-    [InlineData("branches:\r\n  development: a\r\n  release: b\r\n  repeated: c")]        // CRLF with unknown key
-    public void BranchConfig_FailsClosedOnMalformedOrIncompleteSchemas(string yaml)
-    {
-        var result = RunConfig(yaml);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Empty(result.StandardOutput);
     }
 
     [Fact]
-    public void BranchConfig_IsParsedByACheckedInModuleThroughActionPath()
+    public void BranchInputs_AreValidatedAsDistinctGitBranchNamesAndRejectedWhenMissing()
     {
+        // The preflight now reads the branch names from the reusable workflow
+        // inputs (development-branch and production-branch), never from a caller
+        // configuration file. They must be non-empty, distinct, and valid Git
+        // branch names so the role resolver cannot misclassify an unrelated ref.
         Assert.Contains(
-            "config_json=$(node \"$GITHUB_ACTION_PATH/scripts/parse-package-config.mjs\" .github/package.yml)",
+            "[[ \"$DEVELOPMENT_BRANCH\" != \"$PRODUCTION_BRANCH\" ]] || fail \"The development and production branches must differ.\"",
+            Action,
+            StringComparison.Ordinal);
+        Assert.Contains("git check-ref-format --branch \"$DEVELOPMENT_BRANCH\"", Action, StringComparison.Ordinal);
+        Assert.Contains("git check-ref-format --branch \"$PRODUCTION_BRANCH\"", Action, StringComparison.Ordinal);
+
+        // The preflight fails closed when either input is missing.
+        Assert.Contains(
+            "[[ -n \"$DEVELOPMENT_BRANCH\" && -n \"$PRODUCTION_BRANCH\" ]] || fail \"The development and production branch inputs are both required.\"",
             Action,
             StringComparison.Ordinal);
 
-        // The inline interpreter program must not return; a named module is the contract.
-        Assert.DoesNotContain("node -e", Action, StringComparison.Ordinal);
-        Assert.DoesNotContain("<<'NODE'", Action, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void BranchConfig_RequiresDistinctValidGitBranchNamesAndEmitsEveryOutput()
-    {
-        Assert.Contains("[[ \"$development_branch\" != \"$release_branch\" ]] || fail", Action, StringComparison.Ordinal);
-        Assert.Contains("git check-ref-format --branch \"$development_branch\"", Action, StringComparison.Ordinal);
-        Assert.Contains("git check-ref-format --branch \"$release_branch\"", Action, StringComparison.Ordinal);
-        Assert.Contains(
-            @"printf 'project-path=%s\npackage-id=%s\ncompatibility-line=%s\nrepository-visibility=%s\nbranch-role=%s\n'",
-            Action,
-            StringComparison.Ordinal);
+        // No caller configuration file is read for branch policy.
+        Assert.DoesNotContain(".github/package.yml", Action, StringComparison.Ordinal);
+        Assert.DoesNotContain("parse-package-config", Action, StringComparison.Ordinal);
     }
 
     [Theory]
-    [InlineData("refs/heads/develop", "development")]
-    [InlineData("refs/heads/main", "release")]
+    [InlineData("refs/heads/pre-release", "development")]
+    [InlineData("refs/heads/release", "production")]
     [InlineData("refs/heads/feature", "none")]
     [InlineData("refs/tags/v3.0.0", "none")]
-    public void BranchRole_ResolvesDevelopmentReleaseOrNone(string currentRef, string expected)
+    public void BranchRole_ResolvesDevelopmentProductionOrNone(string currentRef, string expected)
     {
         var result = RunBranchRole(currentRef);
 
@@ -354,7 +312,7 @@ public sealed class PackagePreflightActionTests
                      "dotnet nuget push", "dotnet pack", "dotnet build", "dotnet restore",
                      "ACTIONS_ID_TOKEN", "id-token", "api.nuget.org", "nuget.pkg.github.com",
                      "NUGET_API_KEY", "packages: write", "secrets:", "GITHUB_REPOSITORY_OWNER",
-                     "--source", "registry",
+                     "--source",
                  })
         {
             Assert.DoesNotContain(forbidden, Action, StringComparison.Ordinal);
@@ -364,9 +322,8 @@ public sealed class PackagePreflightActionTests
     [Fact]
     public void Preflight_DeclaresNoPublisherIdentityOrProfileValidation()
     {
-        // E15 leaves the publisher and tag jobs disabled and authorizes no
-        // routing contract, so the preflight must carry no publisher identity and
-        // perform no public-profile validation. Reintroducing either would let the
+        // The preflight must carry no publisher identity and perform no
+        // public-profile validation. Reintroducing either would let the
         // preflight branch on a publisher credential.
         Assert.DoesNotContain("NUGET_USER", Action, StringComparison.Ordinal);
         Assert.DoesNotContain("nuget-user", Action, StringComparison.Ordinal);
@@ -378,7 +335,11 @@ public sealed class PackagePreflightActionTests
         var root = YamlWorkflowReader.Parse(Action);
 
         Assert.Equal(
-            new[] { "caller-repository", "current-ref", "github-token" },
+            new[]
+            {
+                "caller-repository", "current-ref", "development-branch", "github-token",
+                "production-branch",
+            },
             MappingKeys(YamlWorkflowReader.MappingChild(root, "inputs"))
                 .OrderBy(name => name, StringComparer.Ordinal)
                 .ToArray());
@@ -412,11 +373,14 @@ public sealed class PackagePreflightActionTests
             var with = YamlWorkflowReader.MappingChild(metadata, "with");
             Assert.Equal("${{ github.repository }}", YamlWorkflowReader.ScalarChild(with, "caller-repository"));
             Assert.Equal("${{ github.token }}", YamlWorkflowReader.ScalarChild(with, "github-token"));
-            Assert.Equal("${{ github.ref }}", YamlWorkflowReader.ScalarChild(with, "current-ref"));
+
+            // Pull requests resolve the role from the PR base branch; push/dispatch
+            // resolve it from the pushed or dispatched ref.
+            Assert.Contains("github.event_name == 'pull_request'", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
+            Assert.Contains("github.base_ref", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
+            Assert.Contains("github.ref", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
 
             // The preflight discovers these; the workflow must not resupply them.
-            // E15 also removes every publisher input, so no nuget-user or
-            // require-nuget-user may reappear before a routing contract exists.
             foreach (var forbidden in new[]
                      {
                          "project-path", "package-id", "package-visibility", "repository-visibility",
@@ -425,26 +389,15 @@ public sealed class PackagePreflightActionTests
             {
                 Assert.False(YamlWorkflowReader.HasChild(with, forbidden), $"{file} must not pass '{forbidden}'.");
             }
-
-            // A reusable workflow with no declared inputs must not read the inputs
-            // context at all.
-            Assert.DoesNotContain("inputs.", Read(file), StringComparison.Ordinal);
         }
-    }
-
-    private static ShellResult RunConfig(string yaml)
-    {
-        using var repository = new TempRepository();
-        var configPath = repository.WriteFile(".github/package.yml", yaml);
-        return WorkflowShell.RunNodeScript(ParserScript, configPath);
     }
 
     private static ShellResult RunBranchRole(string currentRef)
     {
         var block = WorkflowShell.ExtractBlock(Action, "branch_role=none", "fi");
         var script =
-            "development_branch=develop\n"
-            + "release_branch=main\n"
+            "DEVELOPMENT_BRANCH=pre-release\n"
+            + "PRODUCTION_BRANCH=release\n"
             + $"CURRENT_REF='{currentRef}'\n"
             + block
             + "\nprintf '%s' \"$branch_role\"\n";
@@ -523,7 +476,10 @@ public sealed class PackagePreflightActionTests
         Job(root, file == ValidationFile ? "validate" : "build");
 
     private static YamlMappingNode StepById(YamlMappingNode job, string id) =>
-        YamlWorkflowReader.MappingSequence(job, "steps").Single(step =>
+        YamlMappingNode_MappingSequence(job).Single(step =>
             YamlWorkflowReader.HasChild(step, "id")
             && YamlWorkflowReader.ScalarChild(step, "id") == id);
+
+    private static IReadOnlyList<YamlMappingNode> YamlMappingNode_MappingSequence(YamlMappingNode job) =>
+        YamlWorkflowReader.MappingSequence(job, "steps");
 }

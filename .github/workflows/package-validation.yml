@@ -2,12 +2,17 @@ name: NuGet package validation
 
 on:
   workflow_call:
+    inputs:
+      development-branch:
+        description: Caller development branch name declared once in the single caller workflow.
+        required: true
+        type: string
+      production-branch:
+        description: Caller production branch name declared once in the single caller workflow.
+        required: true
+        type: string
 
 permissions: {}
-
-concurrency:
-  group: nuget-${{ github.repository }}
-  cancel-in-progress: false
 
 jobs:
   validate:
@@ -62,10 +67,13 @@ jobs:
         with:
           caller-repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          current-ref: ${{ github.ref }}
+          development-branch: ${{ inputs.development-branch }}
+          production-branch: ${{ inputs.production-branch }}
+          current-ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
       - name: Calculate package version and tag state
         id: version-state
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
@@ -134,9 +142,20 @@ jobs:
             if (( carry )); then result="1$result"; fi
             printf '%s' "$result"
           }
+          # Canonical decimals on the same length compare ordinally; a longer canonical decimal is numerically larger.
+          decimal_gt() {
+            local left=$1 right=$2
+            if (( ${#left} != ${#right} )); then
+              (( ${#left} > ${#right} ))
+            else
+              [[ "$left" > "$right" ]]
+            fi
+          }
           tag_rows=$(fetch_tag_rows)
           tag_prefix="refs/tags/${PACKAGE_ID}/"
           max_patch=''
+          governed_major=''
+          governed_minor=''
           tag_snapshot=''
           while IFS=$'\t' read -r ref object_type object_sha; do
             [[ -z "$ref" ]] && continue
@@ -150,13 +169,36 @@ jobs:
               exit 1
             fi
             tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            tag_major=${BASH_REMATCH[1]}
+            tag_minor=${BASH_REMATCH[2]}
             tag_patch=${BASH_REMATCH[3]}
             tag_commit=$(resolve_commit "$object_type" "$object_sha")
             tag_snapshot+="${ref}=${object_sha}"$'\n'
+            if [[ -z "$governed_major" ]] || decimal_gt "$tag_major" "$governed_major" || { [[ "$tag_major" == "$governed_major" ]] && decimal_gt "$tag_minor" "$governed_minor"; }; then
+              governed_major=$tag_major
+              governed_minor=$tag_minor
+            fi
             if [[ "$tag_line" == "$COMPATIBILITY_LINE" ]] && { [[ -z "$max_patch" ]] || (( ${#tag_patch} > ${#max_patch} )) || { (( ${#tag_patch} == ${#max_patch} )) && [[ "$tag_patch" > "$max_patch" ]]; }; }; then
               max_patch=$tag_patch
             fi
           done <<< "$tag_rows"
+          # The project line may only stay on the highest governed line, advance one minor, or advance one major with a minor reset.
+          if [[ -n "$governed_major" ]]; then
+            declared_major=${COMPATIBILITY_LINE%%.*}
+            declared_minor=${COMPATIBILITY_LINE#*.}
+            expected_minor=$(increment_decimal "$governed_minor")
+            expected_major=$(increment_decimal "$governed_major")
+            if [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$governed_minor" ]]; then
+              :
+            elif [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$expected_minor" ]]; then
+              :
+            elif [[ "$declared_major" == "$expected_major" && "$declared_minor" == 0 ]]; then
+              :
+            else
+              echo "Declared compatibility line ${COMPATIBILITY_LINE} is not a governed transition from ${governed_major}.${governed_minor}." >&2
+              exit 1
+            fi
+          fi
           if [[ -z "$max_patch" ]]; then
             patch=0
           else
@@ -172,18 +214,21 @@ jobs:
           printf 'base-version=%s\npackage-version=%s\npackage-artifact=%s\ncalculated-state=%s\ntag-state-fingerprint=%s\n' "$base_version" "$package_version" "$package_artifact" "$calculated_state" "$tag_state_fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Restore with NuGet audit
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
 
       - name: Build
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
 
       - name: Pack calculated validation version
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         shell: bash
         env:
           CALCULATED_VERSION: ${{ steps.version-state.outputs.package-version }}
@@ -191,6 +236,7 @@ jobs:
         run: dotnet pack "$PROJECT_PATH" --configuration Release --no-restore --output artifacts -p:RepositoryCommit="$GITHUB_SHA" -p:PackageVersion="$CALCULATED_VERSION"
 
       - name: Upload exact package artifact
+        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}

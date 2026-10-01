@@ -4,24 +4,33 @@ using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>Contract coverage for the canonical caller-owned publish template at <c>.github/templates/package-publish.yml</c>.</summary>
+/// <summary>
+/// Contract coverage for the canonical single caller-owned package workflow at
+/// <c>.github/templates/package.yml</c>. The template is the only caller file;
+/// there is no separate <c>package-validation.yml</c>, <c>package-publish.yml</c>,
+/// or <c>.github/package.yml</c> descriptor. Physical branch names are declared
+/// exactly once through YAML anchors and passed to the reusable workflows.
+/// </summary>
 public sealed class CallerTemplateContractTests
 {
-    private const string TemplatePath = ".github/templates/package-publish.yml";
+    private const string TemplatePath = ".github/templates/package.yml";
 
     // Callers replace this one marker with the same immutable 40-character Gizmo.Infra commit SHA in every reference.
     private const string InfraShaPlaceholder = "<40-character-infra-commit-sha>";
-    private const string InfraWorkflowRef =
+    private const string ValidationWorkflowRef =
+        "GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@" + InfraShaPlaceholder;
+    private const string PublishWorkflowRef =
         "GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@" + InfraShaPlaceholder;
 
+    // Mutually exclusive publishing jobs use the prepared visibility as the sole routing signal.
     private const string PublicIf =
-        "${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}";
+        "${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}";
     private const string PrivateIf =
-        "${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}";
+        "${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}";
     private const string RejectIf =
-        "${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}";
+        "${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}";
     private const string TagIf =
-        "${{ always() && needs.prepare.outputs.branch-role == 'release' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}";
+        "${{ always() && github.event_name != 'pull_request' && needs.prepare.outputs.branch-role == 'production' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}";
 
     private const string VisibilityInput = "${{ needs.prepare.outputs.repository-visibility }}";
 
@@ -41,14 +50,19 @@ public sealed class CallerTemplateContractTests
     }
 
     [Fact]
-    public void Template_RunsOnPushAndDispatchAndIsNotReusable()
+    public void Template_TriggersOnPullRequestPushAndDispatchAndIsNotReusable()
     {
         var triggers = YamlWorkflowReader.MappingChild(Parse(), "on");
 
+        Assert.True(YamlWorkflowReader.HasChild(triggers, "pull_request"));
         Assert.True(YamlWorkflowReader.HasChild(triggers, "push"));
         Assert.True(YamlWorkflowReader.HasChild(triggers, "workflow_dispatch"));
         Assert.False(YamlWorkflowReader.HasChild(triggers, "workflow_call"));
-        Assert.False(YamlWorkflowReader.HasChild(triggers, "pull_request"));
+
+        // The trigger filter must not duplicate configured branch names; role
+        // resolution belongs to the reusable preflight.
+        Assert.DoesNotContain("branches:", Content(), StringComparison.Ordinal);
+        Assert.DoesNotContain("pre-release", Content(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -70,10 +84,10 @@ public sealed class CallerTemplateContractTests
     }
 
     [Fact]
-    public void Template_DeclaresExactlyThePreparationRoutingAndTagJobs()
+    public void Template_DeclaresExactlyTheSixJobs()
     {
         Assert.Equal(
-            new[] { "prepare", "publish-private", "publish-public", "reject-unsupported-visibility", "tag" },
+            new[] { "prepare", "publish-private", "publish-public", "reject-unsupported-visibility", "tag", "validate" },
             JobNames());
     }
 
@@ -87,10 +101,74 @@ public sealed class CallerTemplateContractTests
             .Select(match => match.Groups["sha"].Value)
             .ToArray();
 
-        // One reusable workflow plus the public, private, and release-tag actions.
-        Assert.Equal(4, shaReferences.Length);
+        // Two reusable workflows (validation + publish preparation) plus the
+        // three caller-owned composite actions (public, private, release-tag).
+        Assert.Equal(5, shaReferences.Length);
         Assert.All(shaReferences, sha => Assert.Equal(InfraShaPlaceholder, sha));
-        Assert.Contains($"uses: {InfraWorkflowRef}", content, StringComparison.Ordinal);
+        Assert.Contains($"uses: {ValidationWorkflowRef}", content, StringComparison.Ordinal);
+        Assert.Contains($"uses: {PublishWorkflowRef}", content, StringComparison.Ordinal);
+        Assert.Contains(
+            $"GAMP/Gizmo.Infra/.github/actions/package-public-publish@{InfraShaPlaceholder}",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            $"GAMP/Gizmo.Infra/.github/actions/package-private-publish@{InfraShaPlaceholder}",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            $"GAMP/Gizmo.Infra/.github/actions/package-release-tag@{InfraShaPlaceholder}",
+            content,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Template_DeclaresDevelopmentAndProductionBranchesOnceAndForwardsBoth()
+    {
+        var content = Content();
+
+        // The two branch names live in env with YAML anchors, then flow to the
+        // reusable workflows through the required development-branch and
+        // production-branch inputs. No duplicates anywhere in the template.
+        Assert.Contains("DEVELOPMENT_BRANCH: &development_branch", content, StringComparison.Ordinal);
+        Assert.Contains("PRODUCTION_BRANCH: &production_branch", content, StringComparison.Ordinal);
+        Assert.Contains("development-branch: *development_branch", content, StringComparison.Ordinal);
+        Assert.Contains("production-branch: *production_branch", content, StringComparison.Ordinal);
+
+        // The branch names must not be duplicated in trigger filters or job conditions.
+        Assert.DoesNotContain("branches:", content, StringComparison.Ordinal);
+
+        // The reusable workflows consume the configured branches as inputs.
+        Assert.Contains(
+            $"uses: {ValidationWorkflowRef}",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            $"uses: {PublishWorkflowRef}",
+            content,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Template_ValidateJobIsPullRequestOnly()
+    {
+        var content = Content();
+
+        // A pull request only validates; the if guard skips it on every other event.
+        Assert.Contains(
+            "github.event_name == 'pull_request'",
+            JobIf("validate"),
+            StringComparison.Ordinal);
+
+        Assert.DoesNotContain("publish", JobIf("validate"), StringComparison.Ordinal);
+
+        // No publisher or tag job may run for a pull request.
+        foreach (var publishingJob in new[] { "publish-public", "publish-private", "reject-unsupported-visibility", "tag" })
+        {
+            Assert.Contains(
+                "github.event_name != 'pull_request'",
+                JobIf(publishingJob),
+                StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -102,9 +180,12 @@ public sealed class CallerTemplateContractTests
         Assert.Equal(VisibilityInput, StepWithValue("publish-public", "repository-visibility"));
         Assert.Equal(VisibilityInput, StepWithValue("publish-private", "repository-visibility"));
 
-        // Routing consumes the authenticated preparation output; nothing may re-derive visibility from the event or an input.
+        // Routing consumes the authenticated preparation output; nothing may
+        // re-derive visibility from the event, an input, or a caller config file.
         Assert.DoesNotContain("github.event.repository.visibility", Content(), StringComparison.Ordinal);
         Assert.DoesNotContain("inputs.", Content(), StringComparison.Ordinal);
+        Assert.DoesNotContain(".github/package.yml", Content(), StringComparison.Ordinal);
+        Assert.DoesNotContain("branches.release", Content(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -147,11 +228,12 @@ public sealed class CallerTemplateContractTests
     }
 
     [Fact]
-    public void Template_TaggingRequiresReleaseAndASuccessfulSelectedPublisher()
+    public void Template_TaggingRequiresProductionAndASuccessfulSelectedPublisher()
     {
         Assert.Equal(TagIf, JobIf("tag"));
-        Assert.Contains("branch-role == 'release'", JobIf("tag"), StringComparison.Ordinal);
+        Assert.Contains("branch-role == 'production'", JobIf("tag"), StringComparison.Ordinal);
         Assert.DoesNotContain("development", JobIf("tag"), StringComparison.Ordinal);
+        Assert.DoesNotContain("'release'", JobIf("tag"), StringComparison.Ordinal);
 
         // Two mutually exclusive publishers yield at most one success, so the OR engages only after the selected publisher succeeded.
         Assert.Contains("needs.publish-public.result == 'success'", JobIf("tag"), StringComparison.Ordinal);

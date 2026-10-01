@@ -354,31 +354,64 @@ public sealed class PackageBootstrapAdoptionContractTests
     }
 
     [Fact]
-    public void GizmoShared30_NaturalBootstrapStartsAtTheFirstStableVersion()
+    public void GizmoShared10_MigrationAdoptionAdvancesOnePatch()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // No stable line package and no line tag makes Gizmo.Shared a natural bootstrap.
-        Assert.Contains("Gizmo.Shared 3.0 conclusion", caller, StringComparison.Ordinal);
-        Assert.Contains("no stable `3.0.Y` NuGet package", caller, StringComparison.Ordinal);
-        Assert.Contains("no `Gizmo.Shared/v3.0.Y` tag", caller, StringComparison.Ordinal);
+        // Gizmo.Shared is on compatibility line 1.0 with stable 1.0.13 already
+        // in the selected registry, so the line is not a natural bootstrap and
+        // needs migration adoption before steady state is enabled.
+        Assert.Contains("Gizmo.Shared 1.0 migration and adoption", caller, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared` is on compatibility line 1.0", caller, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared 1.0.13` package already exists", caller, StringComparison.Ordinal);
+        Assert.Contains("the line is not a natural bootstrap", caller, StringComparison.Ordinal);
+
+        Assert.Contains("Gizmo.Shared 1.0 migration and adoption", provider, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared` is on compatibility line 1.0", provider, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared 1.0.13` package already exists", provider, StringComparison.Ordinal);
+        Assert.Contains("it is not a natural bootstrap and needs migration", provider, StringComparison.Ordinal);
+
+        // Provenance proof is required before the deliberate adoption tag.
+        Assert.Contains("`RepositoryCommit`", caller, StringComparison.Ordinal);
+        Assert.Contains("real commit in the caller repository", caller, StringComparison.Ordinal);
+        Assert.Contains("`RepositoryCommit`", provider, StringComparison.Ordinal);
+        Assert.Contains("real caller commit as its `RepositoryCommit`", provider, StringComparison.Ordinal);
+
         Assert.Contains(
-            "Nothing is adopted and no migration step applies",
+            "deliberately create the immutable `Gizmo.Shared/v1.0.13` tag",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("the line qualifies for natural bootstrap", caller, StringComparison.Ordinal);
-        Assert.Contains("first development build is `3.0.0-dev.N`", caller, StringComparison.Ordinal);
-        Assert.Contains("first stable release publishes `3.0.0`", caller, StringComparison.Ordinal);
-        Assert.Contains("`Gizmo.Shared/v3.0.0` tag", caller, StringComparison.Ordinal);
-        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "deliberately create the immutable `Gizmo.Shared/v1.0.13` tag",
+            provider,
+            StringComparison.Ordinal);
 
-        Assert.Contains("Gizmo.Shared 3.0 conclusion", provider, StringComparison.Ordinal);
-        Assert.Contains("no stable `3.0.Y` NuGet package", provider, StringComparison.Ordinal);
-        Assert.Contains("natural bootstrap derives the first `3.0.0-dev.N`", provider, StringComparison.Ordinal);
-        Assert.Contains("first stable release calculates `3.0.0`", provider, StringComparison.Ordinal);
-        Assert.Contains("Gizmo.Shared/v3.0.0", provider, StringComparison.Ordinal);
-        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", provider, StringComparison.Ordinal);
+        // Steady state resumes at patch+1: 1.0.14-dev.N, 1.0.14, Gizmo.Shared/v1.0.14.
+        Assert.Contains("the next development build is `1.0.14-dev.N`", caller, StringComparison.Ordinal);
+        Assert.Contains("the next stable release publishes `1.0.14`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "creates the immutable `Gizmo.Shared/v1.0.14` tag",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("the next development build is `1.0.14-dev.N`", provider, StringComparison.Ordinal);
+        Assert.Contains("the next stable release calculates `1.0.14`", provider, StringComparison.Ordinal);
+        Assert.Contains(
+            "creates the immutable `Gizmo.Shared/v1.0.14` tag",
+            provider,
+            StringComparison.Ordinal);
+
+        // The evaluated project <Version> stays the compatibility line only; the
+        // pilot ultimately uses <Version>1.0</Version> and the 1.0.14 patch is
+        // infrastructure-owned and never encoded in the project Version.
+        Assert.Contains("compatibility line only", caller, StringComparison.Ordinal);
+        Assert.Contains("`<Version>1.0</Version>`", caller, StringComparison.Ordinal);
+        Assert.Contains("`1.0.14` patch remains infrastructure-owned", caller, StringComparison.Ordinal);
+        Assert.Contains("never encoded in the project `Version`", caller, StringComparison.Ordinal);
+
+        Assert.Contains("compatibility line only", provider, StringComparison.Ordinal);
+        Assert.Contains("`<Version>1.0</Version>`", provider, StringComparison.Ordinal);
+        Assert.Contains("infrastructure-owned and is never encoded", provider, StringComparison.Ordinal);
     }
 
     private sealed record ProvenanceRun(ShellResult Result, string RepositoryCommit);

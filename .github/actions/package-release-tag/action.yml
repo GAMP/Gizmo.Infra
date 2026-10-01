@@ -2,16 +2,16 @@ name: Reconcile immutable NuGet release tag
 description: Recheck caller tag state and create the missing immutable package-qualified release tag.
 inputs:
   branch-role:
-    description: Preparation branch role; tagging fails closed unless this is exactly release.
+    description: Preparation branch role; tagging fails closed unless this is exactly production.
     required: true
   release-tag:
-    description: Package-qualified release tag, for example My.Package/v2.1.0.
+    description: Package-qualified production tag, for example My.Package/v2.1.0.
     required: true
   calculated-state:
-    description: Complete state emitted by the release preparation workflow.
+    description: Complete state emitted by the production preparation workflow.
     required: true
   tag-state-fingerprint:
-    description: Tag-state fingerprint emitted by the release preparation workflow.
+    description: Tag-state fingerprint emitted by the production preparation workflow.
     required: true
 runs:
   using: composite
@@ -33,8 +33,8 @@ runs:
           echo "Tagging requires a protected branch ref." >&2
           exit 1
         fi
-        if [[ "$BRANCH_ROLE" != release ]]; then
-          echo "Tagging requires the preparation branch role 'release'; refusing to tag a '$BRANCH_ROLE' run." >&2
+        if [[ "$BRANCH_ROLE" != production ]]; then
+          echo "Tagging requires the preparation branch role 'production'; refusing to tag a '$BRANCH_ROLE' run." >&2
           exit 1
         fi
 

@@ -9,12 +9,15 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// and release-tag rules are verified by behavior instead of by matching source
 /// text. Development and a new release share one derivation: patch 0 when the
 /// compatibility line has no stable tag, otherwise numeric <c>max(Y)+1</c>.
-/// Development appends <c>-dev.N</c> without creating a tag, while release
+/// Development appends <c>-dev.N</c> without creating a tag, while production
 /// reuses the exact version of a current-SHA tag or claims the next stable
 /// version. The calculation is tag-derived and never consults a registry, so an
-/// empty line tag state starts at its first <c>3.X.0</c> without a synthetic tag;
+/// empty line tag state starts at its first <c>M.m.0</c> without a synthetic tag;
 /// stable state is scoped to the exact package prefix and compatibility line, and
-/// malformed, foreign-prefix, or ambiguous state fails closed.
+/// malformed, foreign-prefix, or ambiguous state fails closed. The highest
+/// governed line is computed from the tag set, and the declared compatibility
+/// line must equal, advance one minor, or advance one major (with a minor reset)
+/// from that governed line.
 /// </summary>
 public sealed class PublishVersionStateExecutionTests
 {
@@ -97,9 +100,14 @@ public sealed class PublishVersionStateExecutionTests
     [Fact]
     public void Development_IgnoresStableTagsFromOtherCompatibilityLines()
     {
-        // v3.1.5 is a valid stable tag but not on the 3.0 compatibility line, so
-        // it must not raise the 3.0 candidate patch.
-        var run = RunVersionState("development", "7", [Tag("3.1.5", OtherSha), Tag("3.0.0", ThirdSha)]);
+        // v2.5.7 and v1.0.13 are valid stable tags on lines other than 3.0,
+        // so they must not raise the 3.0 candidate patch. The declared 3.0
+        // line is the highest governed line in the tag set, so the
+        // governed-transition check does not mask the per-line exclusion.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag("3.0.0", OtherSha), Tag("2.5.7", OtherSha), Tag("1.0.13", ThirdSha)]);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.1", run.Outputs["base-version"]);
@@ -131,9 +139,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_WithNoStableTags_BootstrapsAtPatchZeroOfTheCompatibilityLine()
+    public void Production_WithNoStableTags_BootstrapsAtPatchZeroOfTheCompatibilityLine()
     {
-        var run = RunVersionState("release", "7", []);
+        var run = RunVersionState("production", "7", []);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.0", run.Outputs["base-version"]);
@@ -144,9 +152,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_WithAStableTagButNoCurrentShaTag_ClaimsTheNextStableVersion()
+    public void Production_WithAStableTagButNoCurrentShaTag_ClaimsTheNextStableVersion()
     {
-        var run = RunVersionState("release", "7", [Tag("3.0.0", OtherSha)]);
+        var run = RunVersionState("production", "7", [Tag("3.0.0", OtherSha)]);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.1", run.Outputs["base-version"]);
@@ -172,11 +180,11 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_AfterAnAdoptionTagAtTheHighestLineVersion_ClaimsTheNextPatch()
+    public void Production_AfterAnAdoptionTagAtTheHighestLineVersion_ClaimsTheNextPatch()
     {
         // An adoption tag at the proven highest version 3.0.5 resumes
         // steady state one patch later at 3.0.6.
-        var run = RunVersionState("release", "7", [Tag("3.0.5", OtherSha)]);
+        var run = RunVersionState("production", "7", [Tag("3.0.5", OtherSha)]);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.6", run.Outputs["base-version"]);
@@ -186,10 +194,10 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void ReleaseRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersion()
+    public void ProductionRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersion()
     {
         var run = RunVersionState(
-            "release",
+            "production",
             "7",
             [Tag("3.0.0", CurrentSha)],
             githubSha: CurrentSha);
@@ -203,10 +211,10 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_WithMultipleCurrentShaTags_FailsClosedInsteadOfGuessing()
+    public void Production_WithMultipleCurrentShaTags_FailsClosedInsteadOfGuessing()
     {
         var run = RunVersionState(
-            "release",
+            "production",
             "7",
             [Tag("3.0.0", CurrentSha), Tag("3.0.1", CurrentSha)],
             githubSha: CurrentSha);
@@ -219,11 +227,16 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Development_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
+    public void Development_WithOnlyLowerCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
     {
-        // A 3.1.x tag is valid stable state but not on the 3.0 line, so the line
-        // has an empty tag state and starts at its first 3.0.0.
-        var run = RunVersionState("development", "7", [Tag("3.1.5", OtherSha)]);
+        // Tags on lines below the declared line (3.0) establish a lower
+        // governed line, so the 3.0 declared line starts at its first 3.0.0.
+        // The tags themselves never contribute because no tag is on the 3.0
+        // line. The 2.5 governed line accepts 3.0 as the next-major reset.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag("2.5.7", OtherSha), Tag("1.0.13", ThirdSha)]);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.0", run.Outputs["base-version"]);
@@ -231,9 +244,16 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_WithOnlyOtherCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
+    public void Production_WithOnlyLowerCompatibilityLineTags_BootstrapsTheEmptyLineTagState()
     {
-        var run = RunVersionState("release", "7", [Tag("3.1.5", OtherSha)]);
+        // Tags below the declared line establish a lower governed line, so the
+        // declared line has an empty line tag state and starts at its first
+        // patch. The lower-line tags never contribute because no tag is on the
+        // declared line.
+        var run = RunVersionState(
+            "production",
+            "7",
+            [Tag("2.5.7", OtherSha), Tag("1.0.13", ThirdSha)]);
 
         AssertSucceeded(run);
         Assert.Equal("3.0.0", run.Outputs["base-version"]);
@@ -243,9 +263,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_OnEmptyLineTagState_ReportsTheTagMissingAndClaimsNoSyntheticCurrentTag()
+    public void Production_OnEmptyLineTagState_ReportsTheTagMissingAndClaimsNoSyntheticCurrentTag()
     {
-        var run = RunVersionState("release", "7", []);
+        var run = RunVersionState("production", "7", []);
 
         AssertSucceeded(run);
         Assert.Equal("missing", run.Outputs["release-tag-state"]);
@@ -257,9 +277,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_ForeignPackagePrefixTag_FailsClosedInsteadOfCountingIt()
+    public void Production_ForeignPackagePrefixTag_FailsClosedInsteadOfCountingIt()
     {
-        var run = RunVersionState("release", "7", [("refs/tags/Other.Package/v3.0.0", OtherSha)]);
+        var run = RunVersionState("production", "7", [("refs/tags/Other.Package/v3.0.0", OtherSha)]);
 
         Assert.NotEqual(0, run.Result.ExitCode);
         Assert.Contains(
@@ -269,9 +289,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_MalformedTagUnderThePackagePrefix_FailsClosed()
+    public void Production_MalformedTagUnderThePackagePrefix_FailsClosed()
     {
-        var run = RunVersionState("release", "7", [($"refs/tags/{PackageId}/v3.0", OtherSha)]);
+        var run = RunVersionState("production", "7", [($"refs/tags/{PackageId}/v3.0", OtherSha)]);
 
         Assert.NotEqual(0, run.Result.ExitCode);
         Assert.Contains(
@@ -281,9 +301,9 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Fact]
-    public void Release_CarriesTheObservedStableTagStateIntoTheConsistencyRecheck()
+    public void Production_CarriesTheObservedStableTagStateIntoTheConsistencyRecheck()
     {
-        var run = RunVersionState("release", "7", [Tag("3.0.0", OtherSha)]);
+        var run = RunVersionState("production", "7", [Tag("3.0.0", OtherSha)]);
 
         AssertSucceeded(run);
 
@@ -345,10 +365,10 @@ public sealed class PublishVersionStateExecutionTests
     }
 
     [Theory]
-    [InlineData("1.0", new[] { "3.0.0", "2.5.7", "1.0.13", "0.9.9" }, "1.0.14")]
-    [InlineData("4.7", new[] { "4.7.2", "4.8.0", "4.6.99", "5.0.0" }, "4.7.3")]
-    [InlineData("3.2", new[] { "3.0.0", "3.1.5", "3.2.4", "3.3.0" }, "3.2.5")]
-    [InlineData("10.0", new[] { "10.1.0", "9.99.99", "10.0.0" }, "10.0.1")]
+    [InlineData("1.0", new[] { "1.0.0", "1.0.13", "0.9.9" }, "1.0.14")]
+    [InlineData("4.7", new[] { "4.7.2", "4.6.99", "4.6.0" }, "4.7.3")]
+    [InlineData("3.2", new[] { "3.2.0", "3.2.4", "3.0.0", "3.1.5" }, "3.2.5")]
+    [InlineData("10.0", new[] { "10.0.0", "9.99.99" }, "10.0.1")]
     public void Development_OnlyTagsMatchingTheActiveMajorMinorLineContribute(
         string compatibilityLine,
         string[] tagVersions,
@@ -356,8 +376,57 @@ public sealed class PublishVersionStateExecutionTests
     {
         // Tags for other major or minor lines never advance the candidate; only
         // tags whose <major>.<minor> equals the evaluated compatibility line
-        // contribute to the patch calculation.
-        var tags = tagVersions.Select(version => Tag(version, OtherSha)).ToArray();
+        // contribute to the patch calculation. The fixtures only include tags
+        // on lines at or below the declared line so the declared line is the
+        // highest governed line and only its tags contribute.
+        var tags = tagVersions
+            .Select(version => Tag(version, OtherSha))
+            .ToArray();
+
+        var run = RunVersionState("development", "7", tags, compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal($"{expectedBase}-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("4.8", new[] { "4.8.0", "4.8.5", "4.7.13" }, "4.8.6")]
+    [InlineData("1.1", new[] { "1.1.0", "1.0.13", "1.0.7" }, "1.1.1")]
+    public void Development_TagsFromThePreviousMinorLineDoNotContributeWhenTheActiveLineAdvances(
+        string compatibilityLine,
+        string[] tagVersions,
+        string expectedBase)
+    {
+        // A next-minor governed transition (highest governed minor + 1) accepts
+        // tags on the previous minor line without letting them advance the
+        // patch candidate on the new line.
+        var tags = tagVersions
+            .Select(version => Tag(version, OtherSha))
+            .ToArray();
+
+        var run = RunVersionState("development", "7", tags, compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+        Assert.Equal(expectedBase, run.Outputs["base-version"]);
+        Assert.Equal($"{expectedBase}-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("2.0", new[] { "2.0.0", "2.0.3", "1.0.13", "1.1.0" }, "2.0.4")]
+    [InlineData("5.0", new[] { "5.0.0", "5.0.1", "4.7.2", "4.8.0", "4.6.99" }, "5.0.2")]
+    public void Development_TagsFromThePreviousMajorLineDoNotContributeWhenTheActiveLineResets(
+        string compatibilityLine,
+        string[] tagVersions,
+        string expectedBase)
+    {
+        // A next-major governed transition (highest governed major + 1 with
+        // minor == 0) accepts tags on the previous major line without letting
+        // them advance the patch candidate on the new line.
+        var tags = tagVersions
+            .Select(version => Tag(version, OtherSha))
+            .ToArray();
+
         var run = RunVersionState("development", "7", tags, compatibilityLine: compatibilityLine);
 
         AssertSucceeded(run);
@@ -370,14 +439,14 @@ public sealed class PublishVersionStateExecutionTests
     [InlineData("3.2", "3.2.4", "3.2.5", "3.2.5")]
     [InlineData("4.7", "4.7.0", "4.7.1", "4.7.1")]
     [InlineData("10.0", "10.0.99", "10.0.100", "10.0.100")]
-    public void Release_AdvancesTheCandidatePatchOnTheActiveLineForAnyCompatibilityLine(
+    public void Production_AdvancesTheCandidatePatchOnTheActiveLineForAnyCompatibilityLine(
         string compatibilityLine,
         string existingTag,
         string expectedBase,
         string expectedPackage)
     {
         var run = RunVersionState(
-            "release",
+            "production",
             "7",
             [Tag(existingTag, OtherSha)],
             compatibilityLine: compatibilityLine);
@@ -394,7 +463,7 @@ public sealed class PublishVersionStateExecutionTests
     [InlineData("3.2", "3.2.4")]
     [InlineData("4.7", "4.7.0")]
     [InlineData("10.0", "10.0.99")]
-    public void ReleaseRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersionOnAnyLine(
+    public void ProductionRerun_WithTheCurrentShaStableTag_ReusesTheExactStableVersionOnAnyLine(
         string compatibilityLine,
         string tagVersion)
     {
@@ -402,7 +471,7 @@ public sealed class PublishVersionStateExecutionTests
         // compatibility line reuses its exact tagged version when the caller
         // commit already owns exactly one matching stable tag.
         var run = RunVersionState(
-            "release",
+            "production",
             "7",
             [Tag(tagVersion, CurrentSha)],
             compatibilityLine: compatibilityLine,
@@ -421,7 +490,7 @@ public sealed class PublishVersionStateExecutionTests
     [InlineData("3.2", "v3.2.4-dev")]
     [InlineData("4.7", "V4.7.0")]
     [InlineData("10.0", "v10.0.0.1")]
-    public void Release_FailsClosedOnMalformedTagForAnyCompatibilityLine(
+    public void Production_FailsClosedOnMalformedTagForAnyCompatibilityLine(
         string compatibilityLine,
         string malformedLeaf)
     {
@@ -429,7 +498,7 @@ public sealed class PublishVersionStateExecutionTests
         // every active line; the ref prefix is unchanged but the leaf does not
         // match the canonical numeric grammar.
         var run = RunVersionState(
-            "release",
+            "production",
             "7",
             [($"refs/tags/{PackageId}/{malformedLeaf}", OtherSha)],
             compatibilityLine: compatibilityLine);
@@ -439,6 +508,164 @@ public sealed class PublishVersionStateExecutionTests
             "Malformed tag under the exact package prefix:",
             run.Result.StandardError,
             StringComparison.Ordinal);
+    }
+
+    // Governed compatibility-line transitions: a declared line below the
+    // highest governed line must be exactly same, next minor, or next major
+    // (with a minor reset). Any skipped, backward, or invalid-major-reset
+    // transition fails closed.
+
+    [Theory]
+    [InlineData("1.0", "1.0.0")]
+    [InlineData("1.7", "1.7.4")]
+    public void GovernedTransition_AcceptedForTheSameDeclaredLine(string compatibilityLine, string tagVersion)
+    {
+        // The highest governed line equals the declared line; same-line claims
+        // remain a normal patch continuation.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(tagVersion, OtherSha)],
+            compatibilityLine: compatibilityLine);
+
+        AssertSucceeded(run);
+    }
+
+    [Theory]
+    [InlineData("1.0.13", "1.1")]
+    [InlineData("1.7.4", "1.8")]
+    public void GovernedTransition_AcceptedForNextMinorDeclaredLine(
+        string highestTag,
+        string declaredLine)
+    {
+        // The next minor line is exactly one minor above the highest governed
+        // line, so the first patch on the new line starts at 0.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(highestTag, OtherSha)],
+            compatibilityLine: declaredLine);
+
+        AssertSucceeded(run);
+        Assert.Equal($"{declaredLine}.0", run.Outputs["base-version"]);
+        Assert.Equal($"{declaredLine}.0-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("1.0.13", "2.0")]
+    [InlineData("1.7.4", "2.0")]
+    [InlineData("9.9.99", "10.0")]
+    public void GovernedTransition_AcceptedForNextMajorDeclaredLine(
+        string highestTag,
+        string declaredLine)
+    {
+        // The next major line resets the minor to 0 and starts at patch 0; the
+        // declared line must be exactly one major above the highest governed
+        // line with minor == 0.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(highestTag, OtherSha)],
+            compatibilityLine: declaredLine);
+
+        AssertSucceeded(run);
+        Assert.Equal($"{declaredLine}.0", run.Outputs["base-version"]);
+        Assert.Equal($"{declaredLine}.0-dev.7", run.Outputs["package-version"]);
+    }
+
+    [Theory]
+    [InlineData("1.0", "1.0.13", "1.2")]   // skipped minor
+    [InlineData("1.0", "1.0.13", "1.9")]   // skipped minor
+    [InlineData("1.7", "1.7.4", "1.9")]    // skipped minor
+    public void GovernedTransition_FailsClosedOnSkippedMinor(string governedTop, string highestTag, string declaredLine)
+    {
+        // Skipping a minor is not a governed transition and must fail closed.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(highestTag, OtherSha)],
+            compatibilityLine: declaredLine);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            $"Declared compatibility line {declaredLine} is not a governed transition from {governedTop}.",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("1.0", "1.0.13", "2.1")]   // next major but minor != 0
+    [InlineData("1.0", "1.0.13", "3.0")]   // skipped major
+    [InlineData("9.9", "9.9.99", "11.0")]  // skipped major
+    public void GovernedTransition_FailsClosedOnInvalidMajorReset(string governedTop, string highestTag, string declaredLine)
+    {
+        // A next-major transition must reset the minor to 0; a non-zero minor
+        // or any major above the next one is not a governed transition.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(highestTag, OtherSha)],
+            compatibilityLine: declaredLine);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            $"Declared compatibility line {declaredLine} is not a governed transition from {governedTop}.",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("2.3", "2.3.5", "2.2")]
+    [InlineData("2.3", "2.3.5", "1.9")]
+    [InlineData("2.3", "2.3.5", "1.0")]
+    public void GovernedTransition_FailsClosedOnBackwardDeclaredLine(string governedTop, string highestTag, string declaredLine)
+    {
+        // Moving the compatibility line backward is not a governed transition
+        // and must fail closed.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag(highestTag, OtherSha)],
+            compatibilityLine: declaredLine);
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            $"Declared compatibility line {declaredLine} is not a governed transition from {governedTop}.",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GovernedTransition_DerivedFromTheHighestPackageQualifiedStableTagNotTheProjectFile()
+    {
+        // The comparison authority is the package-qualified stable tag history,
+        // not a previous project-file value. A declared compat line below the
+        // highest governed line fails closed even when it would match an older
+        // project descriptor.
+        var run = RunVersionState(
+            "development",
+            "7",
+            [Tag("1.0.13", OtherSha), Tag("1.1.0", ThirdSha)],
+            compatibilityLine: "1.0");
+
+        Assert.NotEqual(0, run.Result.ExitCode);
+        Assert.Contains(
+            "Declared compatibility line 1.0 is not a governed transition from 1.1.",
+            run.Result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GovernedTransition_DoesNotApplyWhenNoStableTagsExist()
+    {
+        // With no tag history there is no governed line, so any canonical
+        // numeric compatibility line (subject to the major >= 1 grammar) is
+        // accepted for natural bootstrap.
+        var run = RunVersionState("development", "7", tags: [], compatibilityLine: "4.7");
+
+        AssertSucceeded(run);
+        Assert.Equal("4.7.0", run.Outputs["base-version"]);
+        Assert.Equal("4.7.0-dev.7", run.Outputs["package-version"]);
     }
 
     private sealed record VersionStateRun(ShellResult Result, IReadOnlyDictionary<string, string> Outputs);

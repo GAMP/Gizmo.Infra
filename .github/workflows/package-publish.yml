@@ -2,6 +2,15 @@ name: NuGet package publish preparation
 
 on:
   workflow_call:
+    inputs:
+      development-branch:
+        description: Caller development branch name declared once in the single caller workflow.
+        required: true
+        type: string
+      production-branch:
+        description: Caller production branch name declared once in the single caller workflow.
+        required: true
+        type: string
     outputs:
       package-artifact:
         description: Repository-relative path of the packed .nupkg inside the uploaded workflow artifact.
@@ -10,10 +19,10 @@ on:
         description: Calculated development or stable package version.
         value: ${{ jobs.build.outputs.package-version }}
       release-tag:
-        description: Immutable package-qualified release tag for a release run.
+        description: Immutable package-qualified production tag for a production run.
         value: ${{ jobs.build.outputs.release-tag }}
       release-tag-state:
-        description: Whether the release tag already resolved to the caller commit.
+        description: Whether the production tag already resolved to the caller commit.
         value: ${{ jobs.build.outputs.release-tag-state }}
       calculated-state:
         description: Complete calculated state used by the caller-owned publisher and tag rechecks.
@@ -25,7 +34,7 @@ on:
         description: Evaluated PackageId from the discovered caller project.
         value: ${{ jobs.build.outputs.package-id }}
       branch-role:
-        description: "Resolved caller branch role: development, release, or none."
+        description: "Resolved caller branch role: development, production, or none."
         value: ${{ jobs.build.outputs.branch-role }}
       repository-visibility:
         description: Authenticated caller repository visibility for caller-owned registry routing.
@@ -93,7 +102,9 @@ jobs:
         with:
           caller-repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          current-ref: ${{ github.ref }}
+          development-branch: ${{ inputs.development-branch }}
+          production-branch: ${{ inputs.production-branch }}
+          current-ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
       - name: Calculate package version and tag state
         id: version-state
@@ -108,7 +119,7 @@ jobs:
           set -euo pipefail
           export LC_ALL=C
           case "$BRANCH_ROLE" in
-            development|release) ;;
+            development|production) ;;
             *) echo "The package preflight did not resolve a publishable branch role." >&2; exit 1 ;;
           esac
           response_file=$(mktemp); tag_object_file=$(mktemp)
@@ -144,21 +155,48 @@ jobs:
             if (( carry )); then result="1$result"; fi
             printf '%s' "$result"
           }
+          # Canonical decimals on the same length compare ordinally; a longer canonical decimal is numerically larger.
+          decimal_gt() {
+            local left=$1 right=$2
+            if (( ${#left} != ${#right} )); then
+              (( ${#left} > ${#right} ))
+            else
+              [[ "$left" > "$right" ]]
+            fi
+          }
           tag_rows=$(fetch_tag_rows)
-          tag_prefix="refs/tags/${PACKAGE_ID}/"; max_patch=''; tag_snapshot=''; current_tags=()
+          tag_prefix="refs/tags/${PACKAGE_ID}/"; max_patch=''; governed_major=''; governed_minor=''; tag_snapshot=''; current_tags=()
           while IFS=$'\t' read -r ref object_type object_sha; do
             [[ -z "$ref" ]] && continue
             if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
             tag_leaf=${ref#"$tag_prefix"}
             if [[ ! "$tag_leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
-            tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; tag_patch=${BASH_REMATCH[3]}
+            tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; tag_major=${BASH_REMATCH[1]}; tag_minor=${BASH_REMATCH[2]}; tag_patch=${BASH_REMATCH[3]}
             tag_commit=$(resolve_commit "$object_type" "$object_sha")
             tag_snapshot+="${ref}=${object_sha}"$'\n'
+            if [[ -z "$governed_major" ]] || decimal_gt "$tag_major" "$governed_major" || { [[ "$tag_major" == "$governed_major" ]] && decimal_gt "$tag_minor" "$governed_minor"; }; then governed_major=$tag_major; governed_minor=$tag_minor; fi
             if [[ "$tag_line" == "$COMPATIBILITY_LINE" ]]; then
               if [[ -z "$max_patch" ]] || (( ${#tag_patch} > ${#max_patch} )) || { (( ${#tag_patch} == ${#max_patch} )) && [[ "$tag_patch" > "$max_patch" ]]; }; then max_patch=$tag_patch; fi
               if [[ "$tag_commit" == "$GITHUB_SHA" ]]; then current_tags+=("$tag_leaf"); fi
             fi
           done <<< "$tag_rows"
+          # The project line may only stay on the highest governed line, advance one minor, or advance one major with a minor reset.
+          if [[ -n "$governed_major" ]]; then
+            declared_major=${COMPATIBILITY_LINE%%.*}
+            declared_minor=${COMPATIBILITY_LINE#*.}
+            expected_minor=$(increment_decimal "$governed_minor")
+            expected_major=$(increment_decimal "$governed_major")
+            if [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$governed_minor" ]]; then
+              :
+            elif [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$expected_minor" ]]; then
+              :
+            elif [[ "$declared_major" == "$expected_major" && "$declared_minor" == 0 ]]; then
+              :
+            else
+              echo "Declared compatibility line ${COMPATIBILITY_LINE} is not a governed transition from ${governed_major}.${governed_minor}." >&2
+              exit 1
+            fi
+          fi
           case "$BRANCH_ROLE" in
             development)
               if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi
@@ -166,7 +204,7 @@ jobs:
               package_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
               release_tag_state=not-applicable
               ;;
-            release)
+            production)
               case ${#current_tags[@]} in
                 0) if [[ -z "$max_patch" ]]; then patch=0; else patch=$(increment_decimal "$max_patch"); fi; release_tag_state=missing ;;
                 1) if [[ ! "${current_tags[0]}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Current-SHA package tag is malformed." >&2; exit 1; fi; tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"; base_version="${tag_line}.${BASH_REMATCH[3]}"; patch=${BASH_REMATCH[3]}; release_tag_state=present ;;

@@ -82,15 +82,16 @@ public sealed class ProjectVersionCaptureTests
     }
 
     [Fact]
-    public void CompatibilityLineGrammar_RequiresCanonicalMajorDotMinor()
+    public void CompatibilityLineGrammar_RequiresCanonicalMajorDotMinorWithMajorAtLeastOne()
     {
         // The evaluated <Version> selects the active compatibility line; the
-        // contract is canonical numeric <major>.<minor> with no leading zero.
-        var accepted = new[] { "0.0", "0.1", "1.0", "1.13", "3.0", "3.4", "4.7", "10.2", "100.200" };
+        // contract is canonical numeric <major>.<minor> with no leading zero and
+        // major >= 1, so 0.X is rejected even though the components are canonical.
+        var accepted = new[] { "1.0", "1.13", "3.0", "3.4", "4.7", "10.2", "100.200" };
         var rejected = new[]
         {
-            "3", "3.01", "3.1.0", "3.x", "3.1-dev", " 3.1", "3.1 ", "03.1", "3.-1",
-            "-1.0", "01.0", "00.0", "3.01.1", "1.", ".1", "",
+            "0.0", "0.1", "0.7", "3", "3.01", "3.1.0", "3.x", "3.1-dev", " 3.1", "3.1 ",
+            "03.1", "3.-1", "-1.0", "01.0", "00.0", "3.01.1", "1.", ".1", "",
         };
 
         AssertPolicy(

@@ -95,25 +95,38 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void EachFile_DeclaresNoCallerSuppliedInputs()
+    public void EachFile_DeclaresOnlyTheBranchConfigurationInputs()
     {
-        // The preflight discovers all caller state, so no workflow declares a caller-supplied input.
+        // The reusable workflows accept only the development-branch and
+        // production-branch string inputs; every caller-side caller-supplied
+        // input would let the caller fork the branch policy from outside the
+        // single declared caller workflow file.
         foreach (var file in ContractFiles)
         {
             var root = Parse(file);
-            var workflowCall = YamlWorkflowReader.Child(
-                YamlWorkflowReader.MappingChild(root, "on"), "workflow_call");
+            var inputs = WorkflowCallInputs(root);
 
-            if (workflowCall is YamlMappingNode mapping)
+            Assert.NotNull(inputs);
+
+            var inputNames = inputs!.Children.Keys
+                .Select(key => Assert.IsType<YamlScalarNode>(key).Value ?? string.Empty)
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToArray();
+
+            Assert.Equal(new[] { "development-branch", "production-branch" }, inputNames);
+
+            foreach (var name in inputNames)
             {
-                Assert.False(
-                    YamlWorkflowReader.HasChild(mapping, "inputs"),
-                    $"{file} must not declare workflow_call inputs.");
+                Assert.Equal(
+                    "true",
+                    YamlWorkflowReader.ScalarChild(YamlWorkflowReader.MappingChild(inputs, name), "required"));
+                Assert.Equal(
+                    "string",
+                    YamlWorkflowReader.ScalarChild(YamlWorkflowReader.MappingChild(inputs, name), "type"));
             }
 
-            Assert.Null(WorkflowCallInputs(root));
-
-            // The caller project owns the compatibility line; no descriptor, version, path, ID, or visibility input may exist.
+            // The caller project owns the compatibility line; no descriptor, version,
+            // path, ID, or visibility input may exist.
             foreach (var forbidden in new[]
                      {
                          "version", "package-version", "version-override", "patch", "prerelease",
@@ -230,18 +243,14 @@ public sealed class ReusableWorkflowContractTests
     }
 
     [Fact]
-    public void ValidationWorkflow_UsesANonCancellingCallerRepositoryGroup()
+    public void ValidationWorkflow_DeclaresNoConcurrency()
     {
-        // Validation is called directly and owns its own caller-repository lock.
-        var concurrency = YamlWorkflowReader.MappingChild(Parse(ValidationFile), "concurrency");
-        var group = YamlWorkflowReader.ScalarChild(concurrency, "group");
+        // The caller template owns the lock around validate -> prepare -> publish
+        // -> tag; redeclaring it here can deadlock the run against itself.
+        var content = Read(ValidationFile);
 
-        Assert.Equal(ConcurrencyGroup, group);
-        Assert.Contains("github.repository", group, StringComparison.Ordinal);
-        Assert.DoesNotContain("package-id", group, StringComparison.Ordinal);
-        Assert.Equal("false", YamlWorkflowReader.ScalarChild(concurrency, "cancel-in-progress"));
-
-        Assert.DoesNotContain("cancel-in-progress: true", Read(ValidationFile), StringComparison.Ordinal);
+        Assert.DoesNotContain("concurrency", content, StringComparison.Ordinal);
+        Assert.DoesNotContain(ConcurrencyGroup, content, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -643,7 +652,8 @@ public sealed class ReusableWorkflowContractTests
             content,
             StringComparison.Ordinal);
         Assert.Contains("case \"$BRANCH_ROLE\" in", content, StringComparison.Ordinal);
-        Assert.Contains("development|release) ;;", content, StringComparison.Ordinal);
+        Assert.Contains("development|production) ;;", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("development|release)", content, StringComparison.Ordinal);
         Assert.Contains(
             "The package preflight did not resolve a publishable branch role.",
             content,
@@ -651,32 +661,46 @@ public sealed class ReusableWorkflowContractTests
 
         // The caller config is never parsed here and no static branch filter shadows the resolver.
         Assert.DoesNotContain(".github/package.yml", content, StringComparison.Ordinal);
-        Assert.DoesNotContain("package.yml", content, StringComparison.Ordinal);
-        Assert.DoesNotContain("refs/heads/", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("branches.release", content, StringComparison.Ordinal);
         Assert.DoesNotContain("github.ref_name", content, StringComparison.Ordinal);
-        Assert.DoesNotContain("github.base_ref", content, StringComparison.Ordinal);
         Assert.DoesNotContain("github.head_ref", content, StringComparison.Ordinal);
+
+        // The only refs/heads/ use is the legitimate current-ref derivation for a
+        // pull-request base branch; the workflow must not filter or compare against
+        // an evaluated branch name in bash.
+        Assert.Contains("refs/heads/", content, StringComparison.Ordinal);
+        Assert.Contains("format('refs/heads/{0}', github.base_ref)", content, StringComparison.Ordinal);
     }
 
     [Fact]
     public void NoneMode_SkipsEveryExpensiveStep()
     {
-        var build = BuildJob(Parse(PublishFile), PublishFile);
-
-        // The tag lookup, restore, build, pack, and upload all skip for none; the cheap preflight still resolves the role.
-        foreach (var step in new[]
-                 {
-                     "Calculate package version and tag state",
-                     "Restore with NuGet audit",
-                     "Build",
-                     "Pack calculated package version",
-                     "Upload exact package artifact",
-                 })
+        // The validation pack step and publish pack step share a contract but the names differ.
+        var packStepNames = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            Assert.Equal(PublishableBranchRole, YamlWorkflowReader.ScalarChild(Step(build, step), "if"));
+            [ValidationFile] = "Pack calculated validation version",
+            [PublishFile] = "Pack calculated package version",
+        };
+
+        foreach (var file in ContractFiles)
+        {
+            var build = BuildJob(Parse(file), file);
+
+            // The tag lookup, restore, build, pack, and upload all skip for none; the cheap preflight still resolves the role.
+            foreach (var step in new[]
+                     {
+                         "Calculate package version and tag state",
+                         "Restore with NuGet audit",
+                         "Build",
+                         packStepNames[file],
+                         "Upload exact package artifact",
+                     })
+            {
+                Assert.Equal(PublishableBranchRole, YamlWorkflowReader.ScalarChild(Step(build, step), "if"));
+            }
         }
 
-        // The mode guard rejects any unexpected role rather than silently doing work.
+        // The publish mode guard rejects any unexpected role rather than silently doing work; validation relies solely on the if-gates above.
         Assert.Contains("*) echo \"The package preflight did not resolve a publishable branch role.\" >&2; exit 1 ;;", VersionStateScript(PublishFile), StringComparison.Ordinal);
     }
 

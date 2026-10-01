@@ -368,9 +368,9 @@ public sealed class CallerOwnedPublishingActionContractTests
     }
 
     [Fact]
-    public void ReleaseTagAction_AcceptsOnlyTheExactReleaseBranchRole()
+    public void ReleaseTagAction_AcceptsOnlyTheExactProductionBranchRole()
     {
-        var result = RunReleaseTagValidation("release");
+        var result = RunReleaseTagValidation("production");
 
         Assert.Equal(0, result.ExitCode);
     }
@@ -378,17 +378,18 @@ public sealed class CallerOwnedPublishingActionContractTests
     [Theory]
     [InlineData("development")]
     [InlineData("none")]
-    [InlineData("Release")]
-    [InlineData("release ")]
+    [InlineData("Production")]
+    [InlineData("production ")]
+    [InlineData("release")]
     [InlineData("")]
-    public void ReleaseTagAction_FailsClosedForAnyNonReleaseBranchRole(string branchRole)
+    public void ReleaseTagAction_FailsClosedForAnyNonProductionBranchRole(string branchRole)
     {
-        // A caller wiring mistake must not tag from a development or unresolved run; the action re-guards release-only.
+        // A caller wiring mistake must not tag from a development or unresolved run; the action re-guards production-only.
         var result = RunReleaseTagValidation(branchRole);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains(
-            "Tagging requires the preparation branch role 'release'",
+            "Tagging requires the preparation branch role 'production'",
             result.StandardError,
             StringComparison.Ordinal);
     }
