@@ -2,16 +2,16 @@ name: Reconcile immutable NuGet release tag
 description: Recheck caller tag state and create the missing immutable package-qualified release tag.
 inputs:
   branch-role:
-    description: Preparation branch role; tagging fails closed unless this is exactly release.
+    description: Preparation branch role; tagging fails closed unless this is exactly production.
     required: true
   release-tag:
-    description: Package-qualified release tag, for example Gizmo.Shared/v3.0.0.
+    description: Package-qualified production tag, for example My.Package/v2.1.0.
     required: true
   calculated-state:
-    description: Complete state emitted by the release preparation workflow.
+    description: Complete state emitted by the production preparation workflow.
     required: true
   tag-state-fingerprint:
-    description: Tag-state fingerprint emitted by the release preparation workflow.
+    description: Tag-state fingerprint emitted by the production preparation workflow.
     required: true
 runs:
   using: composite
@@ -25,16 +25,16 @@ runs:
         BRANCH_ROLE: ${{ inputs.branch-role }}
       run: |
         set -euo pipefail
-        if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
-          echo "Tagging is allowed only from push or workflow_dispatch." >&2
+        if [[ "$EVENT_NAME" != push ]]; then
+          echo "Tagging is allowed only from push." >&2
           exit 1
         fi
         if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
           echo "Tagging requires a protected branch ref." >&2
           exit 1
         fi
-        if [[ "$BRANCH_ROLE" != release ]]; then
-          echo "Tagging requires the preparation branch role 'release'; refusing to tag a '$BRANCH_ROLE' run." >&2
+        if [[ "$BRANCH_ROLE" != production ]]; then
+          echo "Tagging requires the preparation branch role 'production'; refusing to tag a '$BRANCH_ROLE' run." >&2
           exit 1
         fi
 
@@ -77,7 +77,7 @@ runs:
             [[ -z "$ref" ]] && continue
             if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
             leaf=${ref#"$tag_prefix"}
-            if [[ ! "$leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            if [[ ! "$leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
             resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
             snapshot+="${ref}=${object_sha}"$'\n'
           done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")

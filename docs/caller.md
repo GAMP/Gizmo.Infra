@@ -21,37 +21,103 @@ publisher needs.
 
 ## Canonical caller shape
 
-The versioned, tested caller workflow is
-[`.github/templates/package-publish.yml`](../.github/templates/package-publish.yml).
-Copy it to the caller repository as `.github/workflows/package-publish.yml` and
-replace every `<40-character-infra-commit-sha>` placeholder with the same
-immutable, complete 40-character Gizmo.Infra commit SHA. Do not rename the file:
-the caller workflow name is also the NuGet.org Trusted Publishing binding.
+A package repository needs exactly one package automation file:
+
+```text
+.github/
+  workflows/
+    package.yml
+```
+
+The versioned, tested template is
+[`.github/templates/package.yml`](../.github/templates/package.yml). Copy it to
+the caller repository as `.github/workflows/package.yml` and replace every
+`<40-character-infra-commit-sha>` placeholder with the same immutable, complete
+40-character Gizmo.Infra commit SHA. Do not rename the file: the caller workflow
+file is part of the NuGet.org Trusted Publishing binding.
+
+The single workflow triggers on `pull_request` and `push`.
+It declares the two physical branch names exactly once as YAML anchors and passes
+both to Gizmo.Infra as the required reusable `development-branch` and
+`production-branch` inputs:
+
+```yaml
+env:
+  DEVELOPMENT_BRANCH: &development_branch pre-release
+  PRODUCTION_BRANCH: &production_branch release
+
+jobs:
+  validate:
+    uses: GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>
+    with:
+      development-branch: *development_branch
+      production-branch: *production_branch
+```
+
+There is no separate `.github/package.yml` descriptor and no separate caller
+`package-validation.yml` or `package-publish.yml`. The branch names live only in
+this one file, so changing a package branch requires editing only the single
+caller workflow, and the caller never duplicates those names in trigger filters.
 
 Pinning every Gizmo.Infra workflow and composite-action reference to one
 immutable 40-character commit SHA is a GitHub supply-chain invariant. It is
 enforced by the caller template and is separate from the NuGet.org policy
 described below.
 
-Keep the caller workflow on a protected branch and trigger it only from `push`
-or `workflow_dispatch`; every publisher and the tag action repeats the
-protected-branch and event check and fails closed. Do not name the development or
-release branches in the trigger: the caller's `.github/package.yml` configuration
-and the preflight `branch-role` output are the only branch-role authority, and
-any other ref resolves to `none` and publishes nothing.
+The caller is the only owner of the non-cancelling caller-repository concurrency
+group `nuget-${{ github.repository }}` around validation, preparation,
+publication, and tagging. The reusable workflows declare no concurrency of their
+own, so one run is never evaluated against the same lock twice.
 
-The caller template owns the single non-cancelling caller-repository concurrency
-group `nuget-${{ github.repository }}` around preparation, publication, and
-tagging. The reusable preparation workflow declares no concurrency of its own, so
-one run is never evaluated against the same lock twice.
+### Event and role contract
+
+Gizmo.Infra resolves the logical role from the event plus the two declared branch
+inputs:
+
+- `pull_request` — compare the pull-request base branch. Base equal to the
+  development branch resolves `development`, base equal to the production branch
+  resolves `production`, and any other base resolves `none`. A pull request only
+  validates; it never publishes and never tags.
+- `push` — compare the effective branch. Development resolves `development`,
+  production resolves `production`, and any other branch resolves `none`.
+
+There is no `workflow_dispatch` trigger. Publication is driven by `push` only,
+and a same-SHA recovery is a re-run of an existing production `push` workflow
+run rather than a new manually dispatched run.
+
+The logical roles are exactly `development`, `production`, and `none`. No
+logical `release` role remains. `none` is a cheap successful no-op: validation
+and preparation resolve the role and stop, so an unrelated branch performs no
+project discovery, tag lookup, build, pack, publish, or tag work.
+
+### One-file jobs
+
+The canonical template contains:
+
+- `validate` — pull requests only. It calls the reusable validation workflow with
+  `contents: read`, packs the calculated `-pr.N` validation version, and can never
+  publish or tag.
+- `prepare` — push only. It calls the reusable publish preparation
+  workflow with `contents: read` and exports the routing outputs.
+- `publish-public` — caller-owned, `contents: read` plus `id-token: write`, and
+  only for `repository-visibility == public`.
+- `publish-private` — caller-owned, `contents: read` plus `packages: write`, and
+  only for `repository-visibility == private`.
+- `reject-unsupported-visibility` — fails closed for any other visibility
+  (including `internal`) with no publisher and no tag.
+- `tag` — caller-owned, `contents: write`, and only for a `production` run whose
+  selected publisher succeeded. It reconciles the immutable package-qualified tag
+  through `tag`, which fails closed unless the role is exactly
+  `production`.
 
 ## Routing and authentication
 
 The caller must condition the public and private jobs mutually exclusively from
 the preparation output and branch role:
 
-- `branch-role == none` runs no publication and no tag work. Everything else on
-  a non-publishing branch is skipped by the preparation workflow itself.
+- `branch-role == none` runs no publication and no tag work, and a pull request
+  never publishes or tags regardless of role. Everything else on a
+  non-publishing branch is skipped by the preparation workflow itself.
 - `repository-visibility == public` runs only the public job: `contents: read`
   plus `id-token: write`, and it must never be granted `packages: write`.
 - `repository-visibility == private` runs only the private job: `contents: read`
@@ -60,10 +126,10 @@ the preparation output and branch role:
   `reject-unsupported-visibility`, which fails closed, and runs no publisher and
   no tag.
 
-The tag job runs only when the preparation resolved `release` and the selected
-publisher succeeded, so a development run never tags. It also passes the
-prepared `branch-role` to `package-release-tag`, whose own validation fails
-closed unless that value is exactly `release`; a caller wiring mistake cannot
+The tag job runs only when the preparation resolved `production` and the
+selected publisher succeeded, so a development run never tags. It also passes
+the prepared `branch-role` to `tag`, whose own validation fails
+closed unless that value is exactly `production`; a caller wiring mistake cannot
 produce a tag from a development or unresolved run.
 
 The visibility used for routing is only
@@ -83,6 +149,13 @@ exists is inspected: if the published package embeds the caller commit as
 push, and succeeds so the tag job can reconcile the immutable release tag. A
 version that exists without matching provenance fails closed. This preserves
 same-SHA rerun recovery without a permanent key and without moving a tag.
+
+Recovery is performed by re-running an existing production `push` workflow run:
+the re-run keeps that run's pushed commit and evaluates the same immutable tag
+state, so the publisher recognizes the already-published same-SHA package and
+the tag job reconciles the immutable release tag. There is no
+`workflow_dispatch` trigger, so recovery never starts a new manually dispatched
+run and never needs one.
 
 ## One-time existing-package bootstrap and adoption
 
@@ -108,28 +181,31 @@ the operator must, and must do it first.
 2. **Natural bootstrap — no stable line package and no matching line tag.** Only
    when the active compatibility line has no stable package in the selected
    registry *and* no tag under `<package-id>/` for that line is steady state safe
-   from the start: the workflow derives the first `3.X.0`, the selected publisher
-   publishes it, and the caller-owned `package-release-tag` action creates
-   `<package-id>/v3.X.0`. No manual step is required.
+   from the start: the workflow derives the first `<major>.<minor>.0`, the
+   selected publisher publishes it, and the caller-owned `tag`
+   action creates `<package-id>/v<major>.<minor>.0`. No manual step is required.
 3. **Any stable line package — keep steady state disabled until migration.** If
    the active line has one or more stable packages in the selected registry, do
    not enable or run steady state yet. A tag-derived calculation can sit below
    the published packages and the runtime will not catch it: for example, with
-   registry versions `3.X.4` and `3.X.5` and no line tags, the workflow calculates
-   `3.X.0`, and the publisher sees no package at `3.X.0` and would publish a new
-   lower `3.X.0` instead of failing closed. Complete the migration procedure
-   below before enabling steady state.
+   registry versions `<major>.<minor>.4` and `<major>.<minor>.5` and no line tags,
+   the workflow calculates `<major>.<minor>.0`, and the publisher sees no package
+   at `<major>.<minor>.0` and would publish a new lower `<major>.<minor>.0`
+   instead of failing closed. Complete the migration procedure below before
+   enabling steady state.
 4. **Adopt the highest proven version, then advance one patch.** The migration
-   candidate is the highest stable `3.X.Y` already published for the line: for
-   example, registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never
-   the first `3.X.0`. Prove the candidate's provenance, create the immutable
-   `<package-id>/v3.X.Y` tag deliberately, and only then enable steady state: the
-   next release claims `Y+1`, so a candidate of `3.X.5` resumes at `3.X.6`.
+   candidate is the highest stable `<major>.<minor>.<patch>` already published for
+   the line: for example, registry versions `<major>.<minor>.4` and
+   `<major>.<minor>.5` yield candidate `<major>.<minor>.5`, never the first
+   `<major>.<minor>.0`. Prove the candidate's provenance, create the immutable
+   `<package-id>/v<major>.<minor>.<patch>` tag deliberately, and only then enable
+   steady state: the next release claims `patch+1`, so a candidate of
+   `<major>.<minor>.5` resumes at `<major>.<minor>.6`.
 5. **Unprovable highest — migration stays disabled.** When the highest stable
-   `3.X.Y` on the line has missing, malformed, or foreign provenance, migration
-   remains disabled: do not enable or run steady state, do not create a tag, and
-   do not publish. The runtime provides no safety net for the unadopted higher
-   version.
+   `<major>.<minor>.<patch>` on the line has missing, malformed, or foreign
+   provenance, migration remains disabled: do not enable or run steady state, do
+   not create a tag, and do not publish. The runtime provides no safety net for
+   the unadopted higher version.
 
 ### Prove the migration candidate's provenance
 
@@ -157,15 +233,21 @@ disagree about the same version.
   never sees those higher versions, so this is an operator obligation and not a
   workflow guarantee.
 
-### Gizmo.Shared 3.0 conclusion
+### Gizmo.Shared 1.0 migration and adoption
 
-`Gizmo.Shared` is on compatibility line 3.0 with no stable `3.0.Y` NuGet package
-in the selected registry and no `Gizmo.Shared/v3.0.Y` tag. Nothing is adopted and
-no migration step applies: the line qualifies for natural bootstrap. The first
-development build is `3.0.0-dev.N`, the first stable release publishes `3.0.0`,
-and the caller-owned `package-release-tag` action creates the immutable
-`Gizmo.Shared/v3.0.0` tag. Legacy `1.0.x` packages are another compatibility
-line and never raise or lower the 3.0 conclusion.
+`Gizmo.Shared` is on compatibility line 1.0, and the stable `Gizmo.Shared 1.0.13`
+package already exists in the selected registry, so the line is not a natural
+bootstrap: keep steady state disabled until the migration procedure above adopts
+that package. Prove the published `1.0.13` embeds a valid 40-character
+`RepositoryCommit` that is a real commit in the caller repository and produced
+that package, then deliberately create the immutable `Gizmo.Shared/v1.0.13` tag.
+Steady state then resumes at the next patch: the next development build is
+`1.0.14-dev.N`, the next stable release publishes `1.0.14`, and the caller-owned
+`tag` action creates the immutable `Gizmo.Shared/v1.0.14` tag.
+
+The evaluated project `<Version>` stays the compatibility line only: the pilot
+must ultimately use `<Version>1.0</Version>`. The `1.0.14` patch remains
+infrastructure-owned and is never encoded in the project `Version`.
 
 An existing package is never adopted as a side effect of a run. Adoption is a
 separate, deliberate, one-time caller action, outside the workflow; it is not
@@ -183,9 +265,9 @@ binds the caller identity and the caller workflow file, never Gizmo.Infra:
 
 - **Repository owner and repository** — the exact GitHub owner and repository
   that publishes, without wildcards, for example `GAMP` and `Gizmo.Widget`.
-- **Workflow file** — exactly the caller `package-publish.yml`. That caller
+- **Workflow file** — exactly the caller `package.yml`. That single caller
   workflow defines the OIDC-requesting job, so it is the trusted identity; the
-  same policy covers both development and stable publication.
+  same policy covers both development and production publication.
 - **Environment and scopes** — set only when the caller deliberately deploys the
   job through a GitHub environment or narrows package scopes; otherwise leave
   them unset.

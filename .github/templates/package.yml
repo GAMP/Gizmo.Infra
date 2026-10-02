@@ -1,36 +1,56 @@
-# Canonical caller-owned NuGet publishing workflow.
-# Replace every `<40-character-infra-commit-sha>` with one immutable Gizmo.Infra commit SHA.
-# The workflow filename binds NuGet.org Trusted Publishing and must not be renamed.
-name: Publish package
+# Canonical single caller-owned NuGet package workflow; copy it to a consumer repository at .github/workflows/package.yml.
+# Replace every `<40-character-infra-commit-sha>` with one immutable Gizmo.Infra commit SHA and both branch placeholders with real branch names.
+# Do not rename the file: its name binds NuGet.org Trusted Publishing.
+name: Package
 
 on:
+  pull_request:
   push:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-# The caller owns the only lock; the reusable preparation workflow declares none so it cannot nest.
+# The caller owns the only lock; the reusable workflows declare none so they cannot nest.
 concurrency:
   group: nuget-${{ github.repository }}
   cancel-in-progress: false
 
+# Each physical branch name is declared exactly once here and passed to Gizmo.Infra by alias.
+env:
+  DEVELOPMENT_BRANCH: &development_branch <development-branch>
+  PRODUCTION_BRANCH: &production_branch <production-branch>
+
 jobs:
+  validate:
+    # Pull requests only validate; they never publish or tag.
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>
+    permissions:
+      contents: read
+    with:
+      development-branch: *development_branch
+      production-branch: *production_branch
+
   prepare:
+    # Push resolves the branch role and prepares the package.
+    if: ${{ github.event_name == 'push' }}
     uses: GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@<40-character-infra-commit-sha>
     permissions:
       contents: read
+    with:
+      development-branch: *development_branch
+      production-branch: *production_branch
 
   publish-public:
     needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}
+    if: ${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'public' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Publish public package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-public-publish@<40-character-infra-commit-sha>
+        uses: GAMP/Gizmo.Infra/.github/actions/public@<40-character-infra-commit-sha>
         with:
           package-id: ${{ needs.prepare.outputs.package-id }}
           nuget-user: ${{ vars.NUGET_USER }}
@@ -42,14 +62,14 @@ jobs:
 
   publish-private:
     needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}
+    if: ${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility == 'private' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - name: Publish private package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-private-publish@<40-character-infra-commit-sha>
+        uses: GAMP/Gizmo.Infra/.github/actions/private@<40-character-infra-commit-sha>
         with:
           package-id: ${{ needs.prepare.outputs.package-id }}
           package-artifact: ${{ needs.prepare.outputs.package-artifact }}
@@ -60,7 +80,7 @@ jobs:
 
   reject-unsupported-visibility:
     needs: prepare
-    if: ${{ needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}
+    if: ${{ github.event_name != 'pull_request' && needs.prepare.outputs.branch-role != 'none' && needs.prepare.outputs.repository-visibility != 'public' && needs.prepare.outputs.repository-visibility != 'private' }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -78,13 +98,13 @@ jobs:
       - prepare
       - publish-public
       - publish-private
-    if: ${{ always() && needs.prepare.outputs.branch-role == 'release' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}
+    if: ${{ always() && github.event_name != 'pull_request' && needs.prepare.outputs.branch-role == 'production' && (needs.publish-public.result == 'success' || needs.publish-private.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Reconcile immutable release tag
-        uses: GAMP/Gizmo.Infra/.github/actions/package-release-tag@<40-character-infra-commit-sha>
+      - name: Reconcile immutable production tag
+        uses: GAMP/Gizmo.Infra/.github/actions/tag@<40-character-infra-commit-sha>
         with:
           branch-role: ${{ needs.prepare.outputs.branch-role }}
           release-tag: ${{ needs.prepare.outputs.release-tag }}

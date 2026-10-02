@@ -9,16 +9,16 @@ public sealed class CallerOwnedPublishingActionContractTests
 {
     private static readonly string[] ActionDirectories =
     [
-        "package-preflight",
-        "package-private-publish",
-        "package-public-publish",
-        "package-release-tag",
+        "preflight",
+        "private",
+        "public",
+        "tag",
     ];
 
     private static readonly string[] PublisherActions =
     [
-        "package-public-publish",
-        "package-private-publish",
+        "public",
+        "private",
     ];
 
     private static string ActionsRoot() =>
@@ -30,7 +30,7 @@ public sealed class CallerOwnedPublishingActionContractTests
     private static string Read(string directory) => File.ReadAllText(ActionPath(directory));
 
     private static string ReadPrivatePublisherValidator() => File.ReadAllText(
-        Path.Combine(ActionsRoot(), "package-private-publish", "scripts", "validate-package-base-address.mjs"));
+        Path.Combine(ActionsRoot(), "private", "scripts", "validate.mjs"));
 
     [Fact]
     public void DeclaredActions_AreExactlyThePreflightPublishersAndTag()
@@ -41,10 +41,13 @@ public sealed class CallerOwnedPublishingActionContractTests
             .ToArray();
 
         Assert.Equal(ActionDirectories.OrderBy(name => name, StringComparer.Ordinal).ToArray(), actions);
+        EveryDeclaredAction_ExistsAndParsesAsYaml();
+        CompositeActions_DoNotReachIntoCallerNeedsContext();
+        EveryNestedActionReference_IsPinnedToAFullSha();
+        NoAction_InheritsSecretsOrStoresAPermanentKey();
     }
 
-    [Fact]
-    public void EveryDeclaredAction_ExistsAndParsesAsYaml()
+    private void EveryDeclaredAction_ExistsAndParsesAsYaml()
     {
         foreach (var directory in ActionDirectories)
         {
@@ -55,8 +58,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         }
     }
 
-    [Fact]
-    public void CompositeActions_DoNotReachIntoCallerNeedsContext()
+    private void CompositeActions_DoNotReachIntoCallerNeedsContext()
     {
         foreach (var directory in ActionDirectories)
         {
@@ -64,8 +66,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         }
     }
 
-    [Fact]
-    public void EveryNestedActionReference_IsPinnedToAFullSha()
+    private void EveryNestedActionReference_IsPinnedToAFullSha()
     {
         var usesLine = new Regex(
             @"^\s*uses:\s+([^\s@]+)@([0-9a-f]{40})\s+#\s+v[0-9][^\s]*\s*$",
@@ -84,7 +85,7 @@ public sealed class CallerOwnedPublishingActionContractTests
     [Fact]
     public void PublicPublisher_IsCallerOwnedOidcAndRejectsNonPublicVisibility()
     {
-        var content = Read("package-public-publish");
+        var content = Read("public");
 
         Assert.Contains("github.ref_protected", content, StringComparison.Ordinal);
         Assert.Contains("refs/heads/", content, StringComparison.Ordinal);
@@ -105,12 +106,14 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.DoesNotContain("nuget.pkg.github.com", content, StringComparison.Ordinal);
         Assert.Contains("REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}", content, StringComparison.Ordinal);
         Assert.Contains("if [[ \"$REPOSITORY_VISIBILITY\" != public ]]; then", content, StringComparison.Ordinal);
+        PrivatePublisher_UsesCallerTokenWithoutOidcAndRejectsNonPrivateVisibility();
+        Publishers_RecheckCollisionAndProvenanceImmediatelyBeforePublishing();
+        Publishers_UseTheExactArtifactAndNeverRebuild();
     }
 
-    [Fact]
-    public void PrivatePublisher_UsesCallerTokenWithoutOidcAndRejectsNonPrivateVisibility()
+    private void PrivatePublisher_UsesCallerTokenWithoutOidcAndRejectsNonPrivateVisibility()
     {
-        var content = Read("package-private-publish");
+        var content = Read("private");
 
         Assert.Contains("github.ref_protected", content, StringComparison.Ordinal);
         Assert.Contains("github.event_name", content, StringComparison.Ordinal);
@@ -128,13 +131,15 @@ public sealed class CallerOwnedPublishingActionContractTests
 
         Assert.Contains("REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}", content, StringComparison.Ordinal);
         Assert.Contains("if [[ \"$REPOSITORY_VISIBILITY\" != private ]]; then", content, StringComparison.Ordinal);
+        PrivatePublisher_ResolvesPackageBaseAddressFromTheAuthenticatedServiceIndex();
+        PrivatePublisher_ValidatesTheTrustedOriginBeforeAuthenticatingDerivedRequests();
+        PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter();
         Assert.DoesNotContain("nuget-user", content, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void PrivatePublisher_ResolvesPackageBaseAddressFromTheAuthenticatedServiceIndex()
+    private void PrivatePublisher_ResolvesPackageBaseAddressFromTheAuthenticatedServiceIndex()
     {
-        var content = Read("package-private-publish");
+        var content = Read("private");
 
         // The collision recheck discovers the flat-container base from the authenticated service index; no path shape is assumed.
         Assert.Contains(
@@ -161,11 +166,11 @@ public sealed class CallerOwnedPublishingActionContractTests
         // The discovered @id is validated by the checked-in named module, pinned to the exact origin, protocol, authority, and empty query/fragment before any URL is derived.
         // The untrusted candidate travels on stdin, never on the interpreter command line.
         Assert.Contains(
-            "printf '%s' \"$package_base_address\" | node \"$GITHUB_ACTION_PATH/scripts/validate-package-base-address.mjs\"",
+            "printf '%s' \"$package_base_address\" | node \"$GITHUB_ACTION_PATH/scripts/validate.mjs\"",
             content,
             StringComparison.Ordinal);
         Assert.DoesNotContain(
-            "validate-package-base-address.mjs\" \"$package_base_address\"",
+            "validate.mjs\" \"$package_base_address\"",
             content,
             StringComparison.Ordinal);
 
@@ -204,14 +209,13 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.DoesNotContain("/download/", content, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public void PrivatePublisher_ValidatesTheTrustedOriginBeforeAuthenticatingDerivedRequests()
+    private void PrivatePublisher_ValidatesTheTrustedOriginBeforeAuthenticatingDerivedRequests()
     {
-        var content = Read("package-private-publish");
+        var content = Read("private");
 
         // Ordering proof: validation and base normalization must precede derived authenticated requests.
         var validationIndex = content.IndexOf(
-            "scripts/validate-package-base-address.mjs",
+            "scripts/validate.mjs",
             StringComparison.Ordinal);
         var normalizeIndex = content.IndexOf(
             "package_base_address=${package_base_address%/}",
@@ -243,12 +247,11 @@ public sealed class CallerOwnedPublishingActionContractTests
             authenticatedVariables);
     }
 
-    [Fact]
-    public void PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter()
+    private void PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter()
     {
         // jq is stubbed in the executable tests, so the committed discovery filter is pinned here instead of by behavior.
         var match = Regex.Match(
-            Read("package-private-publish"),
+            Read("private"),
             @"if ! raw_package_base_address=\$\(jq -er '(?<filter>.*?)' ""\$response_file"" && printf 'x'\); then",
             RegexOptions.Singleline | RegexOptions.CultureInvariant);
         Assert.True(match.Success, "the private publisher has no service-index discovery filter.");
@@ -264,8 +267,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Equal(expected, normalized);
     }
 
-    [Fact]
-    public void Publishers_RecheckCollisionAndProvenanceImmediatelyBeforePublishing()
+    private void Publishers_RecheckCollisionAndProvenanceImmediatelyBeforePublishing()
     {
         var provenanceComparison =
             "repository_commit=$(printf '%s' \"$nuspec\" | grep -oE 'commit=\"[0-9a-fA-F]{40}\"' | head -n 1 | sed -E 's/.*\"([0-9a-fA-F]{40})\".*/\\1/' | tr 'A-F' 'a-f' || true)";
@@ -299,8 +301,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         }
     }
 
-    [Fact]
-    public void Publishers_UseTheExactArtifactAndNeverRebuild()
+    private void Publishers_UseTheExactArtifactAndNeverRebuild()
     {
         foreach (var directory in PublisherActions)
         {
@@ -318,8 +319,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         }
     }
 
-    [Fact]
-    public void NoAction_InheritsSecretsOrStoresAPermanentKey()
+    private void NoAction_InheritsSecretsOrStoresAPermanentKey()
     {
         foreach (var directory in ActionDirectories)
         {
@@ -334,7 +334,7 @@ public sealed class CallerOwnedPublishingActionContractTests
     [Fact]
     public void ReleaseTagAction_IsOidcFreeAndNeverMovesATag()
     {
-        var content = Read("package-release-tag");
+        var content = Read("tag");
 
         Assert.Contains("github.ref_protected", content, StringComparison.Ordinal);
         Assert.Contains("Refetch and recheck calculated state before tagging", content, StringComparison.Ordinal);
@@ -351,61 +351,219 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.DoesNotContain("--request PUT", content, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("--request DELETE", content, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("force", content, StringComparison.OrdinalIgnoreCase);
+        ReleaseTagAction_DeclaresARequiredReleaseOnlyBranchRoleInput();
     }
 
-    [Fact]
-    public void ReleaseTagAction_DeclaresARequiredReleaseOnlyBranchRoleInput()
+    private void ReleaseTagAction_DeclaresARequiredReleaseOnlyBranchRoleInput()
     {
-        var root = YamlWorkflowReader.Parse(Read("package-release-tag"));
+        var root = YamlWorkflowReader.Parse(Read("tag"));
         var branchRole = YamlWorkflowReader.MappingChild(
             YamlWorkflowReader.MappingChild(root, "inputs"), "branch-role");
 
         Assert.Equal("true", YamlWorkflowReader.ScalarChild(branchRole, "required"));
         Assert.Contains(
             "BRANCH_ROLE: ${{ inputs.branch-role }}",
-            Read("package-release-tag"),
+            Read("tag"),
             StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ReleaseTagAction_AcceptsOnlyTheExactReleaseBranchRole()
+    public void ReleaseTagAction_AcceptsOnlyTheExactProductionBranchRole()
     {
-        var result = RunReleaseTagValidation("release");
+        var result = RunReleaseTagValidation("production");
 
         Assert.Equal(0, result.ExitCode);
+        ReleaseTagAction_FailsClosedForAnyNonProductionBranchRole();
+        ReleaseTagAction_RejectsAnyEventOtherThanPushAndPreservesProtectedBranchAndProductionRoleGuards();
     }
 
-    [Theory]
-    [InlineData("development")]
-    [InlineData("none")]
-    [InlineData("Release")]
-    [InlineData("release ")]
-    [InlineData("")]
-    public void ReleaseTagAction_FailsClosedForAnyNonReleaseBranchRole(string branchRole)
+    private void ReleaseTagAction_FailsClosedForAnyNonProductionBranchRole()
     {
-        // A caller wiring mistake must not tag from a development or unresolved run; the action re-guards release-only.
-        var result = RunReleaseTagValidation(branchRole);
+        foreach (var branchRole in new[] { "development", "none", "Production", "production ", "release", "" })
+        {
+            var result = RunReleaseTagValidation(branchRole);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("Tagging requires the preparation branch role 'production'", result.StandardError, StringComparison.Ordinal);
+        }
+    }
+
+    private void ReleaseTagAction_RejectsAnyEventOtherThanPushAndPreservesProtectedBranchAndProductionRoleGuards()
+    {
+        // The event-name guard runs first so a workflow_dispatch or pull_request
+        // event is rejected before the protected-branch and production-role
+        // guards can be silently skipped; the protected-branch and branch-role
+        // guards still trip after the event-name passes.
+        foreach (var eventName in new[] { "workflow_dispatch", "pull_request", "schedule", "" })
+        {
+            var rejectedByEvent = RunReleaseTagValidation("production", eventName);
+            Assert.NotEqual(0, rejectedByEvent.ExitCode);
+            Assert.Contains("Tagging is allowed only from push.", rejectedByEvent.StandardError, StringComparison.Ordinal);
+        }
+        var rejectedByBranch = RunReleaseTagValidation("production", refProtected: "false");
+        var rejectedByRole = RunReleaseTagValidation("development");
+        Assert.NotEqual(0, rejectedByBranch.ExitCode);
+        Assert.NotEqual(0, rejectedByRole.ExitCode);
+    }
+
+    [Fact]
+    public void Publishers_RejectAnyEventOtherThanPush()
+    {
+        // The publisher guards run as defense in depth: the caller workflow
+        // never starts a workflow_dispatch and the prepare job is push-only, so
+        // dispatch cannot reach the publisher. The action still rejects any
+        // non-push event, including a pull_request, as the second line of defense.
+        foreach (var actionDirectory in PublisherActions)
+        {
+            foreach (var eventName in new[] { "workflow_dispatch", "pull_request", "schedule" })
+            {
+                var result = RunPublisherValidation(
+                    actionDirectory,
+                    eventName,
+                    refProtected: "true",
+                    refName: "refs/heads/main",
+                    visibility: actionDirectory == "public" ? "public" : "private");
+                Assert.NotEqual(0, result.ExitCode);
+                Assert.Contains("Publishing is allowed only from push.", result.StandardError, StringComparison.Ordinal);
+            }
+            Publishers_StillRejectUnprotectedRefOnPush(actionDirectory);
+        }
+        PublicPublisher_StillRejectsNonPublicVisibilityOnPush();
+        PrivatePublisher_StillRejectsNonPrivateVisibilityOnPush();
+        foreach (var actionDirectory in PublisherActions)
+        {
+            Publishers_AcceptPushOnProtectedBranchWithMatchingVisibility(actionDirectory);
+        }
+    }
+
+    private void Publishers_StillRejectUnprotectedRefOnPush(string actionDirectory)
+    {
+        // The event-name guard must not silently short-circuit the protected-branch
+        // guard; an unprotected branch ref still fails closed on a push.
+        var visibility = actionDirectory == "public" ? "public" : "private";
+
+        var unprotectedRef = RunPublisherValidation(
+            actionDirectory,
+            "push",
+            refProtected: "false",
+            refName: "refs/heads/main",
+            visibility: visibility);
+
+        Assert.NotEqual(0, unprotectedRef.ExitCode);
+        Assert.Contains(
+            "Publishing requires a protected branch ref.",
+            unprotectedRef.StandardError,
+            StringComparison.Ordinal);
+
+        var tagRef = RunPublisherValidation(
+            actionDirectory,
+            "push",
+            refProtected: "true",
+            refName: "refs/tags/v3.0.0",
+            visibility: visibility);
+
+        Assert.NotEqual(0, tagRef.ExitCode);
+        Assert.Contains(
+            "Publishing requires a protected branch ref.",
+            tagRef.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    private void PublicPublisher_StillRejectsNonPublicVisibilityOnPush()
+    {
+        var result = RunPublisherValidation(
+            "public",
+            "push",
+            refProtected: "true",
+            refName: "refs/heads/main",
+            visibility: "private");
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains(
-            "Tagging requires the preparation branch role 'release'",
+            "The public publisher requires a public caller repository",
             result.StandardError,
             StringComparison.Ordinal);
     }
 
-    private static ShellResult RunReleaseTagValidation(string branchRole)
+    private void PrivatePublisher_StillRejectsNonPrivateVisibilityOnPush()
     {
-        var root = YamlWorkflowReader.Parse(Read("package-release-tag"));
+        var result = RunPublisherValidation(
+            "private",
+            "push",
+            refProtected: "true",
+            refName: "refs/heads/main",
+            visibility: "public");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(
+            "The private publisher requires a private caller repository",
+            result.StandardError,
+            StringComparison.Ordinal);
+    }
+
+    private void Publishers_AcceptPushOnProtectedBranchWithMatchingVisibility(string actionDirectory)
+    {
+        // The positive control: a push on a protected branch with the matching
+        // visibility passes the publisher guard, so a production re-run keeps
+        // the same inputs and the action reaches the existing package check.
+        var visibility = actionDirectory == "public" ? "public" : "private";
+
+        var result = RunPublisherValidation(
+            actionDirectory,
+            "push",
+            refProtected: "true",
+            refName: "refs/heads/main",
+            visibility: visibility);
+
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    private static ShellResult RunReleaseTagValidation(
+        string branchRole,
+        string eventName = "push",
+        string refProtected = "true",
+        string refName = "refs/heads/main")
+    {
+        var root = YamlWorkflowReader.Parse(Read("tag"));
         var runs = YamlWorkflowReader.MappingChild(root, "runs");
         var step = YamlWorkflowReader.MappingSequence(runs, "steps").Single(step =>
             YamlWorkflowReader.ScalarChild(step, "name") == "Validate trusted tag invocation");
 
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["EVENT_NAME"] = "push",
-            ["REF_NAME"] = "refs/heads/main",
-            ["REF_PROTECTED"] = "true",
+            ["EVENT_NAME"] = eventName,
+            ["REF_NAME"] = refName,
+            ["REF_PROTECTED"] = refProtected,
             ["BRANCH_ROLE"] = branchRole,
+        };
+
+        return WorkflowShell.RunBash(
+            YamlWorkflowReader.ScalarChild(step, "run"),
+            Path.GetTempPath(),
+            environment);
+    }
+
+    private static ShellResult RunPublisherValidation(
+        string actionDirectory,
+        string eventName,
+        string refProtected,
+        string refName,
+        string visibility)
+    {
+        var root = YamlWorkflowReader.Parse(Read(actionDirectory));
+        var runs = YamlWorkflowReader.MappingChild(root, "runs");
+        var stepName = actionDirectory == "public"
+            ? "Validate public publisher invocation"
+            : "Validate private publisher invocation";
+        var step = YamlWorkflowReader.MappingSequence(runs, "steps").Single(step =>
+            YamlWorkflowReader.ScalarChild(step, "name") == stepName);
+
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["EVENT_NAME"] = eventName,
+            ["REF_NAME"] = refName,
+            ["REF_PROTECTED"] = refProtected,
+            ["REPOSITORY_VISIBILITY"] = visibility,
+            ["NUGET_USER"] = "test-nuget-user",
         };
 
         return WorkflowShell.RunBash(

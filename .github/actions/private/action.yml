@@ -1,11 +1,8 @@
-name: Publish NuGet package to the public NuGet.org feed
-description: Recheck caller state and provenance, then publish the exact prepared package to NuGet.org with caller-owned GitHub OIDC.
+name: Publish NuGet package to the caller GitHub Packages feed
+description: Recheck caller state and provenance, then publish the exact prepared package to GitHub Packages with the caller GITHUB_TOKEN.
 inputs:
   package-id:
     description: NuGet package ID.
-    required: true
-  nuget-user:
-    description: NuGet.org profile name used for trusted publishing token exchange.
     required: true
   package-artifact:
     description: Repository-relative path of the packed .nupkg inside the workflow artifact.
@@ -20,35 +17,30 @@ inputs:
     description: Tag-state fingerprint emitted by the preparation workflow.
     required: true
   repository-visibility:
-    description: Preflight caller repository visibility; must be public for this publisher.
+    description: Preflight caller repository visibility; must be private for this publisher.
     required: true
 runs:
   using: composite
   steps:
-    - name: Validate public publisher invocation
+    - name: Validate private publisher invocation
       shell: bash
       env:
         EVENT_NAME: ${{ github.event_name }}
         REF_NAME: ${{ github.ref }}
         REF_PROTECTED: ${{ github.ref_protected }}
-        NUGET_USER: ${{ inputs.nuget-user }}
         REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}
       run: |
         set -euo pipefail
-        if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
-          echo "Publishing is allowed only from push or workflow_dispatch." >&2
+        if [[ "$EVENT_NAME" != push ]]; then
+          echo "Publishing is allowed only from push." >&2
           exit 1
         fi
         if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then
           echo "Publishing requires a protected branch ref." >&2
           exit 1
         fi
-        if [[ ! "$NUGET_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-          echo "nuget-user is missing or invalid." >&2
-          exit 1
-        fi
-        if [[ "$REPOSITORY_VISIBILITY" != public ]]; then
-          echo "The public publisher requires a public caller repository; refusing to route visibility '$REPOSITORY_VISIBILITY' to NuGet.org." >&2
+        if [[ "$REPOSITORY_VISIBILITY" != private ]]; then
+          echo "The private publisher requires a private caller repository; refusing to route visibility '$REPOSITORY_VISIBILITY' to GitHub Packages." >&2
           exit 1
         fi
 
@@ -58,7 +50,7 @@ runs:
         name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
         path: artifacts
 
-    - name: Recheck calculated state and public package provenance
+    - name: Recheck calculated state and private package provenance
       id: collision
       shell: bash
       env:
@@ -98,7 +90,7 @@ runs:
             [[ -z "$ref" ]] && continue
             if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
             leaf=${ref#"$tag_prefix"}
-            if [[ ! "$leaf" =~ ^v3\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
+            if [[ ! "$leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
             resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
             snapshot+="${ref}=${object_sha}"$'\n'
           done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")
@@ -112,44 +104,69 @@ runs:
         if [[ "$EXPECTED_STATE" != *";tag-state=${tag_state}" || "$fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then echo "Calculated package state drifted before publication; refusing to publish." >&2; exit 1; fi
         package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
         version_lower=$(printf '%s' "$PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
-        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/index.json"); then echo "Could not recheck whether the public package version already exists." >&2; exit 1; fi
+        service_index_url="https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json"
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$service_index_url"); then echo "Could not read the GitHub Packages NuGet service index for the private package recheck." >&2; exit 1; fi
+        if [[ "$status" != 200 ]]; then echo "GitHub Packages returned HTTP $status for the NuGet service index during publication recheck." >&2; exit 1; fi
+        if ! raw_package_base_address=$(jq -er '
+          if type == "object" and (.resources | type == "array") then
+            [.resources[]
+             | select(
+                 (.["@type"] | type == "string" and . == "PackageBaseAddress/3.0.0")
+                 or (.["@type"] | type == "array" and (index("PackageBaseAddress/3.0.0") != null))
+               )
+             | .["@id"]
+            ]
+            | if length == 1 and (.[0] | type == "string") and (.[0] | length > 0) and (.[0] | test("[[:cntrl:]]") | not) then .[0] else empty end
+          else
+            error("malformed service index")
+          end
+        ' "$response_file" && printf 'x'); then echo "GitHub Packages returned a malformed, missing, or ambiguous PackageBaseAddress resource in its NuGet service index." >&2; exit 1; fi
+        # Command substitution strips trailing newlines, so a sentinel preserves the selector output; only jq's own record newline is stripped before rejecting any other control byte.
+        package_base_address=${raw_package_base_address%x}
+        package_base_address=${package_base_address%$'\n'}
+        if [[ "$package_base_address" == *[[:cntrl:]]* ]]; then
+          echo "GitHub Packages returned a malformed PackageBaseAddress @id in its NuGet service index." >&2
+          exit 1
+        fi
+        # The @id is untrusted; the checked-in validator rejects raw query/fragment markers and any WHATWG rewriting (parsed.href !== candidate).
+        # The candidate is piped on stdin so the untrusted value never reaches the interpreter command line.
+        if ! package_base_address=$(printf '%s' "$package_base_address" | node "$GITHUB_ACTION_PATH/scripts/validate.mjs"); then
+          echo "GitHub Packages returned a malformed PackageBaseAddress @id in its NuGet service index." >&2
+          exit 1
+        fi
+        package_base_address=${package_base_address%/}
+        package_index_url="$package_base_address/${package_id_lower}/index.json"
+        package_download_url="$package_base_address/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"
+        if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$package_index_url"); then echo "Could not recheck whether the private package version already exists." >&2; exit 1; fi
         case "$status" in
           200)
-            jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null || { echo "NuGet.org returned a malformed package-version response." >&2; exit 1; }
+            jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null || { echo "GitHub Packages returned a malformed package-version response." >&2; exit 1; }
             if jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then
-              if ! status=$(curl --silent --show-error --location --output "$package_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"); then echo "Could not read the published public package for collision provenance." >&2; exit 1; fi
-              if [[ "$status" != 200 ]]; then echo "NuGet.org returned HTTP $status for the published public package; treating the existing version as an unverifiable collision." >&2; exit 1; fi
+              if ! status=$(curl --silent --show-error --location --output "$package_file" --write-out '%{http_code}' --user "$GITHUB_ACTOR:$GH_TOKEN" "$package_download_url"); then echo "Could not read the published private package for collision provenance." >&2; exit 1; fi
+              if [[ "$status" != 200 ]]; then echo "GitHub Packages returned HTTP $status for the published private package; treating the existing version as an unverifiable collision." >&2; exit 1; fi
               nuspec=$(unzip -p "$package_file" '*.nuspec' 2>/dev/null || true)
               repository_commit=$(printf '%s' "$nuspec" | grep -oE 'commit="[0-9a-fA-F]{40}"' | head -n 1 | sed -E 's/.*"([0-9a-fA-F]{40})".*/\1/' | tr 'A-F' 'a-f' || true)
-              if [[ "$repository_commit" != "$GITHUB_SHA" ]]; then echo "The existing public package version has no authenticated provenance for this caller SHA; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              if [[ "$repository_commit" != "$GITHUB_SHA" ]]; then echo "The existing private package version has no authenticated provenance for this caller SHA; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
               printf 'package-state=published\n' >> "$GITHUB_OUTPUT"
             else
               printf 'package-state=unpublished\n' >> "$GITHUB_OUTPUT"
             fi
             ;;
           404) printf 'package-state=unpublished\n' >> "$GITHUB_OUTPUT" ;;
-          *) echo "NuGet.org returned HTTP $status while rechecking package publication." >&2; exit 1 ;;
+          *) echo "GitHub Packages returned HTTP $status while rechecking package publication." >&2; exit 1 ;;
         esac
 
-    - name: Exchange OIDC identity for temporary NuGet API key
+    - name: Publish package to GitHub Packages
       if: ${{ steps.collision.outputs.package-state != 'published' }}
       shell: bash
       env:
-        NUGET_USER: ${{ inputs.nuget-user }}
+        GH_TOKEN: ${{ github.token }}
         PACKAGE_ARTIFACT: ${{ inputs.package-artifact }}
-      run: |
-        set -euo pipefail
-        oidc_response=$(curl --fail --silent --show-error --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fwww.nuget.org")
-        oidc_token=$(printf '%s' "$oidc_response" | jq -er '.value')
-        token_request=$(jq -nc --arg username "$NUGET_USER" '{username: $username, tokenType: "ApiKey"}')
-        token_response=$(curl --fail --silent --show-error --request POST --header 'Content-Type: application/json' --header "Authorization: Bearer $oidc_token" --data "$token_request" 'https://www.nuget.org/api/v2/token')
-        nuget_api_key=$(printf '%s' "$token_response" | jq -er '.apiKey')
-        echo "::add-mask::$nuget_api_key"
-        dotnet nuget push "$PACKAGE_ARTIFACT" --source https://api.nuget.org/v3/index.json --api-key "$nuget_api_key"
+      run: dotnet nuget push "$PACKAGE_ARTIFACT" --source "https://nuget.pkg.github.com/$GITHUB_REPOSITORY_OWNER/index.json" --api-key "$GH_TOKEN"
 
     - name: Report already-published same-SHA package
       if: ${{ steps.collision.outputs.package-state == 'published' }}
       shell: bash
       env:
         PACKAGE_VERSION: ${{ inputs.package-version }}
-      run: echo "Public package version $PACKAGE_VERSION is already published for this caller SHA; skipping publication so the immutable release tag can be reconciled."
+      run: echo "Private package version $PACKAGE_VERSION is already published for this caller SHA; skipping publication so the immutable release tag can be reconciled."

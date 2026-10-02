@@ -21,10 +21,10 @@ public sealed class PackageBootstrapAdoptionContractTests
 
     private static readonly string[] ActionDirectories =
     [
-        "package-preflight",
-        "package-private-publish",
-        "package-public-publish",
-        "package-release-tag",
+        "preflight",
+        "private",
+        "public",
+        "tag",
     ];
 
     // Legacy bootstrap/adoption or registry-migration branches must never enter
@@ -52,52 +52,44 @@ public sealed class PackageBootstrapAdoptionContractTests
         </package>
         """;
 
-    [Theory]
-    [InlineData("package-public-publish", "different")]
-    [InlineData("package-public-publish", "absent")]
-    [InlineData("package-private-publish", "different")]
-    [InlineData("package-private-publish", "absent")]
-    public void ExistingPackageWithoutCallerRepositoryCommitProvenance_FailsClosed(
-        string actionDirectory,
-        string kind)
+    [Fact]
+    public void ExistingPackageWithoutCallerRepositoryCommitProvenance_FailsClosed()
     {
-        var action = WorkflowShell.ReadAction(actionDirectory);
-        Assert.Contains(ProvenanceFailure, action, StringComparison.Ordinal);
+        foreach (var actionDirectory in new[] { "public", "private" })
+        {
+            var action = WorkflowShell.ReadAction(actionDirectory);
+            Assert.Contains(ProvenanceFailure, action, StringComparison.Ordinal);
+            Assert.Contains("creating a recovery tag", action, StringComparison.Ordinal);
 
-        // The committed guard refuses to publish or synthesize a recovery tag, so
-        // an existing package can never be adopted as a side effect of a run.
-        Assert.Contains("creating a recovery tag", action, StringComparison.Ordinal);
-
-        var nuspec = kind == "absent" ? NuspecWithoutRepositoryCommit : Nuspec(OtherSha);
-        var run = RunProvenanceGuard(actionDirectory, nuspec, CurrentSha);
-
-        Assert.NotEqual(0, run.Result.ExitCode);
-        Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+            foreach (var nuspec in new[] { NuspecWithoutRepositoryCommit, Nuspec(OtherSha) })
+            {
+                var run = RunProvenanceGuard(actionDirectory, nuspec, CurrentSha);
+                Assert.NotEqual(0, run.Result.ExitCode);
+                Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+            }
+        }
+        ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed();
+        ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized();
     }
 
-    [Theory]
-    [InlineData("39-hex")]
-    [InlineData("non-hex")]
-    public void ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed(string kind)
+    private void ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed()
     {
-        var commit = kind == "39-hex" ? new string('a', 39) : new string('z', 40);
-        var run = RunProvenanceGuard("package-public-publish", Nuspec(commit), CurrentSha);
-
-        Assert.NotEqual(0, run.Result.ExitCode);
-        Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+        foreach (var commit in new[] { new string('a', 39), new string('z', 40) })
+        {
+            var run = RunProvenanceGuard("public", Nuspec(commit), CurrentSha);
+            Assert.NotEqual(0, run.Result.ExitCode);
+            Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+        }
     }
 
-    [Theory]
-    [InlineData("package-public-publish")]
-    [InlineData("package-private-publish")]
-    public void ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized(string actionDirectory)
+    private void ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized()
     {
-        // Uppercase hex must normalize to the lowercase caller SHA; this is the
-        // exact same-SHA recovery the publisher relies on, and nothing else.
-        var run = RunProvenanceGuard(actionDirectory, Nuspec(CurrentSha.ToUpperInvariant()), CurrentSha);
-
-        Assert.Equal(0, run.Result.ExitCode);
-        Assert.Equal(CurrentSha, run.RepositoryCommit);
+        foreach (var actionDirectory in new[] { "public", "private" })
+        {
+            var run = RunProvenanceGuard(actionDirectory, Nuspec(CurrentSha.ToUpperInvariant()), CurrentSha);
+            Assert.Equal(0, run.Result.ExitCode);
+            Assert.Equal(CurrentSha, run.RepositoryCommit);
+        }
     }
 
     [Fact]
@@ -112,10 +104,21 @@ public sealed class PackageBootstrapAdoptionContractTests
         {
             AssertNoLegacyTokens(WorkflowShell.ReadAction(directory));
         }
+        PreparationWorkflows_DoNotCreateTags();
+        RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled();
+        Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages();
+        HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime();
+        NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag();
+        Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch();
+        MigrationFailure_LeavesPublishingDisabled();
+        MigrationAndRuntime_FailClosedSeparately();
+        MigrationProvenanceRequirements_AreDocumented();
+        BootstrapAndAdoption_ExcludeOtherCompatibilityLines();
+        SteadyStatePublishing_IsTagDerivedAndAdoptsNothing();
+        GizmoShared10_MigrationAdoptionAdvancesOnePatch();
     }
 
-    [Fact]
-    public void PreparationWorkflows_DoNotCreateTags()
+    private void PreparationWorkflows_DoNotCreateTags()
     {
         // "No synthetic tag": only the release-only tag action may write a ref.
         foreach (var file in WorkflowFiles)
@@ -123,14 +126,13 @@ public sealed class PackageBootstrapAdoptionContractTests
             var content = WorkflowShell.ReadWorkflow(file);
             Assert.DoesNotContain("git/refs", content, StringComparison.Ordinal);
             Assert.DoesNotContain("--request POST", content, StringComparison.Ordinal);
-            Assert.DoesNotContain("package-release-tag", content, StringComparison.Ordinal);
+            Assert.DoesNotContain(".github/actions/tag", content, StringComparison.Ordinal);
         }
 
-        Assert.Contains("git/refs", WorkflowShell.ReadAction("package-release-tag"), StringComparison.Ordinal);
+        Assert.Contains("git/refs", WorkflowShell.ReadAction("tag"), StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled()
+    private void RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -147,8 +149,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages()
+    private void Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -170,23 +171,26 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime()
+    private void HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // Registry 3.X.4 and 3.X.5 with no line tags calculate 3.X.0, which the
-        // publisher sees as unpublished, so it would publish a new lower version
-        // rather than detect the higher packages.
-        Assert.Contains("versions `3.X.4` and `3.X.5` and no line tags", caller, StringComparison.Ordinal);
+        // Registry <major>.<minor>.4 and <major>.<minor>.5 with no line tags
+        // calculate <major>.<minor>.0, which the publisher sees as unpublished,
+        // so it would publish a new lower version rather than detect the higher
+        // packages.
+        Assert.Contains(
+            "versions `<major>.<minor>.4` and `<major>.<minor>.5` and no line tags",
+            caller,
+            StringComparison.Ordinal);
         Assert.Contains("the runtime will not catch it", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "would publish a new lower `3.X.0` instead of failing closed",
+            "would publish a new lower `<major>.<minor>.0` instead of failing closed",
             caller,
             StringComparison.Ordinal);
         Assert.Contains(
-            "would publish a new lower `3.X.0` rather than detect the higher packages",
+            "would publish a new lower `<major>.<minor>.0` rather than detect the higher packages",
             provider,
             StringComparison.Ordinal);
 
@@ -195,20 +199,22 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.DoesNotContain("so the run fails closed", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
+    private void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // Bootstrap is the conjunction: the line starts at its first 3.X.0 only
-        // when the registry has no stable package for the line *and* no matching
-        // tag exists. "No tag" alone is not bootstrap.
+        // Bootstrap is the conjunction: the line starts at its first
+        // <major>.<minor>.0 only when the registry has no stable package for the
+        // line *and* no matching tag exists. "No tag" alone is not bootstrap.
         Assert.Contains(
             "the active compatibility line has no stable package in the selected registry *and* no tag under `<package-id>/` for that line",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("the workflow derives the first `3.X.0`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "the workflow derives the first `<major>.<minor>.0`",
+            caller,
+            StringComparison.Ordinal);
         Assert.Contains(
             "the active compatibility line has no stable package in the selected registry *and* no matching stable tag",
             provider,
@@ -216,27 +222,31 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("only case where steady state is safe without a migration step", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch()
+    private void Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch()
     {
         var caller = Flatten(CallerDoc());
 
         // The migration candidate is the highest published line version, and the
         // next release after its immutable tag claims one patch later.
-        Assert.Contains("The migration candidate is the highest stable `3.X.Y`", caller, StringComparison.Ordinal);
         Assert.Contains(
-            "registry versions `3.X.4` and `3.X.5` yield candidate `3.X.5`, never the first `3.X.0`",
+            "The migration candidate is the highest stable `<major>.<minor>.<patch>`",
             caller,
             StringComparison.Ordinal);
         Assert.Contains(
-            "create the immutable `<package-id>/v3.X.Y` tag deliberately",
+            "registry versions `<major>.<minor>.4` and `<major>.<minor>.5` yield candidate `<major>.<minor>.5`, never the first `<major>.<minor>.0`",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("a candidate of `3.X.5` resumes at `3.X.6`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "create the immutable `<package-id>/v<major>.<minor>.<patch>` tag deliberately",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "a candidate of `<major>.<minor>.5` resumes at `<major>.<minor>.6`",
+            caller,
+            StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationFailure_LeavesPublishingDisabled()
+    private void MigrationFailure_LeavesPublishingDisabled()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -260,8 +270,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("The runtime cannot detect the unadopted higher version", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationAndRuntime_FailClosedSeparately()
+    private void MigrationAndRuntime_FailClosedSeparately()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -279,8 +288,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("because the runtime never observes those higher versions", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationProvenanceRequirements_AreDocumented()
+    private void MigrationProvenanceRequirements_AreDocumented()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -298,8 +306,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
+    private void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -312,8 +319,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
+    private void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -340,32 +346,64 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void GizmoShared30_NaturalBootstrapStartsAtTheFirstStableVersion()
+    private void GizmoShared10_MigrationAdoptionAdvancesOnePatch()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
 
-        // No stable line package and no line tag makes Gizmo.Shared a natural bootstrap.
-        Assert.Contains("Gizmo.Shared 3.0 conclusion", caller, StringComparison.Ordinal);
-        Assert.Contains("no stable `3.0.Y` NuGet package", caller, StringComparison.Ordinal);
-        Assert.Contains("no `Gizmo.Shared/v3.0.Y` tag", caller, StringComparison.Ordinal);
+        // Gizmo.Shared is on compatibility line 1.0 with stable 1.0.13 already
+        // in the selected registry, so the line is not a natural bootstrap and
+        // needs migration adoption before steady state is enabled.
+        Assert.Contains("Gizmo.Shared 1.0 migration and adoption", caller, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared` is on compatibility line 1.0", caller, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared 1.0.13` package already exists", caller, StringComparison.Ordinal);
+        Assert.Contains("the line is not a natural bootstrap", caller, StringComparison.Ordinal);
+
+        Assert.Contains("Gizmo.Shared 1.0 migration and adoption", provider, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared` is on compatibility line 1.0", provider, StringComparison.Ordinal);
+        Assert.Contains("`Gizmo.Shared 1.0.13` package already exists", provider, StringComparison.Ordinal);
+        Assert.Contains("it is not a natural bootstrap and needs migration", provider, StringComparison.Ordinal);
+
+        // Provenance proof is required before the deliberate adoption tag.
+        Assert.Contains("`RepositoryCommit`", caller, StringComparison.Ordinal);
+        Assert.Contains("real commit in the caller repository", caller, StringComparison.Ordinal);
+        Assert.Contains("`RepositoryCommit`", provider, StringComparison.Ordinal);
+        Assert.Contains("real caller commit as its `RepositoryCommit`", provider, StringComparison.Ordinal);
+
         Assert.Contains(
-            "Nothing is adopted and no migration step applies",
+            "deliberately create the immutable `Gizmo.Shared/v1.0.13` tag",
             caller,
             StringComparison.Ordinal);
-        Assert.Contains("the line qualifies for natural bootstrap", caller, StringComparison.Ordinal);
-        Assert.Contains("first development build is `3.0.0-dev.N`", caller, StringComparison.Ordinal);
-        Assert.Contains("first stable release publishes `3.0.0`", caller, StringComparison.Ordinal);
-        Assert.Contains("`Gizmo.Shared/v3.0.0` tag", caller, StringComparison.Ordinal);
-        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "deliberately create the immutable `Gizmo.Shared/v1.0.13` tag",
+            provider,
+            StringComparison.Ordinal);
 
-        Assert.Contains("Gizmo.Shared 3.0 conclusion", provider, StringComparison.Ordinal);
-        Assert.Contains("no stable `3.0.Y` NuGet package", provider, StringComparison.Ordinal);
-        Assert.Contains("natural bootstrap derives the first `3.0.0-dev.N`", provider, StringComparison.Ordinal);
-        Assert.Contains("first stable release calculates `3.0.0`", provider, StringComparison.Ordinal);
-        Assert.Contains("Gizmo.Shared/v3.0.0", provider, StringComparison.Ordinal);
-        Assert.Contains("Legacy `1.0.x` packages are another compatibility line", provider, StringComparison.Ordinal);
+        // Steady state resumes at patch+1: 1.0.14-dev.N, 1.0.14, Gizmo.Shared/v1.0.14.
+        Assert.Contains("the next development build is `1.0.14-dev.N`", caller, StringComparison.Ordinal);
+        Assert.Contains("the next stable release publishes `1.0.14`", caller, StringComparison.Ordinal);
+        Assert.Contains(
+            "creates the immutable `Gizmo.Shared/v1.0.14` tag",
+            caller,
+            StringComparison.Ordinal);
+        Assert.Contains("the next development build is `1.0.14-dev.N`", provider, StringComparison.Ordinal);
+        Assert.Contains("the next stable release calculates `1.0.14`", provider, StringComparison.Ordinal);
+        Assert.Contains(
+            "creates the immutable `Gizmo.Shared/v1.0.14` tag",
+            provider,
+            StringComparison.Ordinal);
+
+        // The evaluated project <Version> stays the compatibility line only; the
+        // pilot ultimately uses <Version>1.0</Version> and the 1.0.14 patch is
+        // infrastructure-owned and never encoded in the project Version.
+        Assert.Contains("compatibility line only", caller, StringComparison.Ordinal);
+        Assert.Contains("`<Version>1.0</Version>`", caller, StringComparison.Ordinal);
+        Assert.Contains("`1.0.14` patch remains infrastructure-owned", caller, StringComparison.Ordinal);
+        Assert.Contains("never encoded in the project `Version`", caller, StringComparison.Ordinal);
+
+        Assert.Contains("compatibility line only", provider, StringComparison.Ordinal);
+        Assert.Contains("`<Version>1.0</Version>`", provider, StringComparison.Ordinal);
+        Assert.Contains("infrastructure-owned and is never encoded", provider, StringComparison.Ordinal);
     }
 
     private sealed record ProvenanceRun(ShellResult Result, string RepositoryCommit);
@@ -441,9 +479,9 @@ public sealed class PackageBootstrapAdoptionContractTests
     private static string Flatten(string content) =>
         string.Join(' ', content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
-    private static string CallerDoc() => Read("docs", "CALLER_OWNED_NUGET_PUBLISHING.md");
+    private static string CallerDoc() => Read("docs", "caller.md");
 
-    private static string ProviderDoc() => Read("docs", "GITHUB_NUGET_PROVIDER.md");
+    private static string ProviderDoc() => Read("docs", "provider.md");
 
     private static string Read(string directory, string file) =>
         File.ReadAllText(Path.Combine(InfraRepositoryLocator.ResolveRoot(), directory, file));

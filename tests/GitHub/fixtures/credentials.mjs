@@ -5,7 +5,7 @@
 // masquerade as a rejection.
 
 import { readFileSync } from "node:fs";
-import { validatePackageBaseAddress } from "../../../.github/actions/package-private-publish/scripts/validate-package-base-address.mjs";
+import { validatePackageBaseAddress } from "../../../.github/actions/private/scripts/validate.mjs";
 
 const cases = new Map([
   ["user-and-password", { username: "user", password: "pass" }],
