@@ -1,14 +1,11 @@
-# Canonical single caller-owned NuGet package workflow.
-# Copy this file to a consumer repository at .github/workflows/package.yml.
-# Replace every `<40-character-infra-commit-sha>` with one immutable Gizmo.Infra commit SHA.
-# Replace the two branch placeholders with the package's real development and production branches.
-# The workflow filename binds NuGet.org Trusted Publishing and must not be renamed.
+# Canonical single caller-owned NuGet package workflow; copy it to a consumer repository at .github/workflows/package.yml.
+# Replace every `<40-character-infra-commit-sha>` with one immutable Gizmo.Infra commit SHA and both branch placeholders with real branch names.
+# Do not rename the file: its name binds NuGet.org Trusted Publishing.
 name: Package
 
 on:
   pull_request:
   push:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,8 +32,8 @@ jobs:
       production-branch: *production_branch
 
   prepare:
-    # Push and manual dispatch resolve the branch role and prepare the package.
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    # Push resolves the branch role and prepares the package.
+    if: ${{ github.event_name == 'push' }}
     uses: GAMP/Gizmo.Infra/.github/workflows/package-publish.yml@<40-character-infra-commit-sha>
     permissions:
       contents: read
@@ -53,7 +50,7 @@ jobs:
       id-token: write
     steps:
       - name: Publish public package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-public-publish@<40-character-infra-commit-sha>
+        uses: GAMP/Gizmo.Infra/.github/actions/public@<40-character-infra-commit-sha>
         with:
           package-id: ${{ needs.prepare.outputs.package-id }}
           nuget-user: ${{ vars.NUGET_USER }}
@@ -72,7 +69,7 @@ jobs:
       packages: write
     steps:
       - name: Publish private package
-        uses: GAMP/Gizmo.Infra/.github/actions/package-private-publish@<40-character-infra-commit-sha>
+        uses: GAMP/Gizmo.Infra/.github/actions/private@<40-character-infra-commit-sha>
         with:
           package-id: ${{ needs.prepare.outputs.package-id }}
           package-artifact: ${{ needs.prepare.outputs.package-artifact }}
@@ -107,7 +104,7 @@ jobs:
       contents: write
     steps:
       - name: Reconcile immutable production tag
-        uses: GAMP/Gizmo.Infra/.github/actions/package-release-tag@<40-character-infra-commit-sha>
+        uses: GAMP/Gizmo.Infra/.github/actions/tag@<40-character-infra-commit-sha>
         with:
           branch-role: ${{ needs.prepare.outputs.branch-role }}
           release-tag: ${{ needs.prepare.outputs.release-tag }}

@@ -5,7 +5,7 @@ Gizmo.Infra. It documents workflows and composite actions only; it does not
 configure GitHub, NuGet, or a caller repository, and the reusable publish
 workflow does not perform a publication or tag write. The caller-owned routing
 and authentication shape is in
-[CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md).
+[caller.md](caller.md).
 
 ## Callable workflows
 
@@ -25,10 +25,10 @@ SHA. A branch, tag, abbreviated SHA, or expression is not an acceptable
 workflow reference.
 
 A package repository needs exactly one package automation file,
-`.github/workflows/package.yml`. It triggers on `pull_request`, `push`, and
-`workflow_dispatch`, declares the two physical branch names exactly once as YAML
-anchors, and passes them to both reusable workflows as the required
-`development-branch` and `production-branch` inputs:
+`.github/workflows/package.yml`. It triggers on `pull_request` and `push`,
+declares the two physical branch names exactly once as YAML anchors, and passes
+them to both reusable workflows as the required `development-branch` and
+`production-branch` inputs:
 
 ```yaml
 env:
@@ -51,8 +51,10 @@ requires editing only the single caller workflow. The branch names must be
 distinct valid Git branch names. Gizmo.Infra resolves the logical role
 `development`, `production`, or `none` from the event and these inputs and never
 reads a caller configuration file. A pull request resolves the role from its base
-branch, a push or dispatch resolves the role from the effective branch, and any
-other ref resolves `none`.
+branch, a push resolves the role from the effective branch, and any other ref
+resolves `none`. The caller workflow has no `workflow_dispatch` trigger, so a
+same-SHA recovery re-runs an existing production `push` workflow run instead of
+starting a new manually dispatched run.
 
 When the role is `development` or `production`, the workflows deterministically
 discover exactly one SDK-style packable `.csproj` from the caller workspace and
@@ -111,15 +113,15 @@ preparation workflow requests only `contents: read` and never requests OIDC.
 
 ## Composite actions
 
-The reusable preparation workflow runs the bundled `package-preflight`
+The reusable preparation workflow runs the bundled `preflight`
 composite action for discovery. The caller-owned jobs then compose these pinned
 Gizmo.Infra composite actions:
 
 | Action | Registry | Credentials | Modes |
 | --- | --- | --- | --- |
-| `package-public-publish` | NuGet.org | OIDC (`id-token: write`) | development and production |
-| `package-private-publish` | GitHub Packages | Caller `GITHUB_TOKEN` (`packages: write`) | development and production |
-| `package-release-tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | production only; requires a `production` preparation `branch-role` and fails closed otherwise |
+| `public` | NuGet.org | OIDC (`id-token: write`) | development and production |
+| `private` | GitHub Packages | Caller `GITHUB_TOKEN` (`packages: write`) | development and production |
+| `tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | production only; requires a `production` preparation `branch-role` and fails closed otherwise |
 
 Each publisher re-downloads the exact prepared artifact, refetches the complete
 package tag state under the exact `<package-id>/` prefix, rechecks the
@@ -227,13 +229,13 @@ enabled:
   advertise the first `<major>.<minor>.0`, and a production run calculates
   `<major>.<minor>.0` with `release-tag-state=missing`. The preparation workflow
   never creates a synthetic tag; the immutable release tag is created only by the
-  caller-owned `package-release-tag` action, in a resolved `production` run, after
+  caller-owned `tag` action, in a resolved `production` run, after
   the selected publisher succeeded, and only for the exact calculated release tag.
   This is the only case where steady state is safe without a migration step.
 - **Migration required** — the active compatibility line already has any stable
   package in the selected registry. Do not enable or run steady state until the
   migration procedure in
-  [CALLER_OWNED_NUGET_PUBLISHING.md](CALLER_OWNED_NUGET_PUBLISHING.md) completes.
+  [caller.md](caller.md) completes.
   With no line tags the tag-derived calculation is `<major>.<minor>.0`, and the
   publisher sees no package at `<major>.<minor>.0`, so a steady-state run would
   publish a new lower `<major>.<minor>.0` rather than detect the higher packages.
@@ -294,7 +296,11 @@ metadata and uploads only its exact `.nupkg` path. Artifact names include both
 `github.run_id` and `github.run_attempt`, so a rerun can download the exact
 artifact that its preparation produced. The caller-owned publisher actions
 download that artifact by name and never rebuild it; they recheck collision and
-provenance immediately before publishing.
+provenance immediately before publishing. Same-SHA recovery re-runs an existing
+production `push` workflow run rather than a new manually dispatched run: the
+re-run keeps the pushed caller commit and immutable tag state, so the publisher
+treats the matching package as already published and the tag job reconciles the
+release tag.
 
 All action references are pinned to full commit SHAs, checkout credentials are
 disabled, and caller-supplied strings enter shell commands only through quoted

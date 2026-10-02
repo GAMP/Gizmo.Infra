@@ -14,7 +14,7 @@ inputs:
     description: Caller production branch name declared once in the single caller workflow.
     required: true
   current-ref:
-    description: Effective caller branch ref; the pull-request base branch or the pushed/dispatched branch.
+    description: Effective caller branch ref; the pull-request base branch or the pushed branch.
     required: true
 outputs:
   project-path:
@@ -59,7 +59,7 @@ runs:
         git check-ref-format --branch "$DEVELOPMENT_BRANCH" > /dev/null 2>&1 || fail "The development branch input is not a valid branch name."
         git check-ref-format --branch "$PRODUCTION_BRANCH" > /dev/null 2>&1 || fail "The production branch input is not a valid branch name."
 
-        # The role is resolved from event identity only: pull-request base branch or the pushed/dispatched branch.
+        # The role derives only from event identity and the declared branches, never a caller configuration file.
         branch_role=none
         if [[ "$CURRENT_REF" == "refs/heads/$DEVELOPMENT_BRANCH" ]]; then
           branch_role=development

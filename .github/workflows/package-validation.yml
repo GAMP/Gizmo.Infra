@@ -63,7 +63,7 @@ jobs:
 
       - name: Discover caller package metadata
         id: metadata
-        uses: ./.gizmo-infra/.github/actions/package-preflight
+        uses: ./.gizmo-infra/.github/actions/preflight
         with:
           caller-repository: ${{ github.repository }}
           github-token: ${{ github.token }}

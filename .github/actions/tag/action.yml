@@ -25,8 +25,8 @@ runs:
         BRANCH_ROLE: ${{ inputs.branch-role }}
       run: |
         set -euo pipefail
-        if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
-          echo "Tagging is allowed only from push or workflow_dispatch." >&2
+        if [[ "$EVENT_NAME" != push ]]; then
+          echo "Tagging is allowed only from push." >&2
           exit 1
         fi
         if [[ "$REF_PROTECTED" != true || "$REF_NAME" != refs/heads/* ]]; then

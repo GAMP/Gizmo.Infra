@@ -10,12 +10,12 @@ suffixes from caller-repository tags and route the resolved role `development`,
 
 ## GitHub NuGet workflows
 
-See [docs/GITHUB_NUGET_PROVIDER.md](docs/GITHUB_NUGET_PROVIDER.md) for the
+See [docs/provider.md](docs/provider.md) for the
 validation and publish preparation workflow contracts, automatic
 GitHub-calculated versioning and governed compatibility-line transitions,
 event/role routing, immutable full-SHA invocation, collision and release recovery
 rules, and one-time existing-package bootstrap and adoption. See
-[docs/CALLER_OWNED_NUGET_PUBLISHING.md](docs/CALLER_OWNED_NUGET_PUBLISHING.md)
+[docs/caller.md](docs/caller.md)
 for the single canonical caller workflow, the OIDC and `GITHUB_TOKEN`
 authentication split, the internal-visibility fail-closed rule, and the
 deliberate one-time existing-package adoption procedure. The documentation

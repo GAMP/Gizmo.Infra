@@ -21,10 +21,10 @@ public sealed class PackageBootstrapAdoptionContractTests
 
     private static readonly string[] ActionDirectories =
     [
-        "package-preflight",
-        "package-private-publish",
-        "package-public-publish",
-        "package-release-tag",
+        "preflight",
+        "private",
+        "public",
+        "tag",
     ];
 
     // Legacy bootstrap/adoption or registry-migration branches must never enter
@@ -52,52 +52,44 @@ public sealed class PackageBootstrapAdoptionContractTests
         </package>
         """;
 
-    [Theory]
-    [InlineData("package-public-publish", "different")]
-    [InlineData("package-public-publish", "absent")]
-    [InlineData("package-private-publish", "different")]
-    [InlineData("package-private-publish", "absent")]
-    public void ExistingPackageWithoutCallerRepositoryCommitProvenance_FailsClosed(
-        string actionDirectory,
-        string kind)
+    [Fact]
+    public void ExistingPackageWithoutCallerRepositoryCommitProvenance_FailsClosed()
     {
-        var action = WorkflowShell.ReadAction(actionDirectory);
-        Assert.Contains(ProvenanceFailure, action, StringComparison.Ordinal);
+        foreach (var actionDirectory in new[] { "public", "private" })
+        {
+            var action = WorkflowShell.ReadAction(actionDirectory);
+            Assert.Contains(ProvenanceFailure, action, StringComparison.Ordinal);
+            Assert.Contains("creating a recovery tag", action, StringComparison.Ordinal);
 
-        // The committed guard refuses to publish or synthesize a recovery tag, so
-        // an existing package can never be adopted as a side effect of a run.
-        Assert.Contains("creating a recovery tag", action, StringComparison.Ordinal);
-
-        var nuspec = kind == "absent" ? NuspecWithoutRepositoryCommit : Nuspec(OtherSha);
-        var run = RunProvenanceGuard(actionDirectory, nuspec, CurrentSha);
-
-        Assert.NotEqual(0, run.Result.ExitCode);
-        Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+            foreach (var nuspec in new[] { NuspecWithoutRepositoryCommit, Nuspec(OtherSha) })
+            {
+                var run = RunProvenanceGuard(actionDirectory, nuspec, CurrentSha);
+                Assert.NotEqual(0, run.Result.ExitCode);
+                Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+            }
+        }
+        ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed();
+        ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized();
     }
 
-    [Theory]
-    [InlineData("39-hex")]
-    [InlineData("non-hex")]
-    public void ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed(string kind)
+    private void ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed()
     {
-        var commit = kind == "39-hex" ? new string('a', 39) : new string('z', 40);
-        var run = RunProvenanceGuard("package-public-publish", Nuspec(commit), CurrentSha);
-
-        Assert.NotEqual(0, run.Result.ExitCode);
-        Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+        foreach (var commit in new[] { new string('a', 39), new string('z', 40) })
+        {
+            var run = RunProvenanceGuard("public", Nuspec(commit), CurrentSha);
+            Assert.NotEqual(0, run.Result.ExitCode);
+            Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+        }
     }
 
-    [Theory]
-    [InlineData("package-public-publish")]
-    [InlineData("package-private-publish")]
-    public void ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized(string actionDirectory)
+    private void ExistingPackageWithExactCallerCommitProvenance_IsAcceptedAndNormalized()
     {
-        // Uppercase hex must normalize to the lowercase caller SHA; this is the
-        // exact same-SHA recovery the publisher relies on, and nothing else.
-        var run = RunProvenanceGuard(actionDirectory, Nuspec(CurrentSha.ToUpperInvariant()), CurrentSha);
-
-        Assert.Equal(0, run.Result.ExitCode);
-        Assert.Equal(CurrentSha, run.RepositoryCommit);
+        foreach (var actionDirectory in new[] { "public", "private" })
+        {
+            var run = RunProvenanceGuard(actionDirectory, Nuspec(CurrentSha.ToUpperInvariant()), CurrentSha);
+            Assert.Equal(0, run.Result.ExitCode);
+            Assert.Equal(CurrentSha, run.RepositoryCommit);
+        }
     }
 
     [Fact]
@@ -112,10 +104,21 @@ public sealed class PackageBootstrapAdoptionContractTests
         {
             AssertNoLegacyTokens(WorkflowShell.ReadAction(directory));
         }
+        PreparationWorkflows_DoNotCreateTags();
+        RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled();
+        Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages();
+        HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime();
+        NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag();
+        Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch();
+        MigrationFailure_LeavesPublishingDisabled();
+        MigrationAndRuntime_FailClosedSeparately();
+        MigrationProvenanceRequirements_AreDocumented();
+        BootstrapAndAdoption_ExcludeOtherCompatibilityLines();
+        SteadyStatePublishing_IsTagDerivedAndAdoptsNothing();
+        GizmoShared10_MigrationAdoptionAdvancesOnePatch();
     }
 
-    [Fact]
-    public void PreparationWorkflows_DoNotCreateTags()
+    private void PreparationWorkflows_DoNotCreateTags()
     {
         // "No synthetic tag": only the release-only tag action may write a ref.
         foreach (var file in WorkflowFiles)
@@ -123,14 +126,13 @@ public sealed class PackageBootstrapAdoptionContractTests
             var content = WorkflowShell.ReadWorkflow(file);
             Assert.DoesNotContain("git/refs", content, StringComparison.Ordinal);
             Assert.DoesNotContain("--request POST", content, StringComparison.Ordinal);
-            Assert.DoesNotContain("package-release-tag", content, StringComparison.Ordinal);
+            Assert.DoesNotContain(".github/actions/tag", content, StringComparison.Ordinal);
         }
 
-        Assert.Contains("git/refs", WorkflowShell.ReadAction("package-release-tag"), StringComparison.Ordinal);
+        Assert.Contains("git/refs", WorkflowShell.ReadAction("tag"), StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled()
+    private void RegistryInspection_IsRequiredBeforeSteadyStateIsEnabled()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -147,8 +149,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages()
+    private void Runtime_ChecksOnlyTheCalculatedVersionAndCannotDiscoverHigherPackages()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -170,8 +171,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime()
+    private void HigherRegistryPackagesWithNoTags_AreNotClaimedToFailClosedAtRuntime()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -199,8 +199,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.DoesNotContain("so the run fails closed", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
+    private void NaturalBootstrap_RequiresNoStableRegistryPackageAndNoLineTag()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -223,8 +222,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("only case where steady state is safe without a migration step", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch()
+    private void Migration_AdoptsTheHighestStableLineVersionThenAdvancesOnePatch()
     {
         var caller = Flatten(CallerDoc());
 
@@ -248,8 +246,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationFailure_LeavesPublishingDisabled()
+    private void MigrationFailure_LeavesPublishingDisabled()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -273,8 +270,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("The runtime cannot detect the unadopted higher version", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationAndRuntime_FailClosedSeparately()
+    private void MigrationAndRuntime_FailClosedSeparately()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -292,8 +288,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         Assert.Contains("because the runtime never observes those higher versions", provider, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void MigrationProvenanceRequirements_AreDocumented()
+    private void MigrationProvenanceRequirements_AreDocumented()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -311,8 +306,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
+    private void BootstrapAndAdoption_ExcludeOtherCompatibilityLines()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -325,8 +319,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
+    private void SteadyStatePublishing_IsTagDerivedAndAdoptsNothing()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -353,8 +346,7 @@ public sealed class PackageBootstrapAdoptionContractTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void GizmoShared10_MigrationAdoptionAdvancesOnePatch()
+    private void GizmoShared10_MigrationAdoptionAdvancesOnePatch()
     {
         var caller = Flatten(CallerDoc());
         var provider = Flatten(ProviderDoc());
@@ -487,9 +479,9 @@ public sealed class PackageBootstrapAdoptionContractTests
     private static string Flatten(string content) =>
         string.Join(' ', content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
-    private static string CallerDoc() => Read("docs", "CALLER_OWNED_NUGET_PUBLISHING.md");
+    private static string CallerDoc() => Read("docs", "caller.md");
 
-    private static string ProviderDoc() => Read("docs", "GITHUB_NUGET_PROVIDER.md");
+    private static string ProviderDoc() => Read("docs", "provider.md");
 
     private static string Read(string directory, string file) =>
         File.ReadAllText(Path.Combine(InfraRepositoryLocator.ResolveRoot(), directory, file));

@@ -5,7 +5,7 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// <summary>Executable coverage for the private publisher's PackageBaseAddress discovery, origin validation, and fail-closed control flow.</summary>
 public sealed class PrivatePublisherServiceIndexTests
 {
-    private const string Action = "package-private-publish";
+    private const string Action = "private";
     private const string PackageIdLower = "gizmo.widget";
     private const string VersionLower = "3.0.0-dev.7";
 
@@ -30,13 +30,13 @@ public sealed class PrivatePublisherServiceIndexTests
     private static readonly string ActionDirectory =
         Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "actions", Action);
     private static readonly string ValidatorScript =
-        Path.Combine(ActionDirectory, "scripts", "validate-package-base-address.mjs");
+        Path.Combine(ActionDirectory, "scripts", "validate.mjs");
     private static readonly string CredentialCasesFixture = Path.Combine(
         InfraRepositoryLocator.ResolveRoot(),
         "tests",
         "GitHub",
         "fixtures",
-        "package-base-address-credential-cases.mjs");
+        "credentials.mjs");
 
     [Fact]
     public void Discovery_RequestsTheAuthenticatedServiceIndexAndDerivesUrlsFromTheDiscoveredBase()
@@ -62,12 +62,12 @@ public sealed class PrivatePublisherServiceIndexTests
         // passes only the checked-in module path in the node argv.
         Assert.Equal(BaseAddress, File.ReadAllText(repository.AbsolutePath("node-stdin.log")));
         var nodeArgv = File.ReadAllText(repository.AbsolutePath("node-argv.log"));
-        Assert.Contains("validate-package-base-address.mjs", nodeArgv, StringComparison.Ordinal);
+        Assert.Contains("validate.mjs", nodeArgv, StringComparison.Ordinal);
         Assert.DoesNotContain(BaseAddress, nodeArgv, StringComparison.Ordinal);
+        Discovery_NormalizesATrailingSlashOnTheDiscoveredBase();
     }
 
-    [Fact]
-    public void Discovery_PipesTheUntrustedBaseAddressOnStdinAndNeverOnNodeArgv()
+    private void Discovery_PipesTheUntrustedBaseAddressOnStdinAndNeverOnNodeArgv()
     {
         const string sentinel = "node-argv-sentinel";
         var candidate = "https://evil.example.com/owner/" + sentinel;
@@ -91,8 +91,7 @@ public sealed class PrivatePublisherServiceIndexTests
         Assert.Equal(candidate, File.ReadAllText(repository.AbsolutePath("node-stdin.log")));
     }
 
-    [Fact]
-    public void Discovery_NormalizesATrailingSlashOnTheDiscoveredBase()
+    private void Discovery_NormalizesATrailingSlashOnTheDiscoveredBase()
     {
         using var repository = new TempRepository();
 
@@ -121,10 +120,11 @@ public sealed class PrivatePublisherServiceIndexTests
             "Could not read the GitHub Packages NuGet service index",
             result.StandardError,
             StringComparison.Ordinal);
+        Discovery_FailsClosedOnAnUnexpectedServiceIndexStatus();
+        Discovery_FailsClosedOnMalformedMissingOrAmbiguousResources();
     }
 
-    [Fact]
-    public void Discovery_FailsClosedOnAnUnexpectedServiceIndexStatus()
+    private void Discovery_FailsClosedOnAnUnexpectedServiceIndexStatus()
     {
         var result = RunFailure(httpStatus: "500");
 
@@ -135,32 +135,17 @@ public sealed class PrivatePublisherServiceIndexTests
             StringComparison.Ordinal);
     }
 
-    [Theory]
-    [InlineData("empty")] // missing or ambiguous PackageBaseAddress resource
-    [InlineData("error")] // malformed JSON or malformed service-index structure
-    public void Discovery_FailsClosedOnMalformedMissingOrAmbiguousResources(string jqMode)
+    private void Discovery_FailsClosedOnMalformedMissingOrAmbiguousResources()
     {
-        var result = RunFailure(jqMode: jqMode);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(
-            "malformed, missing, or ambiguous PackageBaseAddress resource",
-            result.StandardError,
-            StringComparison.Ordinal);
+        foreach (var jqMode in new[] { "empty", "error" })
+        {
+            var result = RunFailure(jqMode: jqMode);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("malformed, missing, or ambiguous PackageBaseAddress resource", result.StandardError, StringComparison.Ordinal);
+        }
     }
 
-    [Theory]
-    [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
-    [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
-    [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
-    [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
-    [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
-    [InlineData("https://nuget.pkg.github.com/owner/download?")]           // empty query marker
-    [InlineData("https://nuget.pkg.github.com/owner/download#")]           // empty fragment marker
-    [InlineData("https://nuget.pkg.github.com/owner/../../evil")]          // path traversal
-    [InlineData("https://nuget.pkg.github.com/owner/down load")]           // embedded whitespace
-    [InlineData("not-a-url")]                                              // malformed / ambiguous
-    public void Discovery_FailsClosedOnAnUntrustedDiscoveredBaseAddress(string baseAddress)
+    private void Discovery_FailsClosedOnAnUntrustedDiscoveredBaseAddress(string baseAddress)
     {
         var result = RunFailure(baseAddress: baseAddress);
 
@@ -171,8 +156,7 @@ public sealed class PrivatePublisherServiceIndexTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void Discovery_FailsClosedOnATerminalNewlineInTheDiscoveredBaseAddress()
+    private void Discovery_FailsClosedOnATerminalNewlineInTheDiscoveredBaseAddress()
     {
         var result = RunFailure(baseAddress: BaseAddress + "\n");
 
@@ -183,22 +167,18 @@ public sealed class PrivatePublisherServiceIndexTests
             StringComparison.Ordinal);
     }
 
-    [Theory]
-    [InlineData(BaseAddress)]
-    [InlineData(BaseAddress + "/")]
-    public void TrustedOriginValidator_AcceptsTheCanonicalPackageBaseAddress(string baseAddress)
+    [Fact]
+    public void TrustedOriginValidator_AcceptsTheCanonicalPackageBaseAddress()
     {
-        var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
-
-        Assert.Equal(0, result.ExitCode);
-        Assert.Equal(baseAddress, result.StandardOutput);
+        foreach (var baseAddress in new[] { BaseAddress, BaseAddress + "/" })
+        {
+            var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal(baseAddress, result.StandardOutput);
+        }
     }
 
-    [Theory]
-    [InlineData("user-and-password")]
-    [InlineData("username-only")]
-    [InlineData("password-only")]
-    public void TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo(string caseId)
+    private void TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo(string caseId)
     {
         // The case selector travels on stdin and the userinfo-bearing candidate is
         // built inside the fixture, so no credential-shaped value reaches any argv.
@@ -209,23 +189,26 @@ public sealed class PrivatePublisherServiceIndexTests
         Assert.Empty(result.StandardError);
     }
 
-    [Theory]
-    [InlineData("http://nuget.pkg.github.com/owner/download")]             // protocol is not https:
-    [InlineData("https://evil.example.com/owner/download")]                // hostname is not the trusted origin
-    [InlineData("https://nuget.pkg.github.com:443/owner/download")]        // explicit (default) port
-    [InlineData("https://nuget.pkg.github.com/owner/download?x=1")]        // query injection
-    [InlineData("https://nuget.pkg.github.com/owner/download#frag")]       // fragment injection
-    [InlineData("https://nuget.pkg.github.com/owner/download?")]           // WHATWG round-trips an empty query marker
-    [InlineData("https://nuget.pkg.github.com/owner/download#")]           // WHATWG round-trips an empty fragment marker
-    [InlineData("https://nuget.pkg.github.com/owner/../../evil")]          // path traversal
-    [InlineData("https://nuget.pkg.github.com/owner/down load")]           // embedded whitespace
-    [InlineData("not-a-url")]                                              // malformed / ambiguous
-    public void TrustedOriginValidator_RejectsAnyUntrustedOrAmbiguousOrigin(string baseAddress)
+    [Fact]
+    public void TrustedOriginValidator_RejectsAnyUntrustedOrAmbiguousOrigin()
     {
-        var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Empty(result.StandardOutput);
+        foreach (var baseAddress in new[]
+                 {
+                     "http://nuget.pkg.github.com/owner/download",
+                     "https://evil.example.com/owner/download",
+                     "https://nuget.pkg.github.com:443/owner/download",
+                     "https://nuget.pkg.github.com/owner/download?x=1",
+                     "https://nuget.pkg.github.com/owner/download#frag",
+                     "https://nuget.pkg.github.com/owner/../../evil",
+                 })
+        {
+            var result = WorkflowShell.RunNodeScriptWithStdin(ValidatorScript, baseAddress);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Empty(result.StandardOutput);
+        }
+        TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo("user-and-password");
+        Discovery_PipesTheUntrustedBaseAddressOnStdinAndNeverOnNodeArgv();
+        Discovery_FailsClosedOnATerminalNewlineInTheDiscoveredBaseAddress();
     }
 
     [Fact]
@@ -239,6 +222,8 @@ public sealed class PrivatePublisherServiceIndexTests
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal(BaseAddress, result.StandardOutput);
+        TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo("username-only");
+        TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo("password-only");
     }
 
     private static ShellResult RunFailure(

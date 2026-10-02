@@ -4,7 +4,7 @@ using Gizmo.Infra.Tests.TestSupport;
 namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
-/// Executable coverage for the package-preflight MSBuild single-property
+/// Executable coverage for the preflight MSBuild single-property
 /// captures and the canonical generic `<major>.<minor>` and
 /// package-qualified `<major>.<minor>.<patch>` stable-tag grammars. Each test
 /// runs the exact command or pattern read from the committed action or
@@ -13,7 +13,7 @@ namespace Gizmo.Infra.Tests.GitHub;
 /// </summary>
 public sealed class ProjectVersionCaptureTests
 {
-    private const string PreflightAction = "package-preflight";
+    private const string PreflightAction = "preflight";
     private const string ValidationFile = "package-validation.yml";
     private const string PublishFile = "package-publish.yml";
 
@@ -99,10 +99,10 @@ public sealed class ProjectVersionCaptureTests
                 WorkflowShell.ReadAction(PreflightAction), "compatibility_line"),
             accepted,
             rejected);
+        TagGrammar_RequiresAPackageQualifiedCanonicalStableTag();
     }
 
-    [Fact]
-    public void TagGrammar_RequiresAPackageQualifiedCanonicalStableTag()
+    private void TagGrammar_RequiresAPackageQualifiedCanonicalStableTag()
     {
         // Stable tags live under <package-id>/ and parse as
         // v<major>.<minor>.<patch> with canonical numeric components. The
