@@ -131,6 +131,9 @@ public sealed class CallerOwnedPublishingActionContractTests
 
         Assert.Contains("REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}", content, StringComparison.Ordinal);
         Assert.Contains("if [[ \"$REPOSITORY_VISIBILITY\" != private ]]; then", content, StringComparison.Ordinal);
+        PrivatePublisher_ResolvesPackageBaseAddressFromTheAuthenticatedServiceIndex();
+        PrivatePublisher_ValidatesTheTrustedOriginBeforeAuthenticatingDerivedRequests();
+        PrivatePublisher_DeclaresTheServiceIndexDiscoveryFilter();
         Assert.DoesNotContain("nuget-user", content, StringComparison.Ordinal);
     }
 

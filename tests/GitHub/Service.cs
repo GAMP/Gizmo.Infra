@@ -206,6 +206,7 @@ public sealed class PrivatePublisherServiceIndexTests
             Assert.NotEqual(0, result.ExitCode);
             Assert.Empty(result.StandardOutput);
         }
+        Discovery_FailsClosedOnAnUntrustedDiscoveredBaseAddress("https://evil.example.com/owner/download");
         TrustedOriginValidator_RejectsEmbeddedCredentialUserinfo("user-and-password");
         Discovery_PipesTheUntrustedBaseAddressOnStdinAndNeverOnNodeArgv();
         Discovery_FailsClosedOnATerminalNewlineInTheDiscoveredBaseAddress();

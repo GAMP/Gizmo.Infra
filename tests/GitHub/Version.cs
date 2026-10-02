@@ -58,9 +58,15 @@ public sealed class PublishVersionStateExecutionTests
     {
         var bootstrap = Run("development", []);
         var maximum = Run("development", [Tag("3.0.8", OtherSha), Tag("3.0.99", OtherSha), Tag("2.99.999", OtherSha)]);
+        var compatibilityOne = Run("development", [Tag("1.0.13", OtherSha)], compatibilityLine: "1.0");
+        var compatibilityThreeTwo = Run("development", [Tag("3.2.4", OtherSha)], compatibilityLine: "3.2");
+        var compatibilityFourSeven = Run("development", [], compatibilityLine: "4.7");
 
         AssertVersion(bootstrap, "3.0.0", "3.0.0-dev.7", "not-applicable");
         AssertVersion(maximum, "3.0.100", "3.0.100-dev.7", "not-applicable");
+        AssertVersion(compatibilityOne, "1.0.14", "1.0.14-dev.7", "not-applicable");
+        AssertVersion(compatibilityThreeTwo, "3.2.5", "3.2.5-dev.7", "not-applicable");
+        AssertVersion(compatibilityFourSeven, "4.7.0", "4.7.0-dev.7", "not-applicable");
     }
 
     [Fact]
@@ -81,11 +87,18 @@ public sealed class PublishVersionStateExecutionTests
         var tag = Tag("3.0.7", CurrentSha);
         var first = Run("production", [tag], githubSha: CurrentSha);
         var retry = Run("production", [tag], githubSha: CurrentSha);
+        var nonThreeMajorRetry = Run(
+            "production",
+            [Tag("4.7.13", CurrentSha)],
+            compatibilityLine: "4.7",
+            githubSha: CurrentSha);
 
         AssertVersion(first, "3.0.7", "3.0.7", "present");
         Assert.Equal($"{PackageId}/v3.0.7", first.Outputs["release-tag"]);
         Assert.Contains(";current-sha-tags=v3.0.7;", first.Outputs["calculated-state"], StringComparison.Ordinal);
         Assert.Equal(first.Outputs["tag-state-fingerprint"], retry.Outputs["tag-state-fingerprint"]);
+        AssertVersion(nonThreeMajorRetry, "4.7.13", "4.7.13", "present");
+        Assert.Equal($"{PackageId}/v4.7.13", nonThreeMajorRetry.Outputs["release-tag"]);
     }
 
     [Fact]
@@ -112,6 +125,12 @@ public sealed class PublishVersionStateExecutionTests
         var same = Run("development", [Tag("3.0.7", OtherSha)], compatibilityLine: "3.0");
         var minor = Run("development", [Tag("3.0.7", OtherSha)], compatibilityLine: "3.1");
         var major = Run("development", [Tag("3.9.7", OtherSha)], compatibilityLine: "4.0");
+        var unrelatedLines = Run(
+            "development",
+            [Tag("3.2.4", OtherSha), Tag("3.1.99", OtherSha), Tag("2.99.999", OtherSha)],
+            compatibilityLine: "3.2");
+        var majorRollover = Run("development", [Tag("9.9.99", OtherSha)], compatibilityLine: "10.0");
+        var minorRollover = Run("development", [Tag("10.9.99", OtherSha)], compatibilityLine: "10.10");
 
         AssertSucceeded(same);
         Assert.Equal("3.0.8", same.Outputs["base-version"]);
@@ -119,6 +138,12 @@ public sealed class PublishVersionStateExecutionTests
         Assert.Equal("3.1.0", minor.Outputs["base-version"]);
         AssertSucceeded(major);
         Assert.Equal("4.0.0", major.Outputs["base-version"]);
+        AssertSucceeded(unrelatedLines);
+        Assert.Equal("3.2.5", unrelatedLines.Outputs["base-version"]);
+        AssertSucceeded(majorRollover);
+        Assert.Equal("10.0.0", majorRollover.Outputs["base-version"]);
+        AssertSucceeded(minorRollover);
+        Assert.Equal("10.10.0", minorRollover.Outputs["base-version"]);
     }
 
     [Fact]
