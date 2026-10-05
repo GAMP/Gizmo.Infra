@@ -1,19 +1,15 @@
-using System.Globalization;
 using Gizmo.Infra.Tests.TestSupport;
 using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
-/// Executable coverage for the public NuGet.org same-SHA recovery path. Each test
-/// runs the committed precheck or publish/readback shell block with local stubs
-/// for curl, jq, dotnet, unzip, and sleep, so the finite polling policy and the
-/// fail-closed provenance decisions are proven without a feed or any real delay.
+/// Executable coverage for the public NuGet.org same-SHA recovery path; each test runs the committed precheck or publish shell block with local stubs for curl, jq, unzip, and sleep, so the structured duplicate discrimination, the finite polling policy, and the fail-closed provenance decisions are proven without a feed or real delay.
 /// </summary>
 public sealed class PublicPublisherRecoveryTests
 {
     private const string Action = "public";
-    private const string PublishStepName = "Publish exact package and verify provenance readback";
+    private const string PublishStepName = "Publish exact package and reconcile duplicate provenance";
     private const string PackageId = "Gizmo.Widget";
     private const string PackageVersion = "1.0.14";
 
@@ -39,7 +35,33 @@ public sealed class PublicPublisherRecoveryTests
         </package>
         """;
 
+    // A nested decoy with the caller SHA must not authorize a repository that commits a different SHA.
+    private static readonly string NestedDecoyNuspec = $"""
+        <?xml version="1.0" encoding="utf-8"?>
+        <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+          <metadata>
+            <id>{PackageId}</id>
+            <version>{PackageVersion}</version>
+            <description>decoy <repository commit="{CurrentSha}" /></description>
+            <repository type="git" url="https://github.com/owner/repository" commit="{OtherSha}" />
+          </metadata>
+        </package>
+        """;
+
     private static string ActionContent => WorkflowShell.ReadAction(Action);
+
+    private static string PublicActionPath() =>
+        Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "actions", "public")
+            .Replace('\\', '/');
+
+    private static string ProvenanceScriptPath() =>
+        Path.Combine(
+            InfraRepositoryLocator.ResolveRoot(),
+            ".github",
+            "actions",
+            "public",
+            "scripts",
+            "nuspec_provenance.py");
 
     [Fact]
     public void Precheck_ExactVersionWithSameShaProvenance_MarksPublishedAndSkipsPush()
@@ -85,129 +107,30 @@ public sealed class PublicPublisherRecoveryTests
     }
 
     [Fact]
-    public void Push_SuccessThenMatchingReadback_Succeeds()
+    public void Precheck_DecoyNestedCommitWithDivergentRepository_FailsClosed()
     {
+        // A structural parse must ignore the nested matching-SHA decoy and reject the real repository's divergent commit.
         using var repository = new TempRepository();
 
-        var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: MatchingNuspec);
-
-        Assert.Equal(0, outcome.Result.ExitCode);
-        Assert.Contains("--skip-duplicate", outcome.DotnetLog, StringComparison.Ordinal);
-        Assert.Contains(
-            "Verified published public package 1.0.14 provenance on readback attempt 1.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
-    }
-
-    [Fact]
-    public void Push_DuplicateSkipThenEventualMatchingReadback_Succeeds()
-    {
-        using var repository = new TempRepository();
-
-        // The precheck saw the version absent, the push skipped an existing package, and flat-container lag returned 404 before the package read.
-        var outcome = RunPublish(repository, nupkgStatuses: "404 200", nuspec: MatchingNuspec);
-
-        Assert.Equal(0, outcome.Result.ExitCode);
-        Assert.Contains("--skip-duplicate", outcome.DotnetLog, StringComparison.Ordinal);
-        Assert.Equal("2", outcome.SleepLog.Trim());
-        Assert.Contains(
-            "https://api.nuget.org/v3-flatcontainer/gizmo.widget/1.0.14/gizmo.widget.1.0.14.nupkg",
-            outcome.CurlLog,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "Verified published public package 1.0.14 provenance on readback attempt 2.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Push_DuplicateSkipThenDivergentProvenance_FailsClosedImmediately()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: DivergentNuspec);
+        var outcome = RunPrecheck(
+            repository,
+            indexStatus: "200",
+            versionPresent: true,
+            nupkgStatus: "200",
+            nuspec: NestedDecoyNuspec);
 
         Assert.NotEqual(0, outcome.Result.ExitCode);
         Assert.Contains(
-            "divergent provenance for this caller SHA",
+            "no authenticated provenance for this caller SHA",
             outcome.Result.StandardError,
             StringComparison.Ordinal);
-        // A readable but foreign package is terminal; it is never retried.
-        Assert.Empty(outcome.SleepLog.Trim());
+        Assert.DoesNotContain("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Push_DuplicateSkipThenNeverReadable_FailsClosedAfterBoundedAttempts()
+    public void Precheck_RepositorySignedDifferentBytesWithMatchingMetadata_IsAccepted()
     {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, nupkgStatuses: "404", nuspec: MatchingNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "Could not read back the published public package for 1.0.14 after 6 attempts; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-
-        // Six attempts with two seconds between yield exactly five bounded sleeps.
-        var delays = outcome.SleepLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.Equal(5, delays.Length);
-        Assert.All(delays, delay => Assert.Equal("2", delay));
-
-        // Publisher failure leaves the tag job unsatisfied, so no tag is created.
-        AssertTagJobRequiresPublisherSuccess();
-    }
-
-    [Fact]
-    public void Push_SuccessThenNeverReadable_FailsClosedAndLeavesTagJobUnsatisfied()
-    {
-        using var repository = new TempRepository();
-
-        // A real (non-duplicate) push also must not report success without readback.
-        var outcome = RunPublish(repository, nupkgStatuses: "404", nuspec: MatchingNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Equal(5, outcome.SleepLog.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length);
-        AssertTagJobRequiresPublisherSuccess();
-    }
-
-    [Fact]
-    public void Push_NonDuplicateError_FailsBeforeAnyReadback()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: MatchingNuspec, dotnetExit: 2);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Empty(outcome.SleepLog.Trim());
-        Assert.DoesNotContain(".nupkg", outcome.CurlLog, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Push_MissingOrMalformedProvenance_FailsClosed()
-    {
-        foreach (var nuspec in new[] { MissingProvenanceNuspec, MalformedNuspec })
-        {
-            using var repository = new TempRepository();
-
-            var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: nuspec);
-
-            Assert.NotEqual(0, outcome.Result.ExitCode);
-            Assert.Contains(
-                "missing or malformed provenance; failing closed",
-                outcome.Result.StandardError,
-                StringComparison.Ordinal);
-            Assert.Empty(outcome.SleepLog.Trim());
-        }
-    }
-
-    [Fact]
-    public void Precheck_ForgedMatchingCommitButDifferentDigest_FailsClosed()
-    {
-        // A package-controlled nuspec may forge the exact caller commit, but the
-        // downloaded bytes differ from the locally prepared artifact, so the digest
-        // gate refuses to accept it or authorize a recovery tag.
+        // NuGet.org repository-signs the stored archive, so differing bytes still prove recovery by matching metadata.
         using var repository = new TempRepository();
 
         var outcome = RunPrecheck(
@@ -216,37 +139,11 @@ public sealed class PublicPublisherRecoveryTests
             versionPresent: true,
             nupkgStatus: "200",
             nuspec: MatchingNuspec,
-            localBody: "locally-prepared-bytes",
-            downloadedBody: "attacker-forged-nupkg-bytes");
+            localBody: "prepared-artifact-bytes",
+            downloadedBody: "repository-signed-stored-bytes");
 
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The existing public package version is not byte-identical to the exact prepared artifact; failing closed instead of publishing or creating a recovery tag.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Push_ForgedMatchingCommitButDifferentDigest_FailsClosedImmediately()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(
-            repository,
-            nupkgStatuses: "200",
-            nuspec: MatchingNuspec,
-            localBody: "locally-prepared-bytes",
-            downloadedBody: "attacker-forged-nupkg-bytes");
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The published public package is not byte-identical to the exact prepared artifact; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.Contains("--skip-duplicate", outcome.DotnetLog, StringComparison.Ordinal);
-        // A readable but digest-divergent package is terminal; it is never retried.
-        Assert.Empty(outcome.SleepLog.Trim());
+        Assert.True(outcome.Result.ExitCode == 0, outcome.Result.StandardError);
+        Assert.Contains("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -328,13 +225,171 @@ public sealed class PublicPublisherRecoveryTests
             StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("201")]
+    [InlineData("202")]
+    public void Push_AcceptedStatus_SucceedsWithoutReadback(string pushStatus)
+    {
+        // A new package is accepted on the push's own structured status, so no propagation readback is incurred.
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, pushStatus, nupkgStatuses: "404", nuspec: MatchingNuspec);
+
+        Assert.Equal(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "NuGet.org accepted public package 1.0.14.",
+            outcome.Result.StandardOutput,
+            StringComparison.Ordinal);
+        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
+        Assert.Empty(outcome.SleepLog.Trim());
+    }
+
     [Fact]
-    public void Push_MultipleNuspecEntries_FailsClosedImmediately()
+    public void Push_DuplicateThenDelayedMatchingReadback_Succeeds()
+    {
+        using var repository = new TempRepository();
+
+        // The push answers 409, and flat-container reads return 404 twice before the package is readable.
+        var outcome = RunPublish(repository, "409", nupkgStatuses: "404 404 200", nuspec: MatchingNuspec);
+
+        Assert.Equal(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "NuGet.org already has public package 1.0.14; reconciling the existing package provenance.",
+            outcome.Result.StandardOutput,
+            StringComparison.Ordinal);
+        Assert.Equal(3, ReadbackAttempts(outcome.CurlLog));
+        Assert.Equal("10\n10", outcome.SleepLog.Trim());
+        Assert.Contains(
+            "Verified published public package 1.0.14 provenance on readback attempt 3.",
+            outcome.Result.StandardOutput,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Push_DuplicateRepositorySignedDifferentBytesWithMatchingMetadata_Succeeds()
+    {
+        // The stored duplicate is repository-signed and differs from the prepared artifact, but matching metadata still proves this caller SHA.
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(
+            repository,
+            "409",
+            nupkgStatuses: "200",
+            nuspec: MatchingNuspec,
+            localBody: "prepared-artifact-bytes",
+            downloadedBody: "repository-signed-stored-bytes");
+
+        Assert.Equal(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "Verified published public package 1.0.14 provenance on readback attempt 1.",
+            outcome.Result.StandardOutput,
+            StringComparison.Ordinal);
+        Assert.Empty(outcome.SleepLog.Trim());
+    }
+
+    [Fact]
+    public void Push_DuplicateThenDivergentProvenance_FailsClosedImmediately()
+    {
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: DivergentNuspec);
+
+        Assert.NotEqual(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "divergent provenance for this caller SHA",
+            outcome.Result.StandardError,
+            StringComparison.Ordinal);
+        // A readable but foreign package is terminal; it is never retried.
+        Assert.Empty(outcome.SleepLog.Trim());
+        Assert.Equal(1, ReadbackAttempts(outcome.CurlLog));
+    }
+
+    [Fact]
+    public void Push_DuplicateThenNeverReadable_FailsClosedAfterBoundedAttempts()
+    {
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, "409", nupkgStatuses: "404", nuspec: MatchingNuspec);
+
+        Assert.NotEqual(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "Could not read back the published public package for 1.0.14 after 13 attempts; failing closed.",
+            outcome.Result.StandardError,
+            StringComparison.Ordinal);
+
+        // Thirteen attempts with ten seconds between yield exactly twelve bounded sleeps and a 120-second ceiling.
+        var delays = outcome.SleepLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(12, delays.Length);
+        Assert.All(delays, delay => Assert.Equal("10", delay));
+        Assert.Equal(13, ReadbackAttempts(outcome.CurlLog));
+
+        // Publisher failure leaves the tag job unsatisfied, so no tag is created.
+        AssertTagJobRequiresPublisherSuccess();
+    }
+
+    [Theory]
+    [InlineData("400")]
+    [InlineData("403")]
+    [InlineData("500")]
+    public void Push_OtherStatus_FailsBeforeAnyReadback(string pushStatus)
+    {
+        // Only a duplicate 409 may continue to provenance reconciliation.
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, pushStatus, nupkgStatuses: "200", nuspec: MatchingNuspec);
+
+        Assert.NotEqual(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            $"NuGet.org returned HTTP {pushStatus} for the push; failing closed.",
+            outcome.Result.StandardError,
+            StringComparison.Ordinal);
+        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
+        Assert.Empty(outcome.SleepLog.Trim());
+    }
+
+    [Fact]
+    public void Push_TransportFailure_FailsBeforeAnyReadback()
+    {
+        // A transport failure never yields a structured status, so it fails closed.
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, "000", nupkgStatuses: "200", nuspec: MatchingNuspec);
+
+        Assert.NotEqual(0, outcome.Result.ExitCode);
+        Assert.Contains(
+            "Could not reach the NuGet.org package-publish endpoint.",
+            outcome.Result.StandardError,
+            StringComparison.Ordinal);
+        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
+        Assert.Empty(outcome.SleepLog.Trim());
+    }
+
+    [Fact]
+    public void Push_DuplicateMissingOrMalformedProvenance_FailsClosed()
+    {
+        foreach (var nuspec in new[] { MissingProvenanceNuspec, MalformedNuspec })
+        {
+            using var repository = new TempRepository();
+
+            var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: nuspec);
+
+            Assert.NotEqual(0, outcome.Result.ExitCode);
+            Assert.Contains(
+                "missing or malformed provenance; failing closed",
+                outcome.Result.StandardError,
+                StringComparison.Ordinal);
+            Assert.Empty(outcome.SleepLog.Trim());
+        }
+    }
+
+    [Fact]
+    public void Push_DuplicateMultipleNuspecEntries_FailsClosedImmediately()
     {
         using var repository = new TempRepository();
 
         var outcome = RunPublish(
             repository,
+            "409",
             nupkgStatuses: "200",
             nuspec: MatchingNuspec,
             nuspecEntries: ExpectedNuspecName + "\ndecoy.nuspec");
@@ -348,11 +403,11 @@ public sealed class PublicPublisherRecoveryTests
     }
 
     [Fact]
-    public void Push_PackageIdMismatch_FailsClosedImmediately()
+    public void Push_DuplicatePackageIdMismatch_FailsClosedImmediately()
     {
         using var repository = new TempRepository();
 
-        var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: WrongIdNuspec);
+        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: WrongIdNuspec);
 
         Assert.NotEqual(0, outcome.Result.ExitCode);
         Assert.Contains(
@@ -363,12 +418,13 @@ public sealed class PublicPublisherRecoveryTests
     }
 
     [Fact]
-    public void Push_UnexpectedNuspecName_FailsClosedImmediately()
+    public void Push_DuplicateUnexpectedNuspecName_FailsClosedImmediately()
     {
         using var repository = new TempRepository();
 
         var outcome = RunPublish(
             repository,
+            "409",
             nupkgStatuses: "200",
             nuspec: MatchingNuspec,
             nuspecEntries: "decoy.nuspec");
@@ -379,7 +435,6 @@ public sealed class PublicPublisherRecoveryTests
             "The published public package nuspec is not the expected package nuspec; failing closed.",
             outcome.Result.StandardError,
             StringComparison.Ordinal);
-        Assert.Contains("--skip-duplicate", outcome.DotnetLog, StringComparison.Ordinal);
         Assert.DoesNotContain(
             "Verified published public package",
             outcome.Result.StandardOutput,
@@ -390,11 +445,11 @@ public sealed class PublicPublisherRecoveryTests
     }
 
     [Fact]
-    public void Push_PackageVersionMismatch_FailsClosedImmediately()
+    public void Push_DuplicatePackageVersionMismatch_FailsClosedImmediately()
     {
         using var repository = new TempRepository();
 
-        var outcome = RunPublish(repository, nupkgStatuses: "200", nuspec: WrongVersionNuspec);
+        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: WrongVersionNuspec);
 
         // A readable duplicate with a mismatched declared version is terminal; it is never retried.
         Assert.NotEqual(0, outcome.Result.ExitCode);
@@ -402,7 +457,6 @@ public sealed class PublicPublisherRecoveryTests
             "The published public package nuspec version does not match the expected package version; failing closed.",
             outcome.Result.StandardError,
             StringComparison.Ordinal);
-        Assert.Contains("--skip-duplicate", outcome.DotnetLog, StringComparison.Ordinal);
         Assert.DoesNotContain(
             "Verified published public package",
             outcome.Result.StandardOutput,
@@ -439,23 +493,21 @@ public sealed class PublicPublisherRecoveryTests
         ShellResult Result,
         string GithubOutput,
         string SleepLog,
-        string DotnetLog,
         string CurlLog);
 
     private sealed record PrecheckOutcome(ShellResult Result, string GithubOutput);
 
     private static PublishOutcome RunPublish(
         TempRepository repository,
+        string pushStatus,
         string nupkgStatuses,
         string nuspec,
-        int dotnetExit = 0,
         string? localBody = null,
         string? downloadedBody = null,
         string? nuspecEntries = null)
     {
         var githubOutput = repository.WriteFile("github-output.txt", string.Empty);
         var sleepLog = repository.WriteFile("sleep.log", string.Empty);
-        var dotnetLog = repository.WriteFile("dotnet.log", string.Empty);
         var curlLog = repository.WriteFile("curl.log", string.Empty);
         repository.WriteFile(ArtifactRelativePath, localBody ?? LocalArtifactBody);
 
@@ -467,16 +519,16 @@ public sealed class PublicPublisherRecoveryTests
             ["PACKAGE_ARTIFACT"] = ArtifactRelativePath,
             ["GITHUB_SHA"] = CurrentSha,
             ["GITHUB_OUTPUT"] = githubOutput,
+            ["GITHUB_ACTION_PATH"] = PublicActionPath(),
             ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "id-token-request-token",
             ["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://pipelines.example/oidc?api-version=2.0",
+            ["STUB_PUSH_STATUS"] = pushStatus,
             ["STUB_NUPKG_STATUSES"] = nupkgStatuses,
             ["STUB_NUSPEC"] = nuspec,
             ["STUB_NUPKG_BODY"] = downloadedBody ?? (localBody ?? LocalArtifactBody),
             ["STUB_NUSPEC_ENTRIES"] = nuspecEntries ?? ExpectedNuspecName,
             ["STUB_NUPKG_COUNTER"] = repository.AbsolutePath("nupkg-counter.txt"),
             ["STUB_SLEEP_LOG"] = sleepLog,
-            ["STUB_DOTNET_LOG"] = dotnetLog,
-            ["STUB_DOTNET_EXIT"] = dotnetExit.ToString(CultureInfo.InvariantCulture),
             ["STUB_CURL_LOG"] = curlLog,
         };
 
@@ -485,7 +537,6 @@ public sealed class PublicPublisherRecoveryTests
             result,
             File.ReadAllText(githubOutput),
             File.ReadAllText(sleepLog),
-            File.ReadAllText(dotnetLog),
             File.ReadAllText(curlLog));
     }
 
@@ -509,6 +560,7 @@ public sealed class PublicPublisherRecoveryTests
             ["PACKAGE_ARTIFACT"] = ArtifactRelativePath,
             ["GITHUB_SHA"] = CurrentSha,
             ["GITHUB_OUTPUT"] = githubOutput,
+            ["GITHUB_ACTION_PATH"] = PublicActionPath(),
             ["STUB_INDEX_STATUS"] = indexStatus,
             ["STUB_NUPKG_STATUS"] = nupkgStatus,
             ["STUB_NUSPEC"] = nuspec,
@@ -541,7 +593,7 @@ public sealed class PublicPublisherRecoveryTests
               while (( $# )); do
                 case "$1" in
                   --output) output=$2; shift 2 ;;
-                  --write-out|--request|--data|--header) shift 2 ;;
+                  --write-out|--request|--data|--header|--form|--connect-timeout|--max-time) shift 2 ;;
                   --fail|--silent|--show-error|--location) shift ;;
                   *) url=$1; shift ;;
                 esac
@@ -550,6 +602,12 @@ public sealed class PublicPublisherRecoveryTests
               case "$url" in
                 *audience=*) printf '%s' '{"value":"oidc-token"}'; return 0 ;;
                 https://www.nuget.org/api/v2/token) printf '%s' '{"apiKey":"nuget-api-key"}'; return 0 ;;
+                https://www.nuget.org/api/v2/package)
+                  [[ -n "$output" ]] && printf '%s' "${STUB_PUSH_BODY:-}" > "$output"
+                  if [[ "${STUB_PUSH_STATUS:-201}" == "000" ]]; then return 7; fi
+                  printf '%s' "${STUB_PUSH_STATUS:-201}"
+                  return 0
+                  ;;
                 *.nupkg)
                   local count=0
                   if [[ -f "$STUB_NUPKG_COUNTER" ]]; then count=$(cat "$STUB_NUPKG_COUNTER"); fi
@@ -575,14 +633,11 @@ public sealed class PublicPublisherRecoveryTests
                 *) printf '%s' '{}' ;;
               esac
             }
-            dotnet() {
-              printf '%s\n' "$*" >> "$STUB_DOTNET_LOG"
-              return "${STUB_DOTNET_EXIT:-0}"
-            }
             unzip() {
               if [[ "$1" == "-Z1" ]]; then printf '%s\n' "${STUB_NUSPEC_ENTRIES:-Gizmo.Widget.nuspec}"; return 0; fi
               printf '%s' "${STUB_NUSPEC:-}"
             }
+            {{WorkflowShell.PythonBashFunction()}}
             sleep() { printf '%s\n' "$1" >> "$STUB_SLEEP_LOG"; }
             {{run}}
             """;
@@ -600,7 +655,7 @@ public sealed class PublicPublisherRecoveryTests
               while (( $# )); do
                 case "$1" in
                   --output) output=$2; shift 2 ;;
-                  --write-out) shift 2 ;;
+                  --write-out|--connect-timeout|--max-time|--header) shift 2 ;;
                   --silent|--show-error|--location) shift ;;
                   *) url=$1; shift ;;
                 esac
@@ -629,6 +684,7 @@ public sealed class PublicPublisherRecoveryTests
               if [[ "$1" == "-Z1" ]]; then printf '%s\n' "${STUB_NUSPEC_ENTRIES:-Gizmo.Widget.nuspec}"; return 0; fi
               printf '%s' "${STUB_NUSPEC:-}"
             }
+            {{WorkflowShell.PythonBashFunction()}}
             {{block}}
             """;
     }

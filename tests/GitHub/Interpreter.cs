@@ -3,15 +3,11 @@ using Gizmo.Infra.Tests.TestSupport;
 namespace Gizmo.Infra.Tests.GitHub;
 
 /// <summary>
-/// Fails when an inline interpreter program reappears in a production composite
-/// action, its checked-in modules, or the executable test helpers. Inline programs
-/// are opaque to review and to endpoint scanning, so the contract requires named
-/// checked-in modules instead.
+/// Fails when an inline interpreter program reappears in a production composite action, its checked-in modules, or the executable test helpers; inline programs are opaque to review and endpoint scanning, so a named module is required instead.
 /// </summary>
-public sealed class InlineNodeContractTests
+public sealed class InlineInterpreterContractTests
 {
-    // Production action YAML plus its checked-in modules, and the test helpers and
-    // fixtures that stand in for a runner environment.
+    // Production action YAML plus its modules, and the test helpers that stand in for a runner.
     private static readonly string[] ScanRoots =
     [
         Path.Combine(".github", "actions"),
@@ -19,8 +15,16 @@ public sealed class InlineNodeContractTests
         Path.Combine("tests", "GitHub", "fixtures"),
     ];
 
-    // The short and long forms select the same inline-program execution mode.
-    private static readonly string[] ForbiddenTokens = ["node -e", "node --eval"];
+    // Inline evaluation and heredoc forms execute an opaque anonymous program, so a named module is required.
+    private static readonly string[] ForbiddenTokens =
+    [
+        "node -e",
+        "node --eval",
+        "python -c",
+        "python3 -c",
+        "python - <<",
+        "python3 - <<",
+    ];
 
     [Fact]
     public void NoProductionActionModuleOrTestHelper_EmbedsAnInlineInterpreterProgram()

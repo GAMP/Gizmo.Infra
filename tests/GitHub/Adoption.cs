@@ -65,7 +65,15 @@ public sealed class PackageBootstrapAdoptionContractTests
             {
                 var run = RunProvenanceGuard(actionDirectory, nuspec, CurrentSha);
                 Assert.NotEqual(0, run.Result.ExitCode);
-                Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+                if (actionDirectory == "public")
+                {
+                    // The action maps the parser's non-ok verdict to the message pinned above.
+                    Assert.NotEqual("ok", run.Result.StandardOutput);
+                }
+                else
+                {
+                    Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+                }
             }
         }
         ExistingPackageWithMalformedRepositoryCommitProvenance_FailsClosed();
@@ -78,7 +86,7 @@ public sealed class PackageBootstrapAdoptionContractTests
         {
             var run = RunProvenanceGuard("public", Nuspec(commit), CurrentSha);
             Assert.NotEqual(0, run.Result.ExitCode);
-            Assert.Contains(ProvenanceFailure, run.Result.StandardError, StringComparison.Ordinal);
+            Assert.NotEqual("ok", run.Result.StandardOutput);
         }
     }
 
@@ -415,6 +423,22 @@ public sealed class PackageBootstrapAdoptionContractTests
     /// </summary>
     private static ProvenanceRun RunProvenanceGuard(string actionDirectory, string nuspec, string githubSha)
     {
+        // The public publisher delegates nuspec parsing to the checked-in module; private stays inline.
+        if (actionDirectory == "public")
+        {
+            var parsed = WorkflowShell.RunPythonScript(
+                PublicProvenanceScriptPath(),
+                nuspec,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["EXPECTED_PACKAGE_ID"] = "Gizmo.Widget",
+                    ["PACKAGE_VERSION"] = "3.0.0",
+                    ["GITHUB_SHA"] = githubSha,
+                });
+            var parsedCommit = parsed.ExitCode == 0 ? githubSha.ToLowerInvariant() : string.Empty;
+            return new ProvenanceRun(parsed, parsedCommit);
+        }
+
         var guard = WorkflowShell.ExtractBlock(
             WorkflowShell.ReadAction(actionDirectory),
             "nuspec=$(unzip",
@@ -441,6 +465,14 @@ public sealed class PackageBootstrapAdoptionContractTests
         var commit = outputs.TryGetValue("repository_commit", out var value) ? value : string.Empty;
         return new ProvenanceRun(result, commit);
     }
+
+    private static string PublicProvenanceScriptPath() => Path.Combine(
+        InfraRepositoryLocator.ResolveRoot(),
+        ".github",
+        "actions",
+        "public",
+        "scripts",
+        "nuspec_provenance.py");
 
     private static void AssertNoLegacyTokens(string content)
     {

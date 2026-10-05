@@ -32,6 +32,9 @@ public sealed class CallerOwnedPublishingActionContractTests
     private static string ReadPrivatePublisherValidator() => File.ReadAllText(
         Path.Combine(ActionsRoot(), "private", "scripts", "validate.mjs"));
 
+    private static string ReadPublicPublisherProvenanceValidator() => File.ReadAllText(
+        Path.Combine(ActionsRoot(), "public", "scripts", "nuspec_provenance.py"));
+
     [Fact]
     public void DeclaredActions_AreExactlyThePreflightPublishersAndTag()
     {
@@ -94,10 +97,11 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN", content, StringComparison.Ordinal);
         Assert.Contains("audience=https%3A%2F%2Fwww.nuget.org", content, StringComparison.Ordinal);
         Assert.Contains("https://www.nuget.org/api/v2/token", content, StringComparison.Ordinal);
-        Assert.Contains("dotnet nuget push", content, StringComparison.Ordinal);
+        Assert.Contains("--request PUT", content, StringComparison.Ordinal);
+        Assert.Contains("X-NuGet-ApiKey: $nuget_api_key", content, StringComparison.Ordinal);
         Assert.Contains("Calculated package state drifted before publication", content, StringComparison.Ordinal);
         Assert.Contains("::add-mask::", content, StringComparison.Ordinal);
-        Assert.Contains(@"--api-key ""$nuget_api_key""", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("dotnet nuget push", content, StringComparison.Ordinal);
         Assert.DoesNotContain("NUGET_API_KEY", content, StringComparison.Ordinal);
         Assert.DoesNotContain("secrets:", content, StringComparison.Ordinal);
 
@@ -112,17 +116,44 @@ public sealed class CallerOwnedPublishingActionContractTests
     }
 
     [Fact]
-    public void PublicPublisher_DefersSuccessUntilBoundedProvenanceReadback()
+    public void PublicPublisher_DiscriminatesDuplicateByStructuredStatusAndBoundsReadback()
     {
         var content = Read("public");
 
-        // The precheck can miss a package that NuGet.org has not yet indexed, so a duplicate push must continue to the exact readback instead of failing.
-        Assert.Contains("--skip-duplicate", content, StringComparison.Ordinal);
+        // A new package is accepted on 2xx and needs no readback; only a duplicate 409 continues.
+        Assert.Contains("2*) echo \"NuGet.org accepted public package $PACKAGE_VERSION.\"; exit 0 ;;", content, StringComparison.Ordinal);
+        Assert.Contains("409) echo \"NuGet.org already has public package $PACKAGE_VERSION; reconciling the existing package provenance.\" ;;", content, StringComparison.Ordinal);
+        Assert.Contains("*) echo \"NuGet.org returned HTTP $push_status for the push; failing closed.\" >&2; exit 1 ;;", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("--skip-duplicate", content, StringComparison.Ordinal);
 
-        // The finite polling policy is centralized in the publish step.
-        Assert.Contains("readback_attempts=6", content, StringComparison.Ordinal);
-        Assert.Contains("readback_interval_seconds=2", content, StringComparison.Ordinal);
-        Assert.Contains("readback_max_delay_seconds=10", content, StringComparison.Ordinal);
+        // Every request carries explicit connect/total budgets; the key-bearing PUT never follows a redirect.
+        var pushLine = content.Split('\n').Single(line => line.Contains("--request PUT", StringComparison.Ordinal));
+        Assert.Contains("--connect-timeout 10 --max-time 60", pushLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("--location", pushLine, StringComparison.Ordinal);
+        var boundedReads = Regex.Matches(
+            content,
+            Regex.Escape("--location --connect-timeout 5 --max-time 15")).Count;
+        Assert.Equal(3, boundedReads); // precheck index, precheck package, duplicate readback
+        Assert.Contains(
+            "--connect-timeout 5 --max-time 15 --header \"Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains("--connect-timeout 5 --max-time 15 --request POST", content, StringComparison.Ordinal);
+
+        // The untrusted nuspec is parsed by the checked-in structural module, not a regex.
+        Assert.Contains(
+            "python3 \"$GITHUB_ACTION_PATH/scripts/nuspec_provenance.py\"",
+            content,
+            StringComparison.Ordinal);
+        Assert.Equal(
+            2,
+            Regex.Matches(content, Regex.Escape("scripts/nuspec_provenance.py")).Count);
+        Assert.DoesNotContain("grep -oE 'commit=", content, StringComparison.Ordinal);
+
+        // The finite duplicate readback policy is centralized in the publish step.
+        Assert.Contains("readback_attempts=13", content, StringComparison.Ordinal);
+        Assert.Contains("readback_interval_seconds=10", content, StringComparison.Ordinal);
+        Assert.Contains("readback_max_delay_seconds=120", content, StringComparison.Ordinal);
         Assert.Contains(
             "package_download_url=\"https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg\"",
             content,
@@ -142,14 +173,14 @@ public sealed class CallerOwnedPublishingActionContractTests
             content,
             StringComparison.Ordinal);
 
-        // The publisher reports success only after the push and the readback verification.
-        var pushIndex = content.IndexOf("dotnet nuget push", StringComparison.Ordinal);
+        // The readback runs only after a duplicate status; an accepted push exits before it.
+        var pushStatusIndex = content.IndexOf("push_status=$(curl", StringComparison.Ordinal);
+        var duplicateIndex = content.IndexOf("409) echo", StringComparison.Ordinal);
         var readbackIndex = content.IndexOf("Readback attempt", StringComparison.Ordinal);
-        var verifyIndex = content.IndexOf("Verified published public package", StringComparison.Ordinal);
-        Assert.True(pushIndex >= 0 && readbackIndex > pushIndex && verifyIndex > readbackIndex);
+        Assert.True(pushStatusIndex >= 0 && duplicateIndex > pushStatusIndex && readbackIndex > duplicateIndex);
 
         // The private publisher's immediate push is unchanged.
-        Assert.DoesNotContain("--skip-duplicate", Read("private"), StringComparison.Ordinal);
+        Assert.DoesNotContain("readback_attempts", Read("private"), StringComparison.Ordinal);
     }
 
     private void PrivatePublisher_UsesCallerTokenWithoutOidcAndRejectsNonPrivateVisibility()
@@ -328,36 +359,36 @@ public sealed class CallerOwnedPublishingActionContractTests
             Assert.Contains("Could not resolve an annotated package tag during publication recheck.", content, StringComparison.Ordinal);
 
             // The existing version must carry the caller commit, and a matching version short-circuits the push.
-            Assert.Contains(provenanceComparison, content, StringComparison.Ordinal);
             Assert.Contains("no authenticated provenance for this caller SHA", content, StringComparison.Ordinal);
             Assert.Contains("package-state=published", content, StringComparison.Ordinal);
             Assert.Contains("package-state=unpublished", content, StringComparison.Ordinal);
             Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", content, StringComparison.Ordinal);
 
-            // A version collision with matching provenance is success, so the published signal is emitted after the comparison.
-            var comparisonIndex = content.IndexOf("repository_commit", StringComparison.Ordinal);
-            var publishedIndex = content.IndexOf("package-state=published", StringComparison.Ordinal);
-            Assert.True(comparisonIndex >= 0 && publishedIndex > comparisonIndex);
-
             if (directory == "public")
             {
-                PublicPublisher_RequiresExactArtifactDigestAndExpectedNuspecBeforeAcceptingProvenance(content);
+                // The published signal is emitted only after the structural parse succeeds.
+                PublicPublisher_RequiresStructuralNuspecProvenance(content);
             }
             else
             {
+                // The private path is unchanged: broad commit extraction immediately before the published signal.
+                Assert.Contains(provenanceComparison, content, StringComparison.Ordinal);
                 Assert.Contains("nuspec=$(unzip -p \"$package_file\" '*.nuspec' 2>/dev/null || true)", content, StringComparison.Ordinal);
+                var comparisonIndex = content.IndexOf("repository_commit", StringComparison.Ordinal);
+                var publishedIndex = content.IndexOf("package-state=published", StringComparison.Ordinal);
+                Assert.True(comparisonIndex >= 0 && publishedIndex > comparisonIndex);
             }
         }
     }
 
-    private static void PublicPublisher_RequiresExactArtifactDigestAndExpectedNuspecBeforeAcceptingProvenance(string content)
+    private static void PublicPublisher_RequiresStructuralNuspecProvenance(string content)
     {
-        // The public publisher must prove the downloaded package is byte-identical
-        // to the exact prepared artifact and read provenance only from the single
-        // expected nuspec, never an archive-wide decoy match.
-        Assert.Contains("sha256sum < \"$PACKAGE_ARTIFACT\"", content, StringComparison.Ordinal);
-        Assert.Contains("sha256sum < \"$package_file\"", content, StringComparison.Ordinal);
-        Assert.Contains("not byte-identical to the exact prepared artifact", content, StringComparison.Ordinal);
+        // NuGet.org repository-signs the stored archive, so bytes are not compared; the untrusted nuspec is parsed structurally.
+        Assert.DoesNotContain("sha256sum < \"$package_file\"", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("sha256sum < \"$PACKAGE_ARTIFACT\"", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("byte-identical", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("grep -oE 'commit=", content, StringComparison.Ordinal);
+
         Assert.Contains(
             @"nuspec_entries=$(unzip -Z1 ""$package_file"" 2>/dev/null | grep -i '\.nuspec$' || true)",
             content,
@@ -366,13 +397,31 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("does not contain exactly one nuspec", content, StringComparison.Ordinal);
         Assert.Contains("nuspec_name=$(printf '%s\\n' \"$nuspec_entries\" | grep '[^[:space:]]')", content, StringComparison.Ordinal);
         Assert.Contains("nuspec is not the expected package nuspec", content, StringComparison.Ordinal);
-        Assert.Contains("nuspec ID does not match the expected package ID", content, StringComparison.Ordinal);
-        Assert.Contains("nuspec version does not match the expected package version", content, StringComparison.Ordinal);
         Assert.Contains("nuspec=$(unzip -p \"$package_file\" \"$nuspec_name\" 2>/dev/null || true)", content, StringComparison.Ordinal);
 
-        // Both the precheck and the readback must apply the digest gate.
-        var digestChecks = Regex.Matches(content, Regex.Escape("sha256sum < \"$package_file\"")).Count;
-        Assert.Equal(2, digestChecks);
+        // Both the precheck and the duplicate readback delegate to the same structural module.
+        var invocation = "python3 \"$GITHUB_ACTION_PATH/scripts/nuspec_provenance.py\"";
+        Assert.Contains("| " + invocation, content, StringComparison.Ordinal);
+        Assert.Equal(2, Regex.Matches(content, Regex.Escape(invocation)).Count);
+        Assert.Contains("The existing public package version nuspec ID does not match the expected package ID", content, StringComparison.Ordinal);
+        Assert.Contains("The published public package nuspec ID does not match the expected package ID", content, StringComparison.Ordinal);
+
+        // The published signal is emitted only after the structural parse succeeds.
+        var parseIndex = content.IndexOf("scripts/nuspec_provenance.py", StringComparison.Ordinal);
+        var publishedIndex = content.IndexOf("package-state=published", StringComparison.Ordinal);
+        Assert.True(parseIndex >= 0 && publishedIndex > parseIndex);
+
+        // The module must be namespace-aware, structural, and DTD/entity-hostile.
+        var module = ReadPublicPublisherProvenanceValidator();
+        Assert.Contains("xml.parsers.expat", module, StringComparison.Ordinal);
+        Assert.Contains("XML_PARAM_ENTITY_PARSING_NEVER", module, StringComparison.Ordinal);
+        Assert.Contains("StartDoctypeDeclHandler", module, StringComparison.Ordinal);
+        Assert.Contains("EntityDeclHandler", module, StringComparison.Ordinal);
+        Assert.Contains("ExternalEntityRefHandler", module, StringComparison.Ordinal);
+        Assert.Contains("_NUSPEC_NAMESPACE", module, StringComparison.Ordinal);
+        Assert.Contains("_sole_child", module, StringComparison.Ordinal);
+        Assert.Contains("casefold", module, StringComparison.Ordinal);
+        Assert.Contains("GITHUB_SHA", module, StringComparison.Ordinal);
     }
 
     private void Publishers_UseTheExactArtifactAndNeverRebuild()

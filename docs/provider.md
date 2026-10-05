@@ -128,15 +128,30 @@ package tag state under the exact `<package-id>/` prefix, rechecks the
 calculated-state and tag-state fingerprint, and only then contacts its feed. A
 version that already exists with the caller SHA embedded as provenance is
 treated as an already-published success so the immutable release tag can be
-reconciled; a version that exists without matching provenance fails closed. The
-public publisher additionally proves the downloaded published package is
-byte-identical (SHA-256) to the exact prepared artifact and reads provenance
-only from the single expected nuspec, whose package ID and version must match
-the calculated values; a digest mismatch, a decoy or unexpected nuspec, multiple
-nuspecs, or a metadata mismatch fails closed before any tag can be reconciled.
-The public publisher rejects any visibility other than `public`, and the private
-publisher rejects any visibility other than `private`, so internal visibility
-cannot be silently routed by a caller mistake.
+reconciled; a version that exists without matching provenance fails closed.
+
+The public publisher pushes the prepared `.nupkg` to the NuGet.org
+`PackagePublish/2.0.0` resource (`PUT https://www.nuget.org/api/v2/package`,
+multipart body, authenticated by the short-lived OIDC-derived API key in the
+`X-NuGet-ApiKey` header) and selects its path only from the structured HTTP
+status: any `2xx` acceptance succeeds immediately with no readback, `409` means
+the exact package ID and version already exists and continues to a bounded
+provenance readback, and every other status fails closed. NuGet.org
+repository-signs stored archives, so the stored package is not required to be
+byte-identical to the prepared artifact and no artifact digest is compared. The
+untrusted nuspec is parsed structurally and namespace-aware by the checked-in
+provenance script, which requires exactly one namespaced `package`, `metadata`,
+`id`, `version`, and `repository` with a single `commit` attribute and rejects
+malformed XML, DTDs and entities, duplicate or decoy elements, and non-nuspec
+namespaces. A duplicate is accepted only when the sole nuspec's package ID and
+version match the calculated values and its full 40-character `RepositoryCommit`
+equals the caller SHA; multiple nuspec entries, a decoy or unexpected nuspec
+name, or any provenance mismatch fails closed before any tag can be reconciled.
+The publish and readback requests carry explicit connect and total time budgets,
+and the key-bearing `PUT` never follows a redirect. The public publisher rejects
+any visibility other than `public`, and the private publisher rejects any
+visibility other than `private`, so internal visibility cannot be silently
+routed by a caller mistake.
 
 ## Automatic versioning
 
@@ -306,6 +321,16 @@ production `push` workflow run rather than a new manually dispatched run: the
 re-run keeps the pushed caller commit and immutable tag state, so the publisher
 treats the matching package as already published and the tag job reconciles the
 release tag.
+
+The public publisher's duplicate readback is deterministic and finite: it issues
+at most 13 flat-container `GET` requests spaced 10 seconds apart, with a
+120-second total-delay cap. Every readback `GET` carries a 5-second connect and
+15-second total budget, and the push `PUT` carries a 10-second connect and
+60-second total budget, so an unresponsive feed cannot hang the step. A readable
+package is validated immediately; a not-yet-indexed package is retried until the
+request or delay budget is exhausted and then fails closed. A new package
+accepted on the push `2xx` status performs no readback, and the readback runs
+only after a `409` duplicate.
 
 All action references are pinned to full commit SHAs, checkout credentials are
 disabled, and caller-supplied strings enter shell commands only through quoted
