@@ -337,13 +337,42 @@ All action references are pinned to full commit SHAs, checkout credentials are
 disabled, and caller-supplied strings enter shell commands only through quoted
 environment variables.
 
-## Consumer development ranges
+## Consumer floating-version behavior
 
-Consumer Central Package Management may explicitly opt into the floating
-development range `<major>.<minor>.*-dev.*` when it intentionally tracks the latest
-development build for one compatibility line. Exact development versions remain
-the safer default. This is consumer documentation only: Gizmo.Infra does not
-migrate consumers or enable CPM floating-version behavior.
+Consumers may opt into NuGet floating versions when they intentionally want
+automatic package advancement. This behavior is owned by NuGet resolution, not
+by Gizmo.Infra, so callers must choose a range whose semantics match the intended
+channel.
+
+The Gizmo.Shared 1.0 pilot verified the following behavior against NuGet.org with
+clean isolated restores:
+
+| PackageReference version | Observed behavior |
+| --- | --- |
+| `1.0.16-dev.*` | Resolved `1.0.16-dev.18`, then advanced to `1.0.16-dev.21` without changing the reference while no stable `1.0.16` existed. |
+| `1.0.16-*` | Also resolved `1.0.16-dev.18`, then advanced to `1.0.16-dev.21`. |
+| `1.0.15-dev.*` | Resolved stable `1.0.15` once that matching stable version existed. |
+| `1.0.14-dev.*` | Resolved stable `1.0.14` even though matching development versions existed. |
+| `1.0.*` | Resolved the latest stable patch, `1.0.15`, and did not select `1.0.16-dev.*`. |
+
+Therefore `<major>.<minor>.<patch>-dev.*` is suitable for following the newest
+development build for a specific next patch only while the matching stable
+`<major>.<minor>.<patch>` does not exist. It is not a permanent dev-only
+channel: after the matching stable version is published, NuGet may prefer that
+stable version.
+
+If a consumer must remain exclusively on development packages after a matching
+stable release exists, do not rely on `<major>.<minor>.<patch>-dev.*` as that
+channel boundary. Use an exact prerelease version or another explicitly managed
+consumer policy instead.
+
+A stable patch float such as `<major>.<minor>.*` follows stable packages and
+does not advance to a higher prerelease patch. Exact versions remain the most
+predictable choice when automatic advancement is not required.
+
+This is consumer documentation only: Gizmo.Infra does not alter NuGet floating
+resolution semantics, migrate consumers, or enable Central Package Management
+floating-version behavior.
 
 ## Public NuGet trusted publishing
 
