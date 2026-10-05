@@ -111,6 +111,47 @@ public sealed class CallerOwnedPublishingActionContractTests
         Publishers_UseTheExactArtifactAndNeverRebuild();
     }
 
+    [Fact]
+    public void PublicPublisher_DefersSuccessUntilBoundedProvenanceReadback()
+    {
+        var content = Read("public");
+
+        // The precheck can miss a package that NuGet.org has not yet indexed, so a duplicate push must continue to the exact readback instead of failing.
+        Assert.Contains("--skip-duplicate", content, StringComparison.Ordinal);
+
+        // The finite polling policy is centralized in the publish step.
+        Assert.Contains("readback_attempts=6", content, StringComparison.Ordinal);
+        Assert.Contains("readback_interval_seconds=2", content, StringComparison.Ordinal);
+        Assert.Contains("readback_max_delay_seconds=10", content, StringComparison.Ordinal);
+        Assert.Contains(
+            "package_download_url=\"https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg\"",
+            content,
+            StringComparison.Ordinal);
+
+        // Readable but foreign or malformed provenance is terminal; only an unreadable package is retried and then fails closed.
+        Assert.Contains(
+            "The published public package has divergent provenance for this caller SHA; failing closed.",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "The published public package has missing or malformed provenance; failing closed.",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Could not read back the published public package for $PACKAGE_VERSION after $readback_attempts attempts; failing closed.",
+            content,
+            StringComparison.Ordinal);
+
+        // The publisher reports success only after the push and the readback verification.
+        var pushIndex = content.IndexOf("dotnet nuget push", StringComparison.Ordinal);
+        var readbackIndex = content.IndexOf("Readback attempt", StringComparison.Ordinal);
+        var verifyIndex = content.IndexOf("Verified published public package", StringComparison.Ordinal);
+        Assert.True(pushIndex >= 0 && readbackIndex > pushIndex && verifyIndex > readbackIndex);
+
+        // The private publisher's immediate push is unchanged.
+        Assert.DoesNotContain("--skip-duplicate", Read("private"), StringComparison.Ordinal);
+    }
+
     private void PrivatePublisher_UsesCallerTokenWithoutOidcAndRejectsNonPrivateVisibility()
     {
         var content = Read("private");
