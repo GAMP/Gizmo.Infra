@@ -171,7 +171,7 @@ runs:
         package_file=$(mktemp)
         trap 'rm -f "$push_response" "$package_file"' EXIT
         # No --location: the API key must never follow a redirect to another origin.
-        if ! push_status=$(curl --silent --show-error --request PUT --connect-timeout 10 --max-time 60 --output "$push_response" --write-out '%{http_code}' --header "X-NuGet-ApiKey: $nuget_api_key" --form "package=@${PACKAGE_ARTIFACT};type=application/octet-stream;filename=package.nupkg" 'https://www.nuget.org/api/v2/package'); then
+        if ! push_status=$(curl --silent --show-error --request PUT --connect-timeout 10 --max-time 60 --output "$push_response" --write-out '%{http_code}' --header "X-NuGet-ApiKey: $nuget_api_key" --header "X-NuGet-Protocol-Version: 4.1.0" --form "package=@${PACKAGE_ARTIFACT};type=application/octet-stream;filename=package.nupkg" 'https://www.nuget.org/api/v2/package'); then
           echo "Could not reach the NuGet.org package-publish endpoint." >&2
           exit 1
         fi

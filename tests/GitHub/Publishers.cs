@@ -99,6 +99,8 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("https://www.nuget.org/api/v2/token", content, StringComparison.Ordinal);
         Assert.Contains("--request PUT", content, StringComparison.Ordinal);
         Assert.Contains("X-NuGet-ApiKey: $nuget_api_key", content, StringComparison.Ordinal);
+        Assert.Contains("X-NuGet-Protocol-Version: 4.1.0", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("X-NuGet-Client-Version", content, StringComparison.Ordinal);
         Assert.Contains("Calculated package state drifted before publication", content, StringComparison.Ordinal);
         Assert.Contains("::add-mask::", content, StringComparison.Ordinal);
         Assert.DoesNotContain("dotnet nuget push", content, StringComparison.Ordinal);
@@ -451,6 +453,7 @@ public sealed class CallerOwnedPublishingActionContractTests
             Assert.DoesNotContain("secrets:", content, StringComparison.Ordinal);
             Assert.DoesNotContain("NUGET_API_KEY", content, StringComparison.Ordinal);
             Assert.DoesNotContain("NUGET_TOKEN", content, StringComparison.Ordinal);
+            Assert.DoesNotContain("X-NuGet-Client-Version", content, StringComparison.Ordinal);
         }
     }
 

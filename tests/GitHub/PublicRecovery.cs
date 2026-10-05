@@ -365,6 +365,26 @@ public sealed class PublicPublisherRecoveryTests
     }
 
     [Fact]
+    public void Push_AuthenticatedPut_CarriesApiKeyAndProtocolVersionWithoutRedirect()
+    {
+        // The OIDC-derived key must travel with the NuGet protocol version, and the key-bearing PUT must never follow a redirect.
+        using var repository = new TempRepository();
+
+        var outcome = RunPublish(repository, "201", nupkgStatuses: "404", nuspec: MatchingNuspec);
+
+        Assert.Equal(0, outcome.Result.ExitCode);
+        var putRequest = outcome.RequestLog
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Single(line => line.StartsWith("method=PUT ", StringComparison.Ordinal));
+
+        Assert.Contains("location=no", putRequest, StringComparison.Ordinal);
+        Assert.Contains("url=https://www.nuget.org/api/v2/package", putRequest, StringComparison.Ordinal);
+        Assert.Contains("X-NuGet-ApiKey: nuget-api-key", putRequest, StringComparison.Ordinal);
+        Assert.Contains("X-NuGet-Protocol-Version: 4.1.0", putRequest, StringComparison.Ordinal);
+        Assert.DoesNotContain("X-NuGet-Client-Version", putRequest, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Push_DuplicateMissingOrMalformedProvenance_FailsClosed()
     {
         foreach (var nuspec in new[] { MissingProvenanceNuspec, MalformedNuspec })
@@ -493,7 +513,8 @@ public sealed class PublicPublisherRecoveryTests
         ShellResult Result,
         string GithubOutput,
         string SleepLog,
-        string CurlLog);
+        string CurlLog,
+        string RequestLog);
 
     private sealed record PrecheckOutcome(ShellResult Result, string GithubOutput);
 
@@ -509,6 +530,7 @@ public sealed class PublicPublisherRecoveryTests
         var githubOutput = repository.WriteFile("github-output.txt", string.Empty);
         var sleepLog = repository.WriteFile("sleep.log", string.Empty);
         var curlLog = repository.WriteFile("curl.log", string.Empty);
+        var requestLog = repository.WriteFile("request.log", string.Empty);
         repository.WriteFile(ArtifactRelativePath, localBody ?? LocalArtifactBody);
 
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -530,6 +552,7 @@ public sealed class PublicPublisherRecoveryTests
             ["STUB_NUPKG_COUNTER"] = repository.AbsolutePath("nupkg-counter.txt"),
             ["STUB_SLEEP_LOG"] = sleepLog,
             ["STUB_CURL_LOG"] = curlLog,
+            ["STUB_REQUEST_LOG"] = requestLog,
         };
 
         var result = WorkflowShell.RunBash(PublishScript(), repository.Root, environment);
@@ -537,7 +560,8 @@ public sealed class PublicPublisherRecoveryTests
             result,
             File.ReadAllText(githubOutput),
             File.ReadAllText(sleepLog),
-            File.ReadAllText(curlLog));
+            File.ReadAllText(curlLog),
+            File.ReadAllText(requestLog));
     }
 
     private static PrecheckOutcome RunPrecheck(
@@ -589,16 +613,20 @@ public sealed class PublicPublisherRecoveryTests
         return $$"""
             set -euo pipefail
             curl() {
-              local output='' url=''
+              local output='' url='' method='' location='no' headers=''
               while (( $# )); do
                 case "$1" in
                   --output) output=$2; shift 2 ;;
-                  --write-out|--request|--data|--header|--form|--connect-timeout|--max-time) shift 2 ;;
-                  --fail|--silent|--show-error|--location) shift ;;
+                  --header) headers+="$2"$'\n'; shift 2 ;;
+                  --request) method=$2; shift 2 ;;
+                  --write-out|--data|--form|--connect-timeout|--max-time) shift 2 ;;
+                  --location) location='yes'; shift ;;
+                  --fail|--silent|--show-error) shift ;;
                   *) url=$1; shift ;;
                 esac
               done
               printf '%s\n' "$url" >> "$STUB_CURL_LOG"
+              printf 'method=%s location=%s url=%s headers=%s\n' "$method" "$location" "$url" "$(printf '%s' "$headers" | tr '\n' ';')" >> "$STUB_REQUEST_LOG"
               case "$url" in
                 *audience=*) printf '%s' '{"value":"oidc-token"}'; return 0 ;;
                 https://www.nuget.org/api/v2/token) printf '%s' '{"apiKey":"nuget-api-key"}'; return 0 ;;

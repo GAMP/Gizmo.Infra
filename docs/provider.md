@@ -133,7 +133,8 @@ reconciled; a version that exists without matching provenance fails closed.
 The public publisher pushes the prepared `.nupkg` to the NuGet.org
 `PackagePublish/2.0.0` resource (`PUT https://www.nuget.org/api/v2/package`,
 multipart body, authenticated by the short-lived OIDC-derived API key in the
-`X-NuGet-ApiKey` header) and selects its path only from the structured HTTP
+`X-NuGet-ApiKey` header and declaring the `X-NuGet-Protocol-Version: 4.1.0`
+header) and selects its path only from the structured HTTP
 status: any `2xx` acceptance succeeds immediately with no readback, `409` means
 the exact package ID and version already exists and continues to a bounded
 provenance readback, and every other status fails closed. NuGet.org
