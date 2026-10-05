@@ -65,6 +65,7 @@ runs:
         GH_TOKEN: ${{ github.token }}
         EXPECTED_PACKAGE_ID: ${{ inputs.package-id }}
         PACKAGE_VERSION: ${{ inputs.package-version }}
+        PACKAGE_ARTIFACT: ${{ inputs.package-artifact }}
         EXPECTED_STATE: ${{ inputs.calculated-state }}
         EXPECTED_FINGERPRINT: ${{ inputs.tag-state-fingerprint }}
       run: |
@@ -119,9 +120,25 @@ runs:
             if jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then
               if ! status=$(curl --silent --show-error --location --output "$package_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"); then echo "Could not read the published public package for collision provenance." >&2; exit 1; fi
               if [[ "$status" != 200 ]]; then echo "NuGet.org returned HTTP $status for the published public package; treating the existing version as an unverifiable collision." >&2; exit 1; fi
-              nuspec=$(unzip -p "$package_file" '*.nuspec' 2>/dev/null || true)
+              # The downloaded package must be byte-identical to the exact prepared artifact; a package-controlled
+              # provenance string can never authorize a tag when the artifact digest differs.
+              expected_digest=$(sha256sum < "$PACKAGE_ARTIFACT" | cut -d ' ' -f1)
+              actual_digest=$(sha256sum < "$package_file" | cut -d ' ' -f1)
+              if [[ "$expected_digest" != "$actual_digest" ]]; then echo "The existing public package version is not byte-identical to the exact prepared artifact; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              # Read provenance only from the single expected nuspec, never an archive-wide decoy match.
+              nuspec_entries=$(unzip -Z1 "$package_file" 2>/dev/null | grep -i '\.nuspec$' || true)
+              nuspec_count=$(printf '%s\n' "$nuspec_entries" | grep -c '[^[:space:]]' || true)
+              if [[ "$nuspec_count" != 1 ]]; then echo "The existing public package version does not contain exactly one nuspec; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              nuspec_name=$(printf '%s\n' "$nuspec_entries" | grep '[^[:space:]]')
+              nuspec_basename=${nuspec_name##*/}
+              if [[ "${nuspec_basename,,}" != "${EXPECTED_PACKAGE_ID,,}.nuspec" ]]; then echo "The existing public package version nuspec is not the expected package nuspec; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              nuspec=$(unzip -p "$package_file" "$nuspec_name" 2>/dev/null || true)
               repository_commit=$(printf '%s' "$nuspec" | grep -oE 'commit="[0-9a-fA-F]{40}"' | head -n 1 | sed -E 's/.*"([0-9a-fA-F]{40})".*/\1/' | tr 'A-F' 'a-f' || true)
               if [[ "$repository_commit" != "$GITHUB_SHA" ]]; then echo "The existing public package version has no authenticated provenance for this caller SHA; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              declared_id=$(printf '%s' "$nuspec" | tr -d '\r' | grep -oE '<id>[^<]+</id>' | head -n 1 | sed -E 's:</?id>::g' || true)
+              declared_version=$(printf '%s' "$nuspec" | tr -d '\r' | grep -oE '<version>[^<]+</version>' | head -n 1 | sed -E 's:</?version>::g' || true)
+              if [[ "${declared_id,,}" != "${EXPECTED_PACKAGE_ID,,}" ]]; then echo "The existing public package version nuspec ID does not match the expected package ID; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              if [[ "${declared_version,,}" != "${PACKAGE_VERSION,,}" ]]; then echo "The existing public package version nuspec version does not match the expected package version; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
               printf 'package-state=published\n' >> "$GITHUB_OUTPUT"
             else
               printf 'package-state=unpublished\n' >> "$GITHUB_OUTPUT"
@@ -167,10 +184,25 @@ runs:
             status=000
           fi
           if [[ "$status" == 200 ]]; then
-            nuspec=$(unzip -p "$package_file" '*.nuspec' 2>/dev/null || true)
+            # The readback must be byte-identical to the exact prepared artifact before any provenance string is trusted.
+            expected_digest=$(sha256sum < "$PACKAGE_ARTIFACT" | cut -d ' ' -f1)
+            actual_digest=$(sha256sum < "$package_file" | cut -d ' ' -f1)
+            if [[ "$expected_digest" != "$actual_digest" ]]; then echo "The published public package is not byte-identical to the exact prepared artifact; failing closed." >&2; exit 1; fi
+            # Read provenance only from the single expected nuspec, never an archive-wide decoy match.
+            nuspec_entries=$(unzip -Z1 "$package_file" 2>/dev/null | grep -i '\.nuspec$' || true)
+            nuspec_count=$(printf '%s\n' "$nuspec_entries" | grep -c '[^[:space:]]' || true)
+            if [[ "$nuspec_count" != 1 ]]; then echo "The published public package does not contain exactly one nuspec; failing closed." >&2; exit 1; fi
+            nuspec_name=$(printf '%s\n' "$nuspec_entries" | grep '[^[:space:]]')
+            nuspec_basename=${nuspec_name##*/}
+            if [[ "${nuspec_basename,,}" != "${EXPECTED_PACKAGE_ID,,}.nuspec" ]]; then echo "The published public package nuspec is not the expected package nuspec; failing closed." >&2; exit 1; fi
+            nuspec=$(unzip -p "$package_file" "$nuspec_name" 2>/dev/null || true)
             repository_commit=$(printf '%s' "$nuspec" | grep -oE 'commit="[0-9a-fA-F]{40}"' | head -n 1 | sed -E 's/.*"([0-9a-fA-F]{40})".*/\1/' | tr 'A-F' 'a-f' || true)
             if [[ -z "$repository_commit" ]]; then echo "The published public package has missing or malformed provenance; failing closed." >&2; exit 1; fi
             if [[ "$repository_commit" != "$GITHUB_SHA" ]]; then echo "The published public package has divergent provenance for this caller SHA; failing closed." >&2; exit 1; fi
+            declared_id=$(printf '%s' "$nuspec" | tr -d '\r' | grep -oE '<id>[^<]+</id>' | head -n 1 | sed -E 's:</?id>::g' || true)
+            declared_version=$(printf '%s' "$nuspec" | tr -d '\r' | grep -oE '<version>[^<]+</version>' | head -n 1 | sed -E 's:</?version>::g' || true)
+            if [[ "${declared_id,,}" != "${EXPECTED_PACKAGE_ID,,}" ]]; then echo "The published public package nuspec ID does not match the expected package ID; failing closed." >&2; exit 1; fi
+            if [[ "${declared_version,,}" != "${PACKAGE_VERSION,,}" ]]; then echo "The published public package nuspec version does not match the expected package version; failing closed." >&2; exit 1; fi
             echo "Verified published public package $PACKAGE_VERSION provenance on readback attempt $attempt."
             exit 0
           fi

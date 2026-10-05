@@ -129,7 +129,12 @@ calculated-state and tag-state fingerprint, and only then contacts its feed. A
 version that already exists with the caller SHA embedded as provenance is
 treated as an already-published success so the immutable release tag can be
 reconciled; a version that exists without matching provenance fails closed. The
-public publisher rejects any visibility other than `public`, and the private
+public publisher additionally proves the downloaded published package is
+byte-identical (SHA-256) to the exact prepared artifact and reads provenance
+only from the single expected nuspec, whose package ID and version must match
+the calculated values; a digest mismatch, a decoy or unexpected nuspec, multiple
+nuspecs, or a metadata mismatch fails closed before any tag can be reconciled.
+The public publisher rejects any visibility other than `public`, and the private
 publisher rejects any visibility other than `private`, so internal visibility
 cannot be silently routed by a caller mistake.
 

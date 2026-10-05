@@ -424,6 +424,9 @@ public sealed class PackageBootstrapAdoptionContractTests
         {
             ["STUB_NUSPEC"] = nuspec,
             ["GITHUB_SHA"] = githubSha,
+            // The public publisher now selects the single expected nuspec by name
+            // before reading provenance; the stub returns the supplied nuspec body.
+            ["nuspec_name"] = "Gizmo.Widget.nuspec",
         };
 
         var script =

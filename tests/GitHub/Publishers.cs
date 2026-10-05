@@ -328,7 +328,6 @@ public sealed class CallerOwnedPublishingActionContractTests
             Assert.Contains("Could not resolve an annotated package tag during publication recheck.", content, StringComparison.Ordinal);
 
             // The existing version must carry the caller commit, and a matching version short-circuits the push.
-            Assert.Contains("nuspec=$(unzip -p \"$package_file\" '*.nuspec' 2>/dev/null || true)", content, StringComparison.Ordinal);
             Assert.Contains(provenanceComparison, content, StringComparison.Ordinal);
             Assert.Contains("no authenticated provenance for this caller SHA", content, StringComparison.Ordinal);
             Assert.Contains("package-state=published", content, StringComparison.Ordinal);
@@ -339,7 +338,41 @@ public sealed class CallerOwnedPublishingActionContractTests
             var comparisonIndex = content.IndexOf("repository_commit", StringComparison.Ordinal);
             var publishedIndex = content.IndexOf("package-state=published", StringComparison.Ordinal);
             Assert.True(comparisonIndex >= 0 && publishedIndex > comparisonIndex);
+
+            if (directory == "public")
+            {
+                PublicPublisher_RequiresExactArtifactDigestAndExpectedNuspecBeforeAcceptingProvenance(content);
+            }
+            else
+            {
+                Assert.Contains("nuspec=$(unzip -p \"$package_file\" '*.nuspec' 2>/dev/null || true)", content, StringComparison.Ordinal);
+            }
         }
+    }
+
+    private static void PublicPublisher_RequiresExactArtifactDigestAndExpectedNuspecBeforeAcceptingProvenance(string content)
+    {
+        // The public publisher must prove the downloaded package is byte-identical
+        // to the exact prepared artifact and read provenance only from the single
+        // expected nuspec, never an archive-wide decoy match.
+        Assert.Contains("sha256sum < \"$PACKAGE_ARTIFACT\"", content, StringComparison.Ordinal);
+        Assert.Contains("sha256sum < \"$package_file\"", content, StringComparison.Ordinal);
+        Assert.Contains("not byte-identical to the exact prepared artifact", content, StringComparison.Ordinal);
+        Assert.Contains(
+            @"nuspec_entries=$(unzip -Z1 ""$package_file"" 2>/dev/null | grep -i '\.nuspec$' || true)",
+            content,
+            StringComparison.Ordinal);
+        Assert.Contains("nuspec_count=$(printf '%s\\n' \"$nuspec_entries\" | grep -c '[^[:space:]]' || true)", content, StringComparison.Ordinal);
+        Assert.Contains("does not contain exactly one nuspec", content, StringComparison.Ordinal);
+        Assert.Contains("nuspec_name=$(printf '%s\\n' \"$nuspec_entries\" | grep '[^[:space:]]')", content, StringComparison.Ordinal);
+        Assert.Contains("nuspec is not the expected package nuspec", content, StringComparison.Ordinal);
+        Assert.Contains("nuspec ID does not match the expected package ID", content, StringComparison.Ordinal);
+        Assert.Contains("nuspec version does not match the expected package version", content, StringComparison.Ordinal);
+        Assert.Contains("nuspec=$(unzip -p \"$package_file\" \"$nuspec_name\" 2>/dev/null || true)", content, StringComparison.Ordinal);
+
+        // Both the precheck and the readback must apply the digest gate.
+        var digestChecks = Regex.Matches(content, Regex.Escape("sha256sum < \"$package_file\"")).Count;
+        Assert.Equal(2, digestChecks);
     }
 
     private void Publishers_UseTheExactArtifactAndNeverRebuild()

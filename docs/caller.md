@@ -147,8 +147,12 @@ fingerprint, and then query their feed. A calculated version that already
 exists is inspected: if the published package embeds the caller commit as
 `RepositoryCommit`, the publisher treats it as already published, skips the
 push, and succeeds so the tag job can reconcile the immutable release tag. A
-version that exists without matching provenance fails closed. This preserves
-same-SHA rerun recovery without a permanent key and without moving a tag.
+version that exists without matching provenance fails closed. The public
+publisher also requires the downloaded published package to be byte-identical
+(SHA-256) to the exact prepared artifact and to carry exactly one expected
+nuspec whose ID and version match the calculated package; any digest, archive,
+or metadata mismatch fails closed. This preserves same-SHA rerun recovery
+without a permanent key and without moving a tag.
 
 Recovery is performed by re-running an existing production `push` workflow run:
 the re-run keeps that run's pushed commit and evaluates the same immutable tag
