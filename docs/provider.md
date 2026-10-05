@@ -370,6 +370,25 @@ A stable patch float such as `<major>.<minor>.*` follows stable packages and
 does not advance to a higher prerelease patch. Exact versions remain the most
 predictable choice when automatic advancement is not required.
 
+Broader prerelease-aware floats are also possible:
+
+| Pattern | Scope | Example with the current Gizmo.Shared 1.x set |
+| --- | --- | --- |
+| `1.0.*-*` | Highest version in the `1.0` line, including prereleases | Selects `1.0.16-dev.21` while stable `1.0.16` does not exist; after stable `1.0.16` is published, that stable version wins. |
+| `1.*-*` | Highest version anywhere in major `1`, including prereleases | Also selects `1.0.16-dev.21` today, but may later move to a higher minor such as `1.1.0-dev.N`. |
+| `1.0.*` | Highest stable version in the `1.0` line | Selects `1.0.15` and ignores `1.0.16-dev.*`. |
+
+The important distinction is that the numeric core is compared before
+prerelease precedence. Therefore `1.0.16-dev.21` is newer than stable
+`1.0.15`, while stable `1.0.16` is newer than `1.0.16-dev.21`.
+
+Use `<major>.<minor>.*-*` when a consumer should stay within one compatibility
+line but follow both development and stable releases automatically. Use
+`<major>.*-*` only when automatically moving to later minor lines is also
+acceptable. These broader patterns were not part of the controlled Gizmo.Shared
+pilot matrix above; the examples follow NuGet floating-version ordering applied
+to the currently published version set.
+
 This is consumer documentation only: Gizmo.Infra does not alter NuGet floating
 resolution semantics, migrate consumers, or enable Central Package Management
 floating-version behavior.
