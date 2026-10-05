@@ -147,7 +147,28 @@ fingerprint, and then query their feed. A calculated version that already
 exists is inspected: if the published package embeds the caller commit as
 `RepositoryCommit`, the publisher treats it as already published, skips the
 push, and succeeds so the tag job can reconcile the immutable release tag. A
-version that exists without matching provenance fails closed. This preserves
+version that exists without matching provenance fails closed.
+
+The public publisher determines new-versus-existing only from the structured
+HTTP status of a `PUT` to the NuGet.org `PackagePublish` endpoint: `2xx` means
+the feed accepted the new package and the step succeeds with no readback, `409`
+means the exact ID and version already exists and the step continues to a
+bounded provenance readback, and any other status fails closed. It never parses
+human-readable push output. NuGet.org repository-signs stored archives, so the
+downloaded package is not required to be byte-identical to the prepared
+artifact; a duplicate is accepted only after reading provenance from the single
+expected nuspec whose package ID, version, and full 40-character
+`RepositoryCommit` all match the calculated values. The untrusted nuspec is
+parsed structurally and namespace-aware by the checked-in provenance script: it
+requires exactly one namespaced `package`, `metadata`, `id`, `version`, and
+`repository` with a single `commit` attribute, and rejects malformed XML, DTDs
+and entities, duplicate or decoy elements, and non-nuspec namespaces. Multiple
+nuspec entries, a decoy or unexpected nuspec name, missing or malformed
+provenance, or a metadata mismatch fails closed. Every publish and readback
+request carries explicit connect and total time budgets, and the key-bearing
+`PUT` never follows a redirect. The duplicate readback is finite: at most 13
+flat-container reads, 10 seconds apart, with a 120-second total-delay cap; an
+unreadable package fails closed once the budget is exhausted. This preserves
 same-SHA rerun recovery without a permanent key and without moving a tag.
 
 Recovery is performed by re-running an existing production `push` workflow run:

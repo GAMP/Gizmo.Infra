@@ -17,6 +17,19 @@ public sealed record ShellResult(int ExitCode, string StandardOutput, string Sta
 public static class WorkflowShell
 {
     private static readonly Lazy<string> BashExecutable = new(FindBash);
+    private static readonly Lazy<string> PythonInterpreter = new(FindPython);
+
+    /// <summary>
+    /// Resolves the local Python 3 interpreter. GitHub-hosted ubuntu runners ship <c>python3</c>; a local Windows host may only expose <c>python</c> or <c>py</c>.
+    /// </summary>
+    public static string PythonExecutable => PythonInterpreter.Value;
+
+    /// <summary>
+    /// Builds a bash function that shadows <c>python3</c> with the resolved local interpreter, so an extracted action block calls the interpreter under test.
+    /// </summary>
+    public static string PythonBashFunction() =>
+        $"python3() {{ command '{PythonInterpreter.Value.Replace('\\', '/')}' \"$@\"; }}";
+
     public static string ReadWorkflow(string fileName) =>
         File.ReadAllText(Path.Combine(
             InfraRepositoryLocator.ResolveRoot(), ".github", "workflows", fileName));
@@ -244,6 +257,35 @@ public static class WorkflowShell
         }
     }
 
+    /// <summary>
+    /// Runs a checked-in Python script by path with optional stdin and environment overrides, so the committed nuspec provenance parser is exercised directly.
+    /// </summary>
+    public static ShellResult RunPythonScript(
+        string scriptPath,
+        string? standardInput = null,
+        IReadOnlyDictionary<string, string>? environment = null)
+    {
+        var startInfo = new ProcessStartInfo(PythonExecutable)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            // A genuine BOM in the fixture must survive, so pass UTF-8 without a preamble.
+            StandardInputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+        };
+        startInfo.ArgumentList.Add(scriptPath);
+        if (environment is not null)
+        {
+            foreach (var pair in environment)
+            {
+                startInfo.Environment[pair.Key] = pair.Value;
+            }
+        }
+
+        return Execute(startInfo, standardInput);
+    }
+
     private static ShellResult Execute(ProcessStartInfo startInfo, string? standardInput = null)
     {
         using var process = Process.Start(startInfo)
@@ -264,6 +306,55 @@ public static class WorkflowShell
         var stderr = process.StandardError.ReadToEnd();
         process.WaitForExit();
         return new ShellResult(process.ExitCode, stdout.Trim(), stderr.Trim());
+    }
+
+    private static string FindPython()
+    {
+        var candidates = OperatingSystem.IsWindows()
+            ? new[] { "python3", "python", "py" }
+            : new[] { "python3", "python" };
+
+        foreach (var candidate in candidates)
+        {
+            if (IsWorkingPython(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException(
+            "Python 3 is required to exercise the committed nuspec provenance parser.");
+    }
+
+    private static bool IsWorkingPython(string executable)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo(executable)
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            startInfo.ArgumentList.Add("--version");
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            process.StandardInput.Close();
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return process.ExitCode == 0
+                && (stdout + stderr).Contains("Python 3", StringComparison.Ordinal);
+        }
+        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or IOException)
+        {
+            return false;
+        }
     }
 
     private static string FindBash()
