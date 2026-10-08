@@ -98,9 +98,32 @@ runs:
       run: |
         set -euo pipefail
         response_file=$(mktemp)
+        tag_object_file=$(mktemp)
+        trap 'rm -f "$response_file" "$tag_object_file"' EXIT
+        [[ "$GIZMO_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "The planned source commit is not a complete 40-character SHA." >&2; exit 1; }
         if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$GIZMO_RELEASE_TAG"); then echo "Could not check whether the release tag is already claimed." >&2; exit 1; fi
         case "$status" in
-          200) tag_sha=$(jq -er '.object.sha | strings' "$response_file") || { echo "GitHub returned a malformed release-tag response." >&2; exit 1; }; if [[ "$tag_sha" != "$GIZMO_SHA" ]]; then echo "Release tag already exists for a different commit; refusing to move it." >&2; exit 1; fi ;;
+          200)
+            # Resolve a lightweight or annotated ref to its commit before comparing; never move a tag.
+            if ! object_type=$(jq -er '.object.type | strings' "$response_file") || ! object_sha=$(jq -er '.object.sha | strings' "$response_file"); then echo "GitHub returned a malformed release-tag response." >&2; exit 1; fi
+            [[ "$object_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "GitHub returned a malformed release-tag object SHA." >&2; exit 1; }
+            depth=0
+            while :; do
+              case "$object_type" in
+                commit) break ;;
+                tag)
+                  (( depth += 1 ))
+                  if (( depth > 16 )); then echo "The existing release tag did not resolve to a commit within the depth limit; refusing to move it." >&2; exit 1; fi
+                  if ! status=$(curl --silent --show-error --location --output "$tag_object_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$object_sha"); then echo "Could not resolve the annotated release tag; the tag was not moved or overwritten." >&2; exit 1; fi
+                  if [[ "$status" != 200 ]]; then echo "GitHub returned HTTP $status while resolving the annotated release tag; the tag was not moved or overwritten." >&2; exit 1; fi
+                  if ! object_type=$(jq -er '.object.type | strings' "$tag_object_file") || ! object_sha=$(jq -er '.object.sha | strings' "$tag_object_file"); then echo "GitHub returned a malformed annotated release-tag response." >&2; exit 1; fi
+                  [[ "$object_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "GitHub returned a malformed annotated release-tag object SHA." >&2; exit 1; }
+                  ;;
+                *) echo "The existing release tag does not resolve to a commit; refusing to move it." >&2; exit 1 ;;
+              esac
+            done
+            if [[ "$object_sha" != "$GIZMO_SHA" ]]; then echo "Release tag already exists for a different commit; refusing to move it." >&2; exit 1; fi
+            ;;
           404) request_body=$(jq -nc --arg ref "refs/tags/$GIZMO_RELEASE_TAG" --arg sha "$GIZMO_SHA" '{ref: $ref, sha: $sha}'); if ! status=$(curl --silent --show-error --location --output /dev/null --write-out '%{http_code}' --request POST --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'Content-Type: application/json' --data "$request_body" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs"); then echo "Could not create the release tag; the tag was not moved or overwritten." >&2; exit 1; fi; if [[ "$status" != 201 ]]; then echo "GitHub returned HTTP $status while creating the release tag; the tag was not moved or overwritten." >&2; exit 1; fi ;;
           *) echo "GitHub returned HTTP $status while checking the release tag." >&2; exit 1 ;;
         esac

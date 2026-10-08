@@ -103,8 +103,9 @@ public sealed class PackageStatePlannerTests
         AssertValid(Encode(payload), "publishable", "nuget");
         payload = Decode(sealedState);
         payload["repo"] = "foreign/repo";
-        var binding = Invoke("validate --role publishable --expect-publisher nuget", Encode(payload),
-            new Dictionary<string, string> { ["GITHUB_REPOSITORY"] = "owner/repository" });
+        var bindingEnvironment = ContextForState(sealedState);
+        bindingEnvironment["GITHUB_REPOSITORY"] = "owner/repository";
+        var binding = Invoke("validate --role publishable --expect-publisher nuget", Encode(payload), bindingEnvironment);
         Assert.NotEqual(0, binding.ExitCode);
         Assert.Contains("binding-mismatch", binding.Error, StringComparison.Ordinal);
     }
@@ -120,10 +121,126 @@ public sealed class PackageStatePlannerTests
         payload["role"] = "development";
         AssertInvalid(Encode(payload), "production", "publishable", "role-mismatch");
 
-        var wrongSha = new Dictionary<string, string>(StringComparer.Ordinal) { ["GITHUB_SHA"] = OtherSha };
+        var wrongSha = ContextForState(state);
+        wrongSha["GITHUB_SHA"] = OtherSha;
         var bound = Invoke("validate --role production --expect-publisher publishable", state, wrongSha);
         Assert.NotEqual(0, bound.ExitCode);
         Assert.Contains("binding-mismatch", bound.Error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pre-release", "development")]
+    [InlineData("release", "production")]
+    public void PullRequestPlanAndSeal_BindEffectiveBaseWhileRunnerRefIsMergeRef(string baseBranch, string role)
+    {
+        var request = PlanFor("pull_request", role, "pre-release", "release", "refs/heads/" + baseBranch);
+        Assert.Equal(0, ExitCode(request));
+        Assert.Equal("none", request["publisher"]);
+        Assert.Equal("false", request["tag"]);
+        Assert.Equal("3.0.0-pr.42", request["package-version"]);
+        Assert.Equal("not-applicable", request["release-tag-state"]);
+        Assert.Equal("refs/heads/" + baseBranch, StateField(request["planned-state"], "ref"));
+
+        var env = RunnerEnvironment("pull_request", "refs/pull/123/merge", baseBranch);
+        var sealedState = Seal(request["planned-state"], env);
+        Assert.Equal("pull_request", StateField(sealedState, "event"));
+        Assert.Equal("refs/heads/" + baseBranch, StateField(sealedState, "ref"));
+        Assert.Equal("none", StateField(sealedState, "publisher"));
+        Assert.Equal("false", StateField(sealedState, "tag"));
+    }
+
+    [Theory]
+    [InlineData("event")]
+    [InlineData("base-ref")]
+    [InlineData("repository")]
+    [InlineData("sha")]
+    [InlineData("run")]
+    [InlineData("attempt")]
+    public void PullRequestSeal_RejectsMisboundRunnerContext(string binding)
+    {
+        var request = PlanFor("pull_request", "development", "pre-release", "release", "refs/heads/pre-release");
+        var env = RunnerEnvironment("pull_request", "refs/pull/123/merge", "pre-release");
+        switch (binding)
+        {
+            case "event": env["GITHUB_EVENT_NAME"] = "push"; env["GITHUB_REF"] = "refs/heads/pre-release"; break;
+            case "base-ref": env["GITHUB_BASE_REF"] = "release"; break;
+            case "repository": env["GITHUB_REPOSITORY"] = "foreign/repository"; break;
+            case "sha": env["GITHUB_SHA"] = OtherSha; break;
+            case "run": env["GITHUB_RUN_ID"] = "701"; break;
+            case "attempt": env["GITHUB_RUN_ATTEMPT"] = "2"; break;
+        }
+
+        var result = Invoke("seal --digest " + new string('d', 64), request["planned-state"], env);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("binding-mismatch", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PushSeal_ContinuesToBindTheActualBranchRef()
+    {
+        var request = PlanFor("push", "development", "pre-release", "release", "refs/heads/pre-release");
+        var env = RunnerEnvironment("push", "refs/heads/release", string.Empty);
+        var result = Invoke("seal --digest " + new string('d', 64), request["planned-state"], env);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("binding-mismatch", result.Error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("release+candidate", "production", "development")]
+    [InlineData("feature/with.dots", "release", "development")]
+    [InlineData("topic@name", "release", "development")]
+    [InlineData("@", "release", "development")]
+    [InlineData("café", "release", "development")]
+    [InlineData("development", "stable/release.2", "production")]
+    public void GitAcceptedNontrivialBranchNames_ResolveRolePlanSealAndValidate(string dev, string prod, string role)
+    {
+        AssertGitAcceptsBranch(dev);
+        AssertGitAcceptsBranch(prod);
+        var branch = role == "production" ? prod : dev;
+        var expectedRef = "refs/heads/" + branch;
+        var gate = RunPreflightRole(dev, prod, expectedRef);
+        Assert.Equal(role, gate.StandardOutput);
+
+        var plan = PlanFor("push", role, dev, prod, expectedRef);
+        Assert.Equal(0, ExitCode(plan));
+        var env = RunnerEnvironment("push", expectedRef, string.Empty);
+        var state = Seal(plan["planned-state"], env);
+        var validation = Invoke("validate --role publishable --expect-publisher nuget", state, env);
+        Assert.Equal(0, validation.ExitCode);
+        Assert.Equal(expectedRef, StateField(state, "ref"));
+    }
+
+    [Theory]
+    [InlineData("bad branch")]
+    [InlineData("bad..branch")]
+    [InlineData("-leading")]
+    [InlineData("trailing/")]
+    [InlineData("name.lock")]
+    [InlineData("part/@{revision")]
+    [InlineData("path//component")]
+    [InlineData("path/../escape")]
+    [InlineData("revision~1")]
+    [InlineData("line\nbreak")]
+    [InlineData("branch\\name")]
+    public void GitRejectedUnsafeBranchNames_RemainRejectedByPlanner(string branch)
+    {
+        Assert.NotEqual(0, GitBranchCheck(branch).ExitCode);
+        var plan = PlanFor("push", "development", branch, "release", "refs/heads/" + branch);
+        Assert.NotEqual(0, ExitCode(plan));
+    }
+
+    [Fact]
+    public void GitValidBranchLongerThan255Characters_IsAcceptedWithinTheBoundedStateProtocol()
+    {
+        var branch = string.Join('/', Enumerable.Repeat(new string('a', 120), 3));
+        Assert.True(branch.Length > 255);
+        Assert.Equal(0, GitBranchCheck(branch).ExitCode);
+        var reference = "refs/heads/" + branch;
+        var plan = PlanFor("push", "development", branch, "release", reference);
+        Assert.Equal(0, ExitCode(plan));
+        var env = RunnerEnvironment("push", reference, string.Empty);
+        var state = Seal(plan["planned-state"], env);
+        Assert.Equal(reference, StateField(state, "ref"));
     }
 
     private static Dictionary<string, string> Plan(
@@ -135,11 +252,28 @@ public sealed class PackageStatePlannerTests
         string? currentSha = null,
         IReadOnlyList<object>? tags = null)
     {
-        var reference = role == "production" ? "refs/heads/release" : "refs/heads/pre-release";
+        var dev = "pre-release";
+        var prod = "release";
+        var reference = role == "production" ? "refs/heads/" + prod : "refs/heads/" + dev;
+        return PlanFor(eventName, role, dev, prod, reference, visibility, compatibilityLine, runNumber, currentSha, tags);
+    }
+
+    private static Dictionary<string, string> PlanFor(
+        string eventName,
+        string role,
+        string dev,
+        string prod,
+        string reference,
+        string visibility = "public",
+        string compatibilityLine = "3.0",
+        string runNumber = "42",
+        string? currentSha = null,
+        IReadOnlyList<object>? tags = null)
+    {
         var request = new
         {
             repo = "owner/repository", sha = currentSha ?? Sha, @ref = reference, run = "700", attempt = "1",
-            @event = eventName, dev = "pre-release", prod = "release", role, packageId = PackageId,
+            @event = eventName, dev, prod, role, packageId = PackageId,
             compatibilityLine, runNumber, visibility, tags = tags ?? [],
         };
         var result = Invoke("plan", JsonSerializer.Serialize(request));
@@ -152,17 +286,21 @@ public sealed class PackageStatePlannerTests
         @ref = $"refs/tags/{PackageId}/v{version}", objectSha = objectType == "tag" ? new string('c', 40) : commit, commit,
     };
 
-    private static string Seal(string planned) => Invoke("seal --digest " + new string('d', 64), planned).Output
-        .Split('=', 2)[1].Trim();
+    private static string Seal(string planned, IReadOnlyDictionary<string, string>? environment = null)
+    {
+        var result = Invoke("seal --digest " + new string('d', 64), planned, environment ?? ContextForState(planned));
+        Assert.True(result.ExitCode == 0, result.Error);
+        return result.Output.Split('=', 2)[1].Trim();
+    }
 
     private static void AssertValid(string state, string role, string publisher) =>
-        Assert.Equal(0, Invoke($"validate --role {role} --expect-publisher {publisher}", state).ExitCode);
+        Assert.Equal(0, Invoke($"validate --role {role} --expect-publisher {publisher}", state, ContextForState(state)).ExitCode);
 
     private static void AssertInvalid(string state, string expected) => AssertInvalid(state, "publishable", "nuget", expected);
 
     private static void AssertInvalid(string state, string role, string publisher, string expected)
     {
-        var result = Invoke($"validate --role {role} --expect-publisher {publisher}", state);
+        var result = Invoke($"validate --role {role} --expect-publisher {publisher}", state, ContextForState(state));
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains(expected, result.Error, StringComparison.Ordinal);
     }
@@ -176,11 +314,79 @@ public sealed class PackageStatePlannerTests
     private static ShellResult RunBash(string script, IReadOnlyDictionary<string, string> environment) =>
         WorkflowShell.RunBash(script, Path.GetTempPath(), environment);
 
+    private static Dictionary<string, string> RunnerEnvironment(string eventName, string currentRef, string baseRef) => new(StringComparer.Ordinal)
+    {
+        ["GITHUB_EVENT_NAME"] = eventName,
+        ["GITHUB_REF"] = currentRef,
+        ["GITHUB_BASE_REF"] = baseRef,
+        ["GITHUB_REPOSITORY"] = "owner/repository",
+        ["GITHUB_SHA"] = Sha,
+        ["GITHUB_RUN_ID"] = "700",
+        ["GITHUB_RUN_ATTEMPT"] = "1",
+    };
+
+    private static Dictionary<string, string> ContextForState(string state)
+    {
+        var fallback = RunnerEnvironment("push", "refs/heads/pre-release", string.Empty);
+        try
+        {
+            var normalized = state.Replace('-', '+').Replace('_', '/');
+            normalized += new string('=', (4 - normalized.Length % 4) % 4);
+            using var json = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(normalized)));
+            if (!json.RootElement.TryGetProperty("event", out var eventNode)
+                || !json.RootElement.TryGetProperty("ref", out var refNode)
+                || eventNode.ValueKind != JsonValueKind.String
+                || refNode.ValueKind != JsonValueKind.String)
+            {
+                return fallback;
+            }
+
+            var eventName = eventNode.GetString()!;
+            var stateRef = refNode.GetString()!;
+            var isPullRequest = eventName == "pull_request";
+            var baseRef = isPullRequest && stateRef.StartsWith("refs/heads/", StringComparison.Ordinal)
+                ? stateRef["refs/heads/".Length..]
+                : string.Empty;
+            return RunnerEnvironment(eventName, isPullRequest ? "refs/pull/123/merge" : stateRef, baseRef);
+        }
+        catch (FormatException)
+        {
+            return fallback;
+        }
+        catch (JsonException)
+        {
+            return fallback;
+        }
+    }
+
+    private static ShellResult GitBranchCheck(string branch) =>
+        WorkflowShell.RunBash("git check-ref-format --branch \"$TEST_BRANCH\"", Path.GetTempPath(),
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["TEST_BRANCH"] = branch });
+
+    private static void AssertGitAcceptsBranch(string branch) => Assert.Equal(0, GitBranchCheck(branch).ExitCode);
+
+    private static ShellResult RunPreflightRole(string dev, string prod, string currentRef)
+    {
+        var action = WorkflowShell.ReadAction("preflight");
+        var block = WorkflowShell.ExtractBlock(action, "[[ -n \"$DEV_BRANCH\"", "fi");
+        return WorkflowShell.RunBash("set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n" + block + "\nprintf '%s' \"$branch_role\"",
+            Path.GetTempPath(), new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["DEV_BRANCH"] = dev, ["PROD_BRANCH"] = prod, ["CURRENT_REF"] = currentRef,
+            });
+    }
+
     private static string StateField(string state, string key)
     {
         using var json = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(state)));
         var value = json.RootElement.GetProperty(key);
-        return value.ValueKind == JsonValueKind.Array ? value[0].GetString()! : value.GetString()!;
+        return value.ValueKind switch
+        {
+            JsonValueKind.Array => value[0].GetString()!,
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => value.GetString()!,
+        };
     }
 
     private static JsonObjectWrapper Decode(string state) => new(JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(state.Replace('-', '+').Replace('_', '/')))).RootElement);

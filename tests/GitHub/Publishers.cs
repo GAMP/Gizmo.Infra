@@ -126,9 +126,7 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.Contains("--connect-timeout 5 --max-time 15", nuget, StringComparison.Ordinal);
 
         var tag = Read("tag");
-        Assert.Contains("if [[ \"$tag_sha\" != \"$GIZMO_SHA\" ]]", tag, StringComparison.Ordinal);
         Assert.Contains("Release tag already exists for a different commit; refusing to move it.", tag, StringComparison.Ordinal);
-        Assert.Contains("200) tag_sha=$(jq -er '.object.sha | strings'", tag, StringComparison.Ordinal);
         Assert.Contains("git/ref/tags/$GIZMO_RELEASE_TAG", tag, StringComparison.Ordinal);
     }
 

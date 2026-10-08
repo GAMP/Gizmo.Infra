@@ -306,17 +306,172 @@ public sealed class PrivilegedActionStateGuardTests
         Assert.DoesNotContain("/git/ref/tags/", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
 
         var step = FindStep(ReadAction("tag"), "Create or reconcile immutable release tag");
-        var same = RunTagMutation(repository, vars, step, Sha, "200");
-        Assert.True(same.ExitCode == 0, same.StandardError + "\n" + same.StandardOutput);
-        Assert.Contains("GET https://api.github.com/repos/owner/repository/git/ref/tags/Gizmo.Widget/v3.0.0", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
+        var same = RunTagMutation(repository, vars, step, "200", "commit", Sha, []);
+        Assert.True(same.Result.ExitCode == 0, same.Result.StandardError + "\n" + same.Result.StandardOutput);
+        Assert.Contains("GET https://api.github.com/repos/owner/repository/git/ref/tags/Gizmo.Widget/v3.0.0", same.RequestLog, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(repository);
 
-        var foreign = RunTagMutation(repository, vars, step, new string('b', 40), "200");
-        Assert.NotEqual(0, foreign.ExitCode);
-        Assert.Contains("refusing to move it", foreign.StandardError, StringComparison.Ordinal);
+        var foreign = RunTagMutation(repository, vars, step, "200", "commit", new string('b', 40), []);
+        Assert.NotEqual(0, foreign.Result.ExitCode);
+        Assert.Contains("refusing to move it", foreign.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(repository);
 
-        var missing = RunTagMutation(repository, vars, step, string.Empty, "404");
-        Assert.Equal(0, missing.ExitCode);
-        Assert.Contains("POST https://api.github.com/repos/owner/repository/git/refs", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
+        var missing = RunTagMutation(repository, vars, step, "404", string.Empty, string.Empty, []);
+        Assert.Equal(0, missing.Result.ExitCode);
+        Assert.Contains("POST https://api.github.com/repos/owner/repository/git/refs", missing.RequestLog, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedOneHopSameCommitReconcilesWithoutMutation()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", Sha)]);
+        Assert.True(result.Result.ExitCode == 0, result.Result.StandardError + "\n" + result.Result.StandardOutput);
+        Assert.Contains("/git/tags/" + new string('c', 40), result.RequestLog, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedMultiHopSameCommitReconcilesWithoutMutation()
+    {
+        var result = RunTagResolution([
+            new TagObjectReply("tag", new string('d', 40)),
+            new TagObjectReply("commit", Sha),
+        ]);
+        Assert.True(result.Result.ExitCode == 0, result.Result.StandardError + "\n" + result.Result.StandardOutput);
+        var requests = result.RequestLog;
+        Assert.Contains("/git/tags/" + new string('c', 40), requests, StringComparison.Ordinal);
+        Assert.Contains("/git/tags/" + new string('d', 40), requests, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedForeignCommitRefusesWithoutMutation()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", new string('b', 40))]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("different commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_UnsupportedRootObjectTypeFailsClosed()
+    {
+        var result = RunTagResolution([], referenceType: "tree");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("does not resolve to a commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_MissingRootObjectTypeFailsClosed()
+    {
+        var result = RunTagResolution([], referenceType: "__missing__");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_MissingRootObjectShaFailsClosed()
+    {
+        var result = RunTagResolution([], referenceSha: "__missing__");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_InvalidRootObjectShaFailsClosed()
+    {
+        var result = RunTagResolution([], referenceSha: "not-a-sha");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag object SHA", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseMissingTypeFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("__missing__", Sha)]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseMissingShaFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", "__missing__")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseInvalidShaFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", "not-a-sha")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag object SHA", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedApiHttpFailureFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", Sha, "500")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("HTTP 500 while resolving", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_ReleaseRefApiHttpFailureFailsClosed()
+    {
+        var result = RunTagResolution([], referenceStatus: "500");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("HTTP 500 while checking the release tag", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_ReleaseRefTransportFailureFailsClosed()
+    {
+        var result = RunTagResolution([], referenceStatus: "transport");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("Could not check whether the release tag is already claimed", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedTransportFailureFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", Sha, "transport")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("Could not resolve the annotated release tag", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedUnsupportedTargetTypeFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("tree", Sha)]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("does not resolve to a commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedDepthOverflowFailsClosedWithoutMutation()
+    {
+        var chain = Enumerable.Range(0, 17)
+            .Select(index => new TagObjectReply("tag", index.ToString("x").PadLeft(40, '0')))
+            .ToArray();
+        var result = RunTagResolution(chain);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("depth limit", result.Result.StandardError, StringComparison.Ordinal);
+        Assert.Equal(16, result.RequestLog.Split('\n', StringSplitOptions.RemoveEmptyEntries).Count(line => line.Contains("/git/tags/", StringComparison.Ordinal)));
+        AssertExistingTagWasNeverMutated(result.RequestLog);
     }
 
     [Fact]
@@ -380,11 +535,21 @@ public sealed class PrivilegedActionStateGuardTests
             dev = "pre-release", prod = "release", role, packageId = "Gizmo.Widget", compatibilityLine = "3.0",
             runNumber = "42", visibility, tags = tags ?? Array.Empty<object>(),
         });
-        var plan = RunState("plan", request);
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GITHUB_EVENT_NAME"] = "push",
+            ["GITHUB_REF"] = reference,
+            ["GITHUB_BASE_REF"] = string.Empty,
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GITHUB_SHA"] = Sha,
+            ["GITHUB_RUN_ID"] = "700",
+            ["GITHUB_RUN_ATTEMPT"] = "1",
+        };
+        var plan = RunState("plan", request, environment);
         Assert.Equal(0, plan.ExitCode);
         var plannedState = Parse(plan.StandardOutput)["planned-state"];
         var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(digestSource))).ToLowerInvariant();
-        var seal = RunState("seal --digest " + digest, plannedState);
+        var seal = RunState("seal --digest " + digest, plannedState, environment);
         Assert.Equal(0, seal.ExitCode);
         return Parse(seal.StandardOutput)["state"];
     }
@@ -429,9 +594,11 @@ public sealed class PrivilegedActionStateGuardTests
     {
         var identity = new Dictionary<string, string>(StringComparer.Ordinal)
         {
+            ["GITHUB_EVENT_NAME"] = "push",
             ["GITHUB_REPOSITORY"] = "owner/repository",
             ["GITHUB_SHA"] = Sha,
             ["GITHUB_REF"] = role == "production" ? "refs/heads/release" : "refs/heads/pre-release",
+            ["GITHUB_BASE_REF"] = string.Empty,
             ["GITHUB_RUN_ID"] = "700",
             ["GITHUB_RUN_ATTEMPT"] = "1",
         };
@@ -558,18 +725,128 @@ public sealed class PrivilegedActionStateGuardTests
         ["STUB_SLEEP_LOG"] = repository.WriteFile("sleep.log", string.Empty),
     };
 
-    private static ShellResult RunTagMutation(TempRepository repository, string shellState, string step, string tagSha, string status)
+    private sealed record TagObjectReply(string Type, string Sha, string Status = "200");
+
+    private sealed record TagMutationRun(ShellResult Result, string RequestLog);
+
+    private static TagMutationRun RunTagResolution(
+        IReadOnlyList<TagObjectReply> replies,
+        string referenceStatus = "200",
+        string? referenceType = null,
+        string? referenceSha = null)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "production", "prepared");
+        var shellState = StateShell(state, "production", "publishable");
+        var step = FindStep(ReadAction("tag"), "Create or reconcile immutable release tag");
+        var rootType = referenceType ?? (replies.Count > 0 ? "tag" : "commit");
+        var rootSha = referenceSha ?? (rootType == "tag" ? new string('c', 40) : Sha);
+        var run = RunTagMutation(repository, shellState, step, referenceStatus, rootType, rootSha, replies);
+        return run with { RequestLog = File.ReadAllText(repository.AbsolutePath("requests.log")) };
+    }
+
+    private static TagMutationRun RunTagMutation(
+        TempRepository repository,
+        string shellState,
+        string step,
+        string referenceStatus,
+        string referenceType,
+        string referenceSha,
+        IReadOnlyList<TagObjectReply> replies)
     {
         var log = repository.WriteFile("requests.log", string.Empty);
-        var curl = "curl() { local output='' method='GET' url=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --request) method=$2; shift 2 ;; --header|--data|--write-out) shift 2 ;; --silent|--show-error|--location) shift ;; *) url=$1; shift ;; esac; done; printf '%s %s\\n' \"$method\" \"$url\" >> \"$REQUEST_LOG\"; if [[ \"$method\" == POST ]]; then printf 201; else if [[ \"$MOCK_TAG_STATUS\" == 200 ]]; then printf '{\"object\":{\"sha\":\"%s\"}}' \"$MOCK_TAG_SHA\" > \"$output\"; fi; printf '%s' \"$MOCK_TAG_STATUS\"; fi; }";
-        var jq = "jq() { case \"$*\" in *'.object.sha | strings'*) printf '%s' \"$MOCK_TAG_SHA\" ;; *'-nc'*) printf '{}' ;; *) echo \"unexpected jq filter: $*\" >&2; return 8 ;; esac; }";
-        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        var curl = """
+            curl() {
+              local output='' method='GET' url=''
+              while (( $# )); do
+                case "$1" in
+                  --output) output=$2; shift 2 ;;
+                  --request) method=$2; shift 2 ;;
+                  --header|--data|--write-out) shift 2 ;;
+                  --silent|--show-error|--location) shift ;;
+                  *) url=$1; shift ;;
+                esac
+              done
+              printf '%s %s\n' "$method" "$url" >> "$REQUEST_LOG"
+              if [[ "$method" == POST ]]; then printf 201; return 0; fi
+              if [[ "$url" == */git/ref/tags/* ]]; then
+                MOCK_CURRENT_TYPE="$MOCK_REF_TYPE"
+                MOCK_CURRENT_SHA="$MOCK_REF_SHA"
+                [[ "$MOCK_REF_STATUS" != transport ]] || return 7
+                if [[ "$MOCK_REF_STATUS" == 200 ]]; then write_tag_response "$output" "$MOCK_CURRENT_TYPE" "$MOCK_CURRENT_SHA"; fi
+                printf '%s' "$MOCK_REF_STATUS"
+                return 0
+              fi
+              if [[ "$url" == */git/tags/* ]]; then
+                local requested_sha=${url##*/} index=-1 candidate=0
+                local request_shas=( ${MOCK_TAG_REQUEST_SHAS:-} )
+                local types=( ${MOCK_TAG_TYPES:-} )
+                local shas=( ${MOCK_TAG_SHAS:-} )
+                local statuses=( ${MOCK_TAG_STATUSES:-} )
+                for candidate in "${!request_shas[@]}"; do
+                  if [[ "${request_shas[$candidate]}" == "$requested_sha" ]]; then index=$candidate; break; fi
+                done
+                (( index >= 0 )) || { echo "unexpected mocked tag object SHA: $requested_sha" >&2; return 9; }
+                local status=${statuses[$index]:-500}
+                MOCK_CURRENT_TYPE=${types[$index]:-__missing__}
+                MOCK_CURRENT_SHA=${shas[$index]:-__missing__}
+                [[ "$status" != transport ]] || return 7
+                if [[ "$status" == 200 ]]; then write_tag_response "$output" "$MOCK_CURRENT_TYPE" "$MOCK_CURRENT_SHA"; fi
+                printf '%s' "$status"
+                return 0
+              fi
+              echo "unexpected mocked tag URL: $url" >&2
+              return 9
+            }
+            write_tag_response() {
+              local output=$1 object_type=$2 object_sha=$3
+              printf '{"object":{' > "$output"
+              if [[ "$object_type" != __missing__ ]]; then printf '"type":"%s"' "$object_type" >> "$output"; fi
+              if [[ "$object_sha" != __missing__ ]]; then
+                [[ "$object_type" == __missing__ ]] || printf ',' >> "$output"
+                printf '"sha":"%s"' "$object_sha" >> "$output"
+              fi
+              printf '}}' >> "$output"
+            }
+            """;
+        var jq = """
+            jq() {
+              local joined="$*" input_file=${@: -1} value=''
+              case "$joined" in
+                *'-nc'*) printf '{}' ;;
+                *'.object.type | strings'*) value=$(sed -n 's/.*"type":"\([^"]*\)".*/\1/p' "$input_file"); [[ -n "$value" ]] || return 1; printf '%s' "$value" ;;
+                *'.object.sha | strings'*) value=$(sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' "$input_file"); [[ -n "$value" ]] || return 1; printf '%s' "$value" ;;
+                *) echo "unexpected jq filter: $*" >&2; return 8 ;;
+              esac
+            }
+            """;
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["GITHUB_API_URL"] = "https://api.github.com", ["GITHUB_REPOSITORY"] = "owner/repository",
-            ["GH_TOKEN"] = "mock-token", ["REQUEST_LOG"] = log, ["MOCK_TAG_SHA"] = tagSha,
-            ["MOCK_TAG_STATUS"] = status,
+            ["GITHUB_API_URL"] = "https://api.github.com",
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GH_TOKEN"] = "mock-token",
+            ["REQUEST_LOG"] = log,
+            ["MOCK_REF_STATUS"] = referenceStatus,
+            ["MOCK_REF_TYPE"] = referenceType,
+            ["MOCK_REF_SHA"] = referenceSha,
+            ["MOCK_TAG_REQUEST_SHAS"] = string.Join(' ', new[] { referenceSha }.Concat(replies.Where(reply => reply.Type == "tag").Select(reply => reply.Sha))),
+            ["MOCK_TAG_TYPES"] = string.Join(' ', replies.Select(reply => reply.Type)),
+            ["MOCK_TAG_SHAS"] = string.Join(' ', replies.Select(reply => reply.Sha)),
+            ["MOCK_TAG_STATUSES"] = string.Join(' ', replies.Select(reply => reply.Status)),
         };
-        return WorkflowShell.RunBash(shellState + "\n" + curl + "\n" + jq + "\n" + step, repository.Root, env);
+        var result = WorkflowShell.RunBash(shellState + "\n" + curl + "\n" + jq + "\n" + step, repository.Root, environment);
+        return new TagMutationRun(result, File.ReadAllText(log));
+    }
+
+    private static void AssertExistingTagWasNeverMutated(TempRepository repository) =>
+        AssertExistingTagWasNeverMutated(File.ReadAllText(repository.AbsolutePath("requests.log")));
+
+    private static void AssertExistingTagWasNeverMutated(string requestLog)
+    {
+        Assert.DoesNotContain("POST https://api.github.com/repos/owner/repository/git/refs", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("PATCH", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("PUT", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("DELETE", requestLog, StringComparison.Ordinal);
     }
 
     private static ShellResult RunTagRecheck(TempRepository repository, string shellState, string step, string objectSha, string commitSha)
@@ -616,8 +893,8 @@ public sealed class PrivilegedActionStateGuardTests
         return WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + shellState + "\n" + curl + "\n" + jq + "\n" + step, repository.Root, environment);
     }
 
-    private static ShellResult RunState(string arguments, string input) =>
-        WorkflowShell.RunPythonCli(StateScript, arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries), input);
+    private static ShellResult RunState(string arguments, string input, IReadOnlyDictionary<string, string>? environment = null) =>
+        WorkflowShell.RunPythonCli(StateScript, arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries), input, environment);
 
     private static Dictionary<string, string> ActionEnvironment(TempRepository repository, string state, string envFile, string tempDirectory, string curlLog) =>
         new(StringComparer.Ordinal)

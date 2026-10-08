@@ -377,3 +377,13 @@ Do not bind the Gizmo.Infra commit SHA in the NuGet.org policy. Pinning every
 Gizmo.Infra workflow and action reference to one immutable 40-character commit
 SHA is a separate GitHub supply-chain invariant. The repository or organization
 variable `NUGET_USER` is a NuGet.org profile identifier, not a secret or API key.
+
+## Shared state module (implementation)
+
+The plan workflow and every composite action share one checked-in module,
+`.github/package/state.py`. It exposes `plan`, `seal --digest <sha256>`,
+`validate --role production|publishable --expect-publisher nuget|internal|publishable`,
+and `fingerprint`; `validate` reads the opaque state on stdin and writes the
+validated routing fields to stdout, or to the path given by `--github-env`.
+Consuming actions revalidate independently and never treat the payload as a
+signature.

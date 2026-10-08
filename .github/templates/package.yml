@@ -21,9 +21,6 @@ env:
   PROD: &prod <production-branch>
 
 jobs:
-  # A single read-only plan resolves the branch role, calculates the package
-  # version and tag state, builds and packs the exact artifact, and emits the
-  # opaque state plus the publisher and tag routing requests.
   plan:
     uses: GAMP/Gizmo.Infra/.github/workflows/package.yml@<40-character-infra-commit-sha>
     permissions:

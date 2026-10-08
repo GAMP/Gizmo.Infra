@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
 """Canonical Gizmo.Infra package state planner and validator.
 
-This module is the single checked-in source of truth for the opaque package
-state consumed only by Gizmo.Infra composite actions. State is canonical
-``base64url(UTF-8(JSON))`` with an explicit schema version and an exact key set,
-so a tampered, malformed, or unknown-version payload fails closed structurally
-instead of through shell substring matching.
-
-The state carries only bounded routing/identity facts and a tag-state
-fingerprint; it never embeds the unbounded tag snapshot. Every mutation action
-revalidates the security-sensitive facts it needs from live GitHub/feed/tag
-state and treats this payload as an API simplification, never as a signature.
-
-Subcommands
------------
-``plan``      build state + routing outputs from a request document.
-``seal``      bind the packed artifact digest into the planned state.
-``validate``  strictly validate state for a mutation action and export fields.
-``fingerprint`` canonical tag-state fingerprint for a live tag refetch.
+State is canonical ``base64url(UTF-8(JSON))`` with an explicit schema version
+and an exact key set, so a tampered, malformed, or unknown-version payload
+fails closed structurally instead of through shell substring matching.
 """
 
 import argparse
@@ -28,12 +14,12 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 SCHEMA_VERSION = 1
 
-# Exact top-level state keys -> required type. An unknown or missing key is a
-# schema failure, so accidental protocol drift cannot pass as valid state.
+# Exact top-level state keys -> required type; a missing or extra key fails.
 STATE_KEYS = {
     "v": int,
     "repo": str,
@@ -91,7 +77,8 @@ VERSION = re.compile(
 TAG_LEAF = re.compile(r"^v(" + DEC + r")\.(" + DEC + r")\.(" + DEC + r")$")
 PACKAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-REF = re.compile(r"^refs/[A-Za-z0-9._/-]+$")
+REF_FORBIDDEN = set("~^:?*[\\")
+REF_CONTROL = re.compile(r"[\x00-\x20\x7f]")
 NUMERIC = re.compile(r"^[0-9]+$")
 ROLES = ("development", "production", "none")
 PUBLISHERS = ("nuget", "internal", "none")
@@ -146,16 +133,41 @@ def _check_keys(obj, keys, token):
             raise StateError(token)
 
 
-def _valid_branch(name):
-    if not name or len(name) > 255:
+def _structurally_safe(name):
+    if not isinstance(name, str) or not name:
         return False
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$", name):
+    if REF_CONTROL.search(name):
         return False
-    if name.endswith("/") or name.endswith(".") or name.endswith(".lock"):
+    if name.startswith("-") or name.startswith("/") or name.endswith("/") or name.endswith("."):
         return False
     if ".." in name or "@{" in name or "//" in name:
         return False
+    if name.endswith(".lock") or "/.lock" in name:
+        return False
+    if any(character in REF_FORBIDDEN for character in name):
+        return False
     return True
+
+
+def _safe_branch(name):
+    # Git is authoritative; the structural guard only blocks control/revision constructs.
+    if not _structurally_safe(name):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "check-ref-format", "--branch", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _safe_ref(ref):
+    return _structurally_safe(ref) and ref.startswith("refs/")
 
 
 def _derive_role(ref, dev, prod):
@@ -215,13 +227,13 @@ def _validate_request(request):
         raise StateError("malformed-request")
     if not REPO.match(request["repo"]) or not HEX40.match(request["sha"]):
         raise StateError("malformed-request")
-    if not REF.match(request["ref"]):
+    if not _safe_ref(request["ref"]):
         raise StateError("malformed-request")
     if not NUMERIC.match(request["run"]) or not NUMERIC.match(request["attempt"]):
         raise StateError("malformed-request")
     if not NUMERIC.match(request["runNumber"]):
         raise StateError("malformed-request")
-    if not _valid_branch(request["dev"]) or not _valid_branch(request["prod"]):
+    if not _safe_branch(request["dev"]) or not _safe_branch(request["prod"]):
         raise StateError("malformed-request")
     if request["dev"] == request["prod"]:
         raise StateError("malformed-request")
@@ -231,7 +243,7 @@ def _validate_request(request):
         raise StateError("malformed-request")
     for row in request["tags"]:
         _check_keys(row, TAG_ROW_KEYS, "malformed-request")
-        if not REF.match(row["ref"]):
+        if not _safe_ref(row["ref"]):
             raise StateError("malformed-request")
         if not HEX40.match(row["objectSha"]) or not HEX40.match(row["commit"]):
             raise StateError("malformed-request")
@@ -375,13 +387,13 @@ def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
         raise StateError("unknown-version")
     if not REPO.match(state["repo"]) or not HEX40.match(state["sha"]):
         raise StateError("malformed")
-    if not REF.match(state["ref"]):
+    if not _safe_ref(state["ref"]):
         raise StateError("malformed")
     if not NUMERIC.match(state["run"]) or not NUMERIC.match(state["attempt"]):
         raise StateError("malformed")
     if state["event"] not in EVENTS:
         raise StateError("malformed")
-    if not _valid_branch(state["dev"]) or not _valid_branch(state["prod"]):
+    if not _safe_branch(state["dev"]) or not _safe_branch(state["prod"]):
         raise StateError("malformed")
     if state["dev"] == state["prod"]:
         raise StateError("malformed")
@@ -452,10 +464,20 @@ def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
             if state["releaseTagState"] != "not-applicable" or state["currentShaTags"]:
                 raise StateError("malformed")
 
+    # Bind event and effective policy ref from the runner env; state never chooses its context.
+    event_context = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event_context and (event_context not in EVENTS or state["event"] != event_context):
+        raise StateError("binding-mismatch")
+    if event_context == "pull_request":
+        base_ref = os.environ.get("GITHUB_BASE_REF", "")
+        if not _safe_branch(base_ref) or state["ref"] != "refs/heads/" + base_ref:
+            raise StateError("binding-mismatch")
+    else:
+        if state["ref"] != os.environ.get("GITHUB_REF", ""):
+            raise StateError("binding-mismatch")
     expected = {
         "repo": os.environ.get("GITHUB_REPOSITORY", ""),
         "sha": os.environ.get("GITHUB_SHA", "").lower(),
-        "ref": os.environ.get("GITHUB_REF", ""),
         "run": os.environ.get("GITHUB_RUN_ID", ""),
         "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
     }
