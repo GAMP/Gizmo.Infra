@@ -60,7 +60,6 @@ runs:
           fail "GitHub returned malformed caller repository metadata."
         fi
         [[ "$visibility" == "$GIZMO_REPOSITORY_VISIBILITY" ]] || fail "Caller repository visibility drifted from the planned state; refusing to publish."
-        [[ "$visibility" == private ]] || fail "The internal publisher requires a private caller repository; refusing to route visibility '$visibility'."
         [[ "$GIZMO_PUBLISHER" == internal ]] || fail "The planned publisher is not internal; refusing to publish."
         [[ "$GIZMO_EVENT" == push ]] || fail "The planned event is not push; refusing to publish."
 

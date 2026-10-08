@@ -143,6 +143,14 @@ public sealed class CallerOwnedPublishingActionContractTests
             var unprotected = WorkflowShell.RunBash(step, Path.GetTempPath(), GuardEnvironment("push", "false", "refs/heads/release"));
             Assert.NotEqual(0, unprotected.ExitCode);
             Assert.Contains("Publishing requires a protected branch ref.", unprotected.StandardError, StringComparison.Ordinal);
+
+            var unsupportedEvent = WorkflowShell.RunBash(step, Path.GetTempPath(), GuardEnvironment("workflow_dispatch", "true", "refs/heads/release"));
+            Assert.NotEqual(0, unsupportedEvent.ExitCode);
+            Assert.Contains("Publishing is allowed only from push.", unsupportedEvent.StandardError, StringComparison.Ordinal);
+
+            var nonBranchRef = WorkflowShell.RunBash(step, Path.GetTempPath(), GuardEnvironment("push", "true", "refs/tags/v3.0.0"));
+            Assert.NotEqual(0, nonBranchRef.ExitCode);
+            Assert.Contains("Publishing requires a protected branch ref.", nonBranchRef.StandardError, StringComparison.Ordinal);
         }
         var tagGuard = GetStep("tag", "Validate trusted tag invocation");
         var prTag = WorkflowShell.RunBash(tagGuard, Path.GetTempPath(), GuardEnvironment("pull_request", "true", "refs/heads/release"));
@@ -174,6 +182,20 @@ public sealed class CallerOwnedPublishingActionContractTests
         var tagGuard = GetStep("tag", "Validate trusted tag invocation");
         var acceptedTag = WorkflowShell.RunBash(tagGuard, Path.GetTempPath(), GuardEnvironment("push", "true", "refs/heads/release"));
         Assert.Equal(0, acceptedTag.ExitCode);
+    }
+
+    [Fact]
+    public void InternalPublisher_UsesSharedPublisherStateWithoutVisibilityDestinationPolicyGate()
+    {
+        var internalAction = Read("internal");
+        Assert.Contains("--expect-publisher internal", internalAction, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$visibility\" == \"$GIZMO_REPOSITORY_VISIBILITY\" ]]", internalAction, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$GIZMO_PUBLISHER\" == internal ]]", internalAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("repository-visibility:", internalAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a private caller repository", internalAction, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("requires a public caller repository", internalAction, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("[[ \"$visibility\" == private ]]", internalAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("[[ \"$visibility\" == public ]]", internalAction, StringComparison.Ordinal);
     }
 
     private static string GetStep(string action, string name)

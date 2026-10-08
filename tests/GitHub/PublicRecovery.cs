@@ -63,6 +63,72 @@ public sealed class PrivilegedActionStateGuardTests
     }
 
     [Fact]
+    public void InternalAction_RejectsNugetPlannedStateBeforeMetadataOrRegistryRequests()
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, repository.AbsolutePath("curl.log"));
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
+            repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("missing, malformed, tampered, or unknown-version", result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(repository.AbsolutePath("curl.log")));
+        Assert.Empty(File.ReadAllText(output));
+    }
+
+    [Theory]
+    [InlineData("unknown-version")]
+    [InlineData("unsupported-routing")]
+    public void InternalAction_RejectsUnknownOrUnsupportedPolicyStateBeforeMetadata(string fault)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "development", "prepared");
+        state = fault == "unknown-version"
+            ? ReplaceStateField(state, "v", "2")
+            : ReplaceStateField(ReplaceStateField(state, "repositoryVisibility", "\"internal\""), "publisher", "\"internal\"");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
+            repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(fault, result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(curlLog));
+        Assert.Empty(File.ReadAllText(output));
+    }
+
+    [Fact]
+    public void InternalAction_RejectsLiveVisibilityDriftBeforePackageFeedOrPublicationCalls()
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var curlLog = repository.AbsolutePath("curl.log");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        environment["STUB_LIVE_VISIBILITY"] = "public";
+        var stubs = "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --write-out|--header) shift 2 ;; --silent|--show-error|--location) shift ;; *) shift ;; esac; done; printf '{\"visibility\":\"%s\"}' \"$STUB_LIVE_VISIBILITY\" > \"$output\"; printf 200; echo \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY\" >> \"$CURL_LOG\"; }\n"
+            + "jq() { printf '%s' \"$STUB_LIVE_VISIBILITY\"; }\n";
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + stubs + step, repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("visibility drifted from the planned state", result.StandardError, StringComparison.Ordinal);
+        var requests = File.ReadAllLines(curlLog);
+        Assert.Single(requests);
+        Assert.Contains("/repos/owner/repository", requests[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("nuget.pkg.github.com", string.Join('\n', requests), StringComparison.Ordinal);
+        Assert.DoesNotContain("/git/refs", string.Join('\n', requests), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void PublisherSameShaCollisionIsGatedAndTagCannotMoveExistingReleaseRef()
     {
         var nuget = ReadAction("nuget");
@@ -554,6 +620,19 @@ public sealed class PrivilegedActionStateGuardTests
         return Parse(seal.StandardOutput)["state"];
     }
 
+    private static string ReplaceStateField(string state, string key, string jsonValue)
+    {
+        var normalized = state.Replace('-', '+').Replace('_', '/');
+        normalized += new string('=', (4 - normalized.Length % 4) % 4);
+        using var document = JsonDocument.Parse(Convert.FromBase64String(normalized));
+        var fields = document.RootElement.EnumerateObject()
+            .ToDictionary(property => property.Name, property => property.Value.Clone(), StringComparer.Ordinal);
+        using var replacement = JsonDocument.Parse(jsonValue);
+        fields[key] = replacement.RootElement.Clone();
+        return Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(fields))
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
     private static ShellResult RunCollision(
         TempRepository repository,
         string action,
@@ -903,9 +982,11 @@ public sealed class PrivilegedActionStateGuardTests
             ["STATE_PARSER"] = Path.Combine(Root, ".github", "package", "state.py").Replace('\\', '/'),
             ["NUSPEC_PARSER"] = Path.Combine(Root, ".github", "package", "nuspec.py").Replace('\\', '/'),
             ["GH_TOKEN"] = "mock-token",
+            ["GITHUB_EVENT_NAME"] = "push",
             ["GITHUB_REPOSITORY"] = "owner/repository",
             ["GITHUB_SHA"] = Sha,
             ["GITHUB_REF"] = "refs/heads/pre-release",
+            ["GITHUB_BASE_REF"] = string.Empty,
             ["GITHUB_RUN_ID"] = "700",
             ["GITHUB_RUN_ATTEMPT"] = "1",
             ["GITHUB_ENV"] = envFile,
