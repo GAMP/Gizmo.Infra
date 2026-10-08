@@ -3,6 +3,8 @@
 
 The nuspec is untrusted, so it is parsed as namespace-aware XML rather than
 scanned with substring or regex extraction that a decoy element could satisfy.
+This module is the single checked-in source shared by the NuGet and internal
+publishers; the internal path uses it instead of regex commit extraction.
 """
 
 import os

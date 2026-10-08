@@ -17,10 +17,8 @@ public sealed class NuspecProvenanceParserTests
     private static string ScriptPath => Path.Combine(
         InfraRepositoryLocator.ResolveRoot(),
         ".github",
-        "actions",
-        "public",
-        "scripts",
-        "nuspec_provenance.py");
+        "package",
+        "nuspec.py");
 
     [Fact]
     public void ValidNamespacedMetadata_Accepts() =>

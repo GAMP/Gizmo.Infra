@@ -7,10 +7,10 @@ inputs:
   github-token:
     description: Caller workflow token used only for authenticated repository metadata lookup.
     required: true
-  development-branch:
+  dev:
     description: Caller development branch name declared once in the single caller workflow.
     required: true
-  production-branch:
+  prod:
     description: Caller production branch name declared once in the single caller workflow.
     required: true
   current-ref:
@@ -41,8 +41,8 @@ runs:
       env:
         CALLER_REPOSITORY: ${{ inputs.caller-repository }}
         GH_TOKEN: ${{ inputs.github-token }}
-        DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
-        PRODUCTION_BRANCH: ${{ inputs.production-branch }}
+        DEV_BRANCH: ${{ inputs.dev }}
+        PROD_BRANCH: ${{ inputs.prod }}
         CURRENT_REF: ${{ inputs.current-ref }}
       run: |
         set -euo pipefail
@@ -54,16 +54,16 @@ runs:
         [[ "$CALLER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "github.repository is malformed."
         [[ -n "$GH_TOKEN" ]] || fail "The caller GITHUB_TOKEN is required to read repository metadata."
 
-        [[ -n "$DEVELOPMENT_BRANCH" && -n "$PRODUCTION_BRANCH" ]] || fail "The development and production branch inputs are both required."
-        [[ "$DEVELOPMENT_BRANCH" != "$PRODUCTION_BRANCH" ]] || fail "The development and production branches must differ."
-        git check-ref-format --branch "$DEVELOPMENT_BRANCH" > /dev/null 2>&1 || fail "The development branch input is not a valid branch name."
-        git check-ref-format --branch "$PRODUCTION_BRANCH" > /dev/null 2>&1 || fail "The production branch input is not a valid branch name."
+        [[ -n "$DEV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The dev and prod branch inputs are both required."
+        [[ "$DEV_BRANCH" != "$PROD_BRANCH" ]] || fail "The dev and prod branches must differ."
+        git check-ref-format --branch "$DEV_BRANCH" > /dev/null 2>&1 || fail "The dev branch input is not a valid branch name."
+        git check-ref-format --branch "$PROD_BRANCH" > /dev/null 2>&1 || fail "The prod branch input is not a valid branch name."
 
         # The role derives only from event identity and the declared branches, never a caller configuration file.
         branch_role=none
-        if [[ "$CURRENT_REF" == "refs/heads/$DEVELOPMENT_BRANCH" ]]; then
+        if [[ "$CURRENT_REF" == "refs/heads/$DEV_BRANCH" ]]; then
           branch_role=development
-        elif [[ "$CURRENT_REF" == "refs/heads/$PRODUCTION_BRANCH" ]]; then
+        elif [[ "$CURRENT_REF" == "refs/heads/$PROD_BRANCH" ]]; then
           branch_role=production
         fi
 

@@ -1,4 +1,4 @@
-// The private publisher keeps this validator in a named file instead of an inline
+// The internal publisher keeps this validator in a named file instead of an inline
 // interpreter argument: a credential-shaped URL on an interpreter command line is
 // the process pattern endpoint security flags, and parsing still has to fail closed.
 // The untrusted candidate arrives on stdin, so it never appears in argv at all.

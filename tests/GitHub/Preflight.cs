@@ -1,476 +1,201 @@
-using System.Text.RegularExpressions;
 using Gizmo.Infra.Tests.TestSupport;
 using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Contract and executable coverage for the bundled <c>preflight</c>
-/// composite action: deterministic SDK-style packable project discovery, MSBuild
-/// metadata reads, branch configuration consumed from the reusable workflow
-/// inputs, authenticated caller-repository visibility, and the guarantee that the
-/// preflight adds no publishing or registry-routing behavior.
-///
-/// Executable tests run the action's own extracted bash blocks against a real
-/// working tree, so the committed source, not a hand copy, is under test.
-/// Network and GitHub are unavailable locally, so the visibility transport is
-/// exercised through its exact command text plus a curl test double, and the
-/// visibility parsing block runs its committed jq filter through a Node jq shim.
-/// </summary>
 public sealed class PackagePreflightActionTests
 {
-    private const string PreflightAction = "preflight";
-    private const string ValidationFile = "package-validation.yml";
-    private const string PublishFile = "package-publish.yml";
-
-    private static readonly string[] ContractFiles = [ValidationFile, PublishFile];
-
-    private static readonly string Action = WorkflowShell.ReadAction(PreflightAction);
-
-    private const string PackableProject = """
-        <Project Sdk="Microsoft.NET.Sdk">
-          <PropertyGroup>
-            <TargetFramework>net10.0</TargetFramework>
-            <PackageId>Gizmo.Widget</PackageId>
-            <Version>3.4</Version>
-          </PropertyGroup>
-        </Project>
-        """;
-
-    private const string UnpackableProject = """
-        <Project Sdk="Microsoft.NET.Sdk">
-          <PropertyGroup>
-            <TargetFramework>net10.0</TargetFramework>
-            <IsPackable>false</IsPackable>
-          </PropertyGroup>
-        </Project>
-        """;
+    private static string Action => WorkflowShell.ReadAction("preflight");
 
     [Fact]
-    public void Discovery_SelectsTheSinglePackableSdkProjectAndPrunesRepositoryTrees()
+    public void Preflight_DeclaresOnlyDiscoveryInputsAndDoesNotSelectPublisher()
     {
-        using var repository = new TempRepository();
-        repository.WriteFile("Widget.csproj", PackableProject);
-        repository.WriteFile("Samples.csproj", UnpackableProject);
-
-        // Checked-out metadata and the immutable Gizmo.Infra source tree may hold
-        // their own projects; neither is part of the caller's packable surface.
-        repository.WriteFile(".git/objects/Historical.csproj", PackableProject);
-        repository.WriteFile(".gizmo-infra/action/Packed.csproj", PackableProject);
-
-        var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
-
-        Assert.Equal(0, result.ExitCode);
-        Assert.Contains("count=1", result.StandardOutput, StringComparison.Ordinal);
-        Assert.Contains("project_path=Widget.csproj", result.StandardOutput, StringComparison.Ordinal);
-        Discovery_FailsClosedWhenNoProjectIsAPackableCandidate();
-        Discovery_FailsClosedWhenMultipleProjectsArePackableCandidates();
-    }
-
-    private void Discovery_FailsClosedWhenNoProjectIsAPackableCandidate()
-    {
-        using var repository = new TempRepository();
-        repository.WriteFile("Samples.csproj", UnpackableProject);
-
-        var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("found none", result.StandardError, StringComparison.Ordinal);
-    }
-
-    private void Discovery_FailsClosedWhenMultipleProjectsArePackableCandidates()
-    {
-        using var repository = new TempRepository();
-        repository.WriteFile("Alpha.csproj", PackableProject);
-        repository.WriteFile("Beta.csproj", PackableProject);
-
-        var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("found multiple candidates", result.StandardError, StringComparison.Ordinal);
-    }
-
-    private void Discovery_UsesDeterministicNulTerminatedOrderingAndAPackablePredicate()
-    {
-        Assert.Contains(
-            "-path ./.git -prune -o -path ./.gizmo-infra -prune -o -type f -name '*.csproj' -print0",
-            Action,
-            StringComparison.Ordinal);
-        Assert.Contains("| LC_ALL=C sort -z)", Action, StringComparison.Ordinal);
-        Assert.Contains("[[ \"$is_sdk_style\" == true && \"$is_packable\" == true ]]", Action, StringComparison.Ordinal);
-        Assert.Contains("candidates+=(\"$project\")", Action, StringComparison.Ordinal);
-        Assert.Contains("case ${#candidates[@]} in", Action, StringComparison.Ordinal);
-        Assert.Contains("1) project_path=${candidates[0]} ;;", Action, StringComparison.Ordinal);
-        Assert.Contains("0) fail \"Expected exactly one SDK-style packable .csproj; found none.\" ;;", Action, StringComparison.Ordinal);
-        Assert.Contains("*) fail \"Expected exactly one SDK-style packable .csproj; found multiple candidates.\" ;;", Action, StringComparison.Ordinal);
-
-        // A discovered path that carries a newline cannot be forwarded safely.
-        Assert.Contains("[[ \"$project\" != *$'\\n'* && \"$project\" != *$'\\r'* ]]", Action, StringComparison.Ordinal);
-    }
-
-    private void Metadata_ReadsPackageIdVersionAndPackabilityThroughMsbuild()
-    {
-        Assert.Contains("-getProperty:UsingMicrosoftNETSdk", Action, StringComparison.Ordinal);
-        Assert.Contains("-getProperty:IsPackable", Action, StringComparison.Ordinal);
-        Assert.Contains("-getProperty:PackageId", Action, StringComparison.Ordinal);
-        Assert.Contains("-getProperty:Version", Action, StringComparison.Ordinal);
-        Assert.Contains(
-            "[[ \"$is_packable\" == true ]] || fail \"The discovered project is not packable.\"",
-            Action,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "[[ \"$package_id\" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail \"The discovered project PackageId has an invalid format.\"",
-            Action,
-            StringComparison.Ordinal);
-
-        // The evaluated project Version selects the active compatibility line;
-        // the contract is canonical numeric <major>.<minor> with no leading zero
-        // and major >= 1, so 0.X is rejected even though the components are canonical.
-        Assert.Contains(
-            "[[ \"$compatibility_line\" =~ ^([1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]] || fail \"The discovered project Version must be exactly <major>.<minor>, with major at least 1 and no leading zero.\"",
-            Action,
-            StringComparison.Ordinal);
-    }
-
-    private void BranchInputs_AreValidatedAsDistinctGitBranchNamesAndRejectedWhenMissing()
-    {
-        // The preflight now reads the branch names from the reusable workflow
-        // inputs (development-branch and production-branch), never from a caller
-        // configuration file. They must be non-empty, distinct, and valid Git
-        // branch names so the role resolver cannot misclassify an unrelated ref.
-        Assert.Contains(
-            "[[ \"$DEVELOPMENT_BRANCH\" != \"$PRODUCTION_BRANCH\" ]] || fail \"The development and production branches must differ.\"",
-            Action,
-            StringComparison.Ordinal);
-        Assert.Contains("git check-ref-format --branch \"$DEVELOPMENT_BRANCH\"", Action, StringComparison.Ordinal);
-        Assert.Contains("git check-ref-format --branch \"$PRODUCTION_BRANCH\"", Action, StringComparison.Ordinal);
-
-        // The preflight fails closed when either input is missing.
-        Assert.Contains(
-            "[[ -n \"$DEVELOPMENT_BRANCH\" && -n \"$PRODUCTION_BRANCH\" ]] || fail \"The development and production branch inputs are both required.\"",
-            Action,
-            StringComparison.Ordinal);
-
-        // No caller configuration file is read for branch policy.
-        Assert.DoesNotContain(".github/package.yml", Action, StringComparison.Ordinal);
-        Assert.DoesNotContain("parse-package-config", Action, StringComparison.Ordinal);
+        var root = YamlWorkflowReader.Parse(Action);
+        Assert.Equal(new[] { "caller-repository", "current-ref", "dev", "github-token", "prod" },
+            Keys(YamlWorkflowReader.MappingChild(root, "inputs")).OrderBy(value => value, StringComparer.Ordinal));
+        Assert.Equal(new[] { "branch-role", "compatibility-line", "package-id", "project-path", "repository-visibility" },
+            Keys(YamlWorkflowReader.MappingChild(root, "outputs")).OrderBy(value => value, StringComparer.Ordinal));
+        foreach (var forbidden in new[] { "publisher", "ACTIONS_ID_TOKEN", "api.nuget.org", "nuget.pkg.github.com", "packages: write", "dotnet nuget push" })
+            Assert.DoesNotContain(forbidden, Action, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void BranchRole_ResolvesDevelopmentProductionOrNone()
+    public void BranchRole_ResolvesDevProductionAndCheapNoOp()
     {
-        foreach (var (currentRef, expected) in new[]
+        var block = WorkflowShell.ExtractBlock(Action, "branch_role=none", "fi");
+        foreach (var (reference, expected) in new[]
                  {
                      ("refs/heads/pre-release", "development"),
                      ("refs/heads/release", "production"),
-                     ("refs/heads/feature", "none"),
+                     ("refs/heads/topic", "none"),
                      ("refs/tags/v3.0.0", "none"),
                  })
         {
-            var result = RunBranchRole(currentRef);
+            var script = "set -euo pipefail\nDEV_BRANCH=pre-release\nPROD_BRANCH=release\nCURRENT_REF='" + reference + "'\n" + block + "\nprintf '%s' \"$branch_role\"\n";
+            var result = WorkflowShell.RunBash(script, Path.GetTempPath());
             Assert.Equal(0, result.ExitCode);
             Assert.Equal(expected, result.StandardOutput);
         }
-    }
-
-    private void VisibilityRequest_UsesCallerRepositoryAndWorkflowTokenAuthenticatedEndpoint()
-    {
-        Assert.Contains(
-            "[[ \"$CALLER_REPOSITORY\" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail \"github.repository is malformed.\"",
-            Action,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "[[ -n \"$GH_TOKEN\" ]] || fail \"The caller GITHUB_TOKEN is required to read repository metadata.\"",
-            Action,
-            StringComparison.Ordinal);
-        Assert.Contains("\"$GITHUB_API_URL/repos/$CALLER_REPOSITORY\"", Action, StringComparison.Ordinal);
-        Assert.Contains("--header \"Authorization: Bearer $GH_TOKEN\"", Action, StringComparison.Ordinal);
-        Assert.Contains("--header 'Accept: application/vnd.github+json'", Action, StringComparison.Ordinal);
-        Assert.Contains("--write-out '%{http_code}'", Action, StringComparison.Ordinal);
-        Assert.Contains("CALLER_REPOSITORY: ${{ inputs.caller-repository }}", Action, StringComparison.Ordinal);
-        Assert.Contains("GH_TOKEN: ${{ inputs.github-token }}", Action, StringComparison.Ordinal);
-
-        // The authenticated lookup must be time-bounded so a stalled GitHub
-        // response cannot hang the preflight indefinitely.
-        Assert.Contains("--connect-timeout 10", Action, StringComparison.Ordinal);
-        Assert.Contains("--max-time 30", Action, StringComparison.Ordinal);
-    }
-
-    private void Visibility_DeclaresTheFailClosedStringTypeFilter()
-    {
-        // The executable tests below run this filter through the jq shim; pinning
-        // the committed text keeps a weakened filter from being masked by it.
-        Assert.Equal(
-            "if type == \"object\" and (.visibility | type == \"string\") then .visibility else error(\"missing visibility\") end",
-            VisibilityJqFilter());
-        Assert.Contains("fail \"GitHub returned malformed caller repository metadata.\"", Action, StringComparison.Ordinal);
+        Assert.Contains("if [[ \"$branch_role\" != none ]]", Action, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Visibility_FailsClosedOnTransportAndNonSuccessStatus()
+    public void BranchInputs_RejectMissingEqualAndMalformedNames()
     {
-        foreach (var (failTransport, httpStatus, expectedError) in new[]
+        Assert.Contains("git check-ref-format --branch \"$DEV_BRANCH\"", Action, StringComparison.Ordinal);
+        Assert.Contains("git check-ref-format --branch \"$PROD_BRANCH\"", Action, StringComparison.Ordinal);
+        foreach (var (dev, prod, expected) in new[]
                  {
-                     (true, "500", "Could not fetch authenticated caller repository metadata."),
-                     (false, "500", "GitHub returned HTTP 500 for caller repository metadata."),
-                     (false, "404", "GitHub returned HTTP 404 for caller repository metadata."),
+                     ("", "release", "both required"),
+                     ("release", "release", "must differ"),
+                     ("bad..branch", "release", "valid branch name"),
                  })
         {
-            var result = RunVisibilityRequest(failTransport, httpStatus);
+            var script = "set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n"
+                + "DEV_BRANCH='" + dev + "'\nPROD_BRANCH='" + prod + "'\n"
+                + WorkflowShell.ExtractBlock(Action, "[[ -n \"$DEV_BRANCH\"", "git check-ref-format --branch \"$PROD_BRANCH\"");
+            var result = WorkflowShell.RunBash(script, Path.GetTempPath());
             Assert.NotEqual(0, result.ExitCode);
-            Assert.Contains(expectedError, result.StandardError, StringComparison.Ordinal);
+            Assert.Contains(expected, result.StandardError, StringComparison.Ordinal);
         }
-        Visibility_AcceptsAnAuthenticatedHttp200Response();
-    }
-
-    private void Visibility_AcceptsAnAuthenticatedHttp200Response()
-    {
-        var result = RunVisibilityRequest(failTransport: false, httpStatus: "200");
-
-        Assert.Equal(0, result.ExitCode);
-    }
-
-    private void VisibilityRequest_ExtractsTheCompleteRequestBlockNotAnInnerSubstring()
-    {
-        var transport = WorkflowShell.ExtractBlock(Action, "if ! status=$(curl", "fi");
-
-        // Regression: the 'fi' inside 'response_file' must not close the block.
-        Assert.Contains("--output \"$response_file\"", transport, StringComparison.Ordinal);
-        Assert.Contains(
-            "Could not fetch authenticated caller repository metadata.",
-            transport,
-            StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Visibility_AcceptsOnlyKnownVisibilityFromParsedMetadata()
+    public void Preflight_ValidatesProjectMetadataAndAuthenticatedVisibilityFailClosed()
     {
-        foreach (var value in new[] { "public", "private", "internal" })
+        Assert.Contains("find . -path ./.git -prune -o -path ./.gizmo-infra -prune", Action, StringComparison.Ordinal);
+        Assert.Contains("Expected exactly one SDK-style packable .csproj", Action, StringComparison.Ordinal);
+        Assert.Contains("compatibility_line=", Action, StringComparison.Ordinal);
+        Assert.Contains("-getProperty:PackageId", Action, StringComparison.Ordinal);
+        Assert.Contains("-getProperty:Version", Action, StringComparison.Ordinal);
+        Assert.Contains("PackageId has an invalid format", Action, StringComparison.Ordinal);
+        Assert.Contains("Version must be exactly <major>.<minor>", Action, StringComparison.Ordinal);
+        Assert.Contains("GITHUB_API_URL/repos/$CALLER_REPOSITORY", Action, StringComparison.Ordinal);
+        Assert.Contains("Authorization: Bearer $GH_TOKEN", Action, StringComparison.Ordinal);
+        Assert.Contains("public|private|internal", Action, StringComparison.Ordinal);
+        Assert.Contains("unsupported caller repository visibility", Action, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Discovery_ExecutesNoMultiplePrunedAndNewlineCandidateCases()
+    {
+        using (var repository = new TempRepository())
         {
-            var result = RunVisibilityParsing($"{{\"visibility\":\"{value}\"}}");
+            repository.WriteFile("Widget.csproj", "sdk");
+            repository.WriteFile(".git/objects/Hidden.csproj", "sdk");
+            repository.WriteFile(".gizmo-infra/Hidden.csproj", "sdk");
+            repository.WriteFile("Samples-not-sdk.csproj", "not-sdk");
+            var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
             Assert.Equal(0, result.ExitCode);
-            Assert.Equal("accepted", result.StandardOutput);
+            Assert.Contains("count=1", result.StandardOutput, StringComparison.Ordinal);
+            Assert.Contains("project_path=Widget.csproj", result.StandardOutput, StringComparison.Ordinal);
+        }
+
+        using (var repository = new TempRepository())
+        {
+            repository.WriteFile("Samples-not-sdk.csproj", "not-sdk");
+            var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("found none", result.StandardError, StringComparison.Ordinal);
+        }
+
+        using (var repository = new TempRepository())
+        {
+            repository.WriteFile("Alpha.csproj", "sdk");
+            repository.WriteFile("Beta.csproj", "sdk");
+            var result = WorkflowShell.RunBash(DiscoveryScript(), repository.Root);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("found multiple candidates", result.StandardError, StringComparison.Ordinal);
+        }
+
+        using (var repository = new TempRepository())
+        {
+            var result = WorkflowShell.RunBash(DiscoveryScript(newlineCandidate: true), repository.Root);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("contains a newline", result.StandardError, StringComparison.Ordinal);
         }
     }
 
     [Fact]
-    public void Visibility_FailsClosedOnUnknownVisibilityValues()
+    public void VisibilityRequestAndParsing_ExecuteTransportStatusAndMetadataFailures()
     {
-        foreach (var value in new[] { "gist", "PUBLIC" })
+        foreach (var (transportFail, status, expected) in new[]
+                 {
+                     (true, "200", "Could not fetch authenticated caller repository metadata."),
+                     (false, "500", "GitHub returned HTTP 500"),
+                     (false, "404", "GitHub returned HTTP 404"),
+                 })
         {
-            var result = RunVisibilityParsing($"{{\"visibility\":\"{value}\"}}");
+            var result = RunVisibilityRequest(transportFail, status);
             Assert.NotEqual(0, result.ExitCode);
-            Assert.Contains("GitHub returned an unsupported caller repository visibility.", result.StandardError, StringComparison.Ordinal);
+            Assert.Contains(expected, result.StandardError, StringComparison.Ordinal);
         }
-    }
+        Assert.Equal(0, RunVisibilityRequest(transportFail: false, status: "200").ExitCode);
 
-    [Fact]
-    public void Visibility_FailsClosedOnMissingNonStringOrNonObjectMetadata()
-    {
-        foreach (var responseBody in new[] { "{}", "{\"visibility\":123}", "[]", "not json" })
+        foreach (var visibility in new[] { "public", "private", "internal" })
         {
-            var result = RunVisibilityParsing(responseBody);
+            Assert.Equal(0, RunVisibilityParsing($"{{\"visibility\":\"{visibility}\"}}").ExitCode);
+        }
+        foreach (var visibility in new[] { "gist", "PUBLIC" })
+        {
+            var result = RunVisibilityParsing($"{{\"visibility\":\"{visibility}\"}}");
             Assert.NotEqual(0, result.ExitCode);
-            Assert.Contains("GitHub returned malformed caller repository metadata.", result.StandardError, StringComparison.Ordinal);
+            Assert.Contains("unsupported caller repository visibility", result.StandardError, StringComparison.Ordinal);
+        }
+        foreach (var body in new[] { "{}", "{\"visibility\":12}", "[]", "not json" })
+        {
+            var result = RunVisibilityParsing(body);
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("malformed caller repository metadata", result.StandardError, StringComparison.Ordinal);
             Assert.Empty(result.StandardOutput);
         }
     }
 
-    private void Preflight_NeverReadsEventSpecificRepositoryContext()
-    {
-        Assert.DoesNotContain("github.event.repository", Action, StringComparison.Ordinal);
+    private static IEnumerable<string> Keys(YamlMappingNode mapping) => mapping.Children.Keys
+        .Select(key => Assert.IsType<YamlScalarNode>(key).Value ?? string.Empty);
 
-        foreach (var file in ContractFiles)
-        {
-            Assert.DoesNotContain("github.event.repository.visibility", Read(file), StringComparison.Ordinal);
-        }
-    }
-
-    private void Preflight_IntroducesNoPublishingOrRegistryRouting()
-    {
-        foreach (var forbidden in new[]
-                 {
-                     "dotnet nuget push", "dotnet pack", "dotnet build", "dotnet restore",
-                     "ACTIONS_ID_TOKEN", "id-token", "api.nuget.org", "nuget.pkg.github.com",
-                     "NUGET_API_KEY", "packages: write", "secrets:", "GITHUB_REPOSITORY_OWNER",
-                     "--source",
-                 })
-        {
-            Assert.DoesNotContain(forbidden, Action, StringComparison.Ordinal);
-        }
-    }
-
-    [Fact]
-    public void Preflight_DeclaresNoPublisherIdentityOrProfileValidation()
-    {
-        Discovery_UsesDeterministicNulTerminatedOrderingAndAPackablePredicate();
-        Metadata_ReadsPackageIdVersionAndPackabilityThroughMsbuild();
-        BranchInputs_AreValidatedAsDistinctGitBranchNamesAndRejectedWhenMissing();
-        VisibilityRequest_UsesCallerRepositoryAndWorkflowTokenAuthenticatedEndpoint();
-        Visibility_DeclaresTheFailClosedStringTypeFilter();
-        VisibilityRequest_ExtractsTheCompleteRequestBlockNotAnInnerSubstring();
-        Preflight_NeverReadsEventSpecificRepositoryContext();
-        Preflight_IntroducesNoPublishingOrRegistryRouting();
-        Action_DeclaresOnlyThePreflightInputsOutputsAndCompositeStep();
-        Workflows_PassCallerIdentityAndConsumeOnlyPreflightMetadataOutputs();
-
-        // The preflight must carry no publisher identity and perform no
-        // public-profile validation. Reintroducing either would let the
-        // preflight branch on a publisher credential.
-        Assert.DoesNotContain("NUGET_USER", Action, StringComparison.Ordinal);
-        Assert.DoesNotContain("nuget-user", Action, StringComparison.Ordinal);
-    }
-
-    private void Action_DeclaresOnlyThePreflightInputsOutputsAndCompositeStep()
-    {
-        var root = YamlWorkflowReader.Parse(Action);
-
-        Assert.Equal(
-            new[]
-            {
-                "caller-repository", "current-ref", "development-branch", "github-token",
-                "production-branch",
-            },
-            MappingKeys(YamlWorkflowReader.MappingChild(root, "inputs"))
-                .OrderBy(name => name, StringComparer.Ordinal)
-                .ToArray());
-        Assert.Equal(
-            new[] { "branch-role", "compatibility-line", "package-id", "project-path", "repository-visibility" },
-            MappingKeys(YamlWorkflowReader.MappingChild(root, "outputs"))
-                .OrderBy(name => name, StringComparer.Ordinal)
-                .ToArray());
-
-        var runs = YamlWorkflowReader.MappingChild(root, "runs");
-        Assert.Equal("composite", YamlWorkflowReader.ScalarChild(runs, "using"));
-
-        var step = Assert.Single(YamlWorkflowReader.MappingSequence(runs, "steps"));
-        Assert.Equal("discover", YamlWorkflowReader.ScalarChild(step, "id"));
-        Assert.Equal("bash", YamlWorkflowReader.ScalarChild(step, "shell"));
-        Assert.False(YamlWorkflowReader.HasChild(step, "uses"));
-    }
-
-    private void Workflows_PassCallerIdentityAndConsumeOnlyPreflightMetadataOutputs()
-    {
-        foreach (var file in ContractFiles)
-        {
-            var build = BuildJob(Parse(file), file);
-            var metadata = StepById(build, "metadata");
-
-            Assert.Equal(
-                "./.gizmo-infra/.github/actions/preflight",
-                YamlWorkflowReader.ScalarChild(metadata, "uses"));
-
-            var with = YamlWorkflowReader.MappingChild(metadata, "with");
-            Assert.Equal("${{ github.repository }}", YamlWorkflowReader.ScalarChild(with, "caller-repository"));
-            Assert.Equal("${{ github.token }}", YamlWorkflowReader.ScalarChild(with, "github-token"));
-
-            // Pull requests resolve the role from the PR base branch; push resolves
-            // it from the pushed ref. The caller workflow has no workflow_dispatch
-            // trigger, so dispatch never reaches the preflight.
-            Assert.Contains("github.event_name == 'pull_request'", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
-            Assert.Contains("github.base_ref", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
-            Assert.Contains("github.ref", YamlWorkflowReader.ScalarChild(with, "current-ref"), StringComparison.Ordinal);
-
-            // The preflight discovers these; the workflow must not resupply them.
-            foreach (var forbidden in new[]
-                     {
-                         "project-path", "package-id", "package-visibility", "repository-visibility",
-                         "nuget-user", "require-nuget-user",
-                     })
-            {
-                Assert.False(YamlWorkflowReader.HasChild(with, forbidden), $"{file} must not pass '{forbidden}'.");
-            }
-        }
-    }
-
-    private static ShellResult RunBranchRole(string currentRef)
-    {
-        var block = WorkflowShell.ExtractBlock(Action, "branch_role=none", "fi");
-        var script =
-            "DEVELOPMENT_BRANCH=pre-release\n"
-            + "PRODUCTION_BRANCH=release\n"
-            + $"CURRENT_REF='{currentRef}'\n"
-            + block
-            + "\nprintf '%s' \"$branch_role\"\n";
-        return WorkflowShell.RunBash(script, Path.GetTempPath());
-    }
-
-    private static ShellResult RunVisibilityRequest(bool failTransport, string httpStatus)
-    {
-        var transport = WorkflowShell.ExtractBlock(Action, "if ! status=$(curl", "fi");
-        var statusGuard = WorkflowShell.ExtractBlock(Action, "[[ \"$status\" == 200 ]]", "\n");
-        var stub = "curl() { " + (failTransport ? "return 7;" : $"printf '{httpStatus}';") + " }\n";
-        var script =
-            "set -euo pipefail\n"
-            + "fail() { echo \"$1\" >&2; exit 1; }\n"
-            + stub
-            + "CALLER_REPOSITORY=owner/repo\n"
-            + "GH_TOKEN=token\n"
-            + "GITHUB_API_URL=https://api.github.com\n"
-            + "response_file=/dev/null\n"
-            + transport
-            + "\n"
-            + statusGuard
-            + "\nprintf 'ok'\n";
-        return WorkflowShell.RunBash(script, Path.GetTempPath());
-    }
-
-    private static ShellResult RunVisibilityParsing(string responseBody)
-    {
-        using var repository = new TempRepository();
-        repository.WriteFile("response.json", responseBody);
-        var shim = JqShim.BashFunction(repository.WriteFile("jq.js", JqShim.JavaScript));
-        var parsing = WorkflowShell.ExtractBlock(Action, "if ! repository_visibility=$(jq", "esac");
-        var script =
-            "set -euo pipefail\n"
-            + "fail() { echo \"$1\" >&2; exit 1; }\n"
-            + shim
-            + "\nresponse_file=response.json\n"
-            + parsing
-            + "\nprintf 'accepted'\n";
-        return WorkflowShell.RunBash(script, repository.Root);
-    }
-
-    private static string VisibilityJqFilter()
-    {
-        var block = WorkflowShell.ExtractBlock(Action, "if ! repository_visibility=$(jq", "esac");
-        var match = Regex.Match(block, @"jq -er '(?<filter>[^']*)'", RegexOptions.CultureInvariant);
-        Assert.True(match.Success, "the visibility block has no jq -er filter.");
-        return match.Groups["filter"].Value;
-    }
-
-    private static string DiscoveryScript()
+    private static string DiscoveryScript(bool newlineCandidate = false)
     {
         var block = WorkflowShell.ExtractBlock(Action, "candidates=()", "esac");
+        var findStub = newlineCandidate ? "find() { printf './bad\\nname.csproj\\0'; }\n" : string.Empty;
         return $$"""
             set -euo pipefail
             fail() { echo "$1" >&2; exit 1; }
+            {{findStub}}
+            dotnet() {
+              case "$*" in
+                *-getProperty:UsingMicrosoftNETSdk*) [[ "$*" == *not-sdk* ]] && printf false || printf true ;;
+                *-getProperty:IsPackable*) printf true ;;
+                *) echo "unexpected dotnet arguments: $*" >&2; return 7 ;;
+              esac
+            }
             {{block}}
-            printf 'count=%s\n' "${#candidates[@]}"
-            printf 'project_path=%s\n' "${project_path:-}"
+            printf 'count=%s\nproject_path=%s\n' "${#candidates[@]}" "${project_path:-}"
             """;
     }
 
-    private static IEnumerable<string> MappingKeys(YamlMappingNode mapping) =>
-        mapping.Children.Keys.Select(key => Assert.IsType<YamlScalarNode>(key).Value ?? string.Empty);
+    private static ShellResult RunVisibilityRequest(bool transportFail, string status)
+    {
+        var request = WorkflowShell.ExtractBlock(Action, "if ! status=$(curl", "fi");
+        var statusGuard = WorkflowShell.ExtractBlock(Action, "[[ \"$status\" == 200 ]]", "\n");
+        var curl = transportFail
+            ? "curl() { return 7; }"
+            : "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; *) shift ;; esac; done; printf '{\"visibility\":\"public\"}' > \"$output\"; printf '%s' \"$STUB_STATUS\"; }";
+        var script = "set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n" + curl + "\n"
+            + "CALLER_REPOSITORY=owner/repo\nGH_TOKEN=mock\nGITHUB_API_URL=https://api.github.com\nresponse_file=\"$STUB_RESPONSE\"\n"
+            + request + "\n" + statusGuard + "\n";
+        using var repository = new TempRepository();
+        var environment = new Dictionary<string, string> { ["STUB_STATUS"] = status, ["STUB_RESPONSE"] = repository.AbsolutePath("response.json") };
+        return WorkflowShell.RunBash(script, repository.Root, environment);
+    }
 
-    private static string Read(string fileName) => WorkflowShell.ReadWorkflow(fileName);
-
-    private static YamlMappingNode Parse(string fileName) => YamlWorkflowReader.Parse(Read(fileName));
-
-    private static YamlMappingNode Jobs(YamlMappingNode root) => YamlWorkflowReader.MappingChild(root, "jobs");
-
-    private static YamlMappingNode Job(YamlMappingNode root, string name) =>
-        YamlWorkflowReader.MappingChild(Jobs(root), name);
-
-    private static YamlMappingNode BuildJob(YamlMappingNode root, string file) =>
-        Job(root, file == ValidationFile ? "validate" : "build");
-
-    private static YamlMappingNode StepById(YamlMappingNode job, string id) =>
-        YamlMappingNode_MappingSequence(job).Single(step =>
-            YamlWorkflowReader.HasChild(step, "id")
-            && YamlWorkflowReader.ScalarChild(step, "id") == id);
-
-    private static IReadOnlyList<YamlMappingNode> YamlMappingNode_MappingSequence(YamlMappingNode job) =>
-        YamlWorkflowReader.MappingSequence(job, "steps");
+    private static ShellResult RunVisibilityParsing(string body)
+    {
+        using var repository = new TempRepository();
+        repository.WriteFile("response.json", body);
+        var jq = JqShim.BashFunction(repository.WriteFile("jq.js", JqShim.JavaScript));
+        var block = WorkflowShell.ExtractBlock(Action, "if ! repository_visibility=$(jq", "esac");
+        var script = "set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n" + jq + "\nresponse_file=response.json\n" + block;
+        return WorkflowShell.RunBash(script, repository.Root);
+    }
 }

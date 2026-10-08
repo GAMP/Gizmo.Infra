@@ -286,6 +286,37 @@ public static class WorkflowShell
         return Execute(startInfo, standardInput);
     }
 
+    public static ShellResult RunPythonCli(
+        string scriptPath,
+        IReadOnlyList<string> arguments,
+        string standardInput,
+        IReadOnlyDictionary<string, string>? environment = null)
+    {
+        var startInfo = new ProcessStartInfo(PythonExecutable)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            StandardInputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+        };
+        startInfo.ArgumentList.Add(scriptPath);
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        if (environment is not null)
+        {
+            foreach (var pair in environment)
+            {
+                startInfo.Environment[pair.Key] = pair.Value;
+            }
+        }
+
+        return Execute(startInfo, standardInput);
+    }
+
     private static ShellResult Execute(ProcessStartInfo startInfo, string? standardInput = null)
     {
         using var process = Process.Start(startInfo)

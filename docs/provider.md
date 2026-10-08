@@ -1,158 +1,145 @@
-# GitHub NuGet provider
+# Gizmo.Infra package provider
 
-This is the callable-workflow contract for GitHub Actions NuGet pipelines in
-Gizmo.Infra. It documents workflows and composite actions only; it does not
-configure GitHub, NuGet, or a caller repository, and the reusable publish
+This is the callable-workflow contract for GitHub Actions package pipelines in
+Gizmo.Infra. It documents the workflow and composite actions only; it does not
+configure GitHub, a package feed, or a caller repository, and the reusable plan
 workflow does not perform a publication or tag write. The caller-owned routing
-and authentication shape is in
-[caller.md](caller.md).
+shape is in [caller.md](caller.md).
 
-## Callable workflows
+## Callable workflow
 
-Gizmo.Infra exposes two direct `workflow_call` workflows. There is no mode,
-descriptor version, workflow version, or equivalent version input. Both require
-the caller-supplied `development-branch` and `production-branch` string inputs:
-normal version-controlled branch policy, never secrets, and never a project,
-package, visibility, patch, version, or registry input.
+Gizmo.Infra exposes one direct `workflow_call` workflow,
+`.github/workflows/package.yml`. It requires exactly two caller-supplied string
+inputs, `dev` and `prod`, and declares exactly three outputs, `publisher`, `tag`,
+and `state`. There is no mode, descriptor version, workflow version, project,
+package, version, patch, or visibility input.
 
-| Workflow | Purpose | Caller permissions |
-| --- | --- | --- |
-| `.github/workflows/package-validation.yml` | Calculate, restore, audit, build, pack, and retain a nonpublished validation package. It cannot publish or tag. | `contents: read` |
-| `.github/workflows/package-publish.yml` | Resolve the caller branch role, calculate the development or stable version and tag state, build, pack, and upload the exact package artifact, then export caller-routing outputs. It never requests OIDC, never contacts a package feed, never publishes, and never creates a tag. | `contents: read` |
+Every caller must reference the workflow at an immutable, complete 40-character
+Gizmo.Infra commit SHA. A branch, tag, abbreviated SHA, or expression is not an
+acceptable workflow reference.
 
-Every caller must use an immutable, complete 40-character Gizmo.Infra commit
-SHA. A branch, tag, abbreviated SHA, or expression is not an acceptable
-workflow reference.
+The workflow runs one `contents: read` preparation job. It resolves the caller
+branch role, discovers the single SDK-style packable project, resolves the
+authenticated caller repository visibility, calculates the package version and
+tag state, builds and packs the exact artifact, and emits the routing outputs. It
+never requests OIDC, never contacts a package feed, never publishes, and never
+creates a tag.
 
-A package repository needs exactly one package automation file,
-`.github/workflows/package.yml`. It triggers on `pull_request` and `push`,
-declares the two physical branch names exactly once as YAML anchors, and passes
-them to both reusable workflows as the required `development-branch` and
-`production-branch` inputs:
+| Event / resolved role | Package work | `publisher` | `tag` |
+| --- | --- | --- | --- |
+| `pull_request` | build and pack `<major>.<minor>.<patch>-pr.N` | `none` | `false` |
+| push to `dev` | build and pack `<major>.<minor>.<patch>-dev.N` | routed | `false` |
+| push to `prod` | build and pack `<major>.<minor>.<patch>` | routed | `true` |
+| any other ref | none | `none` | `false` |
+| publishable ref with unsupported routing | none | workflow fails closed | — |
 
-```yaml
-env:
-  DEVELOPMENT_BRANCH: &development_branch version-3
-  PRODUCTION_BRANCH: &production_branch release
+A pull request only validates; it never publishes and never tags. An unrelated
+ref is a cheap successful no-op: the role is resolved before any checkout,
+toolchain setup, project discovery, tag lookup, build, pack, publish, or tag
+work. A publishable ref whose visibility cannot be routed fails the plan job,
+so no publisher and no tag job run; unsupported routing is never reported as a
+silent `none` publication result.
 
-jobs:
-  validate:
-    permissions:
-      contents: read
-    uses: GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@<40-character-infra-commit-sha>
-    with:
-      development-branch: *development_branch
-      production-branch: *production_branch
-```
+### Branch role and trusted source
 
-There is no separate `.github/package.yml` descriptor and no separate caller
-`package-validation.yml` or `package-publish.yml`; changing a package branch
-requires editing only the single caller workflow. The branch names must be
-distinct valid Git branch names. Gizmo.Infra resolves the logical role
-`development`, `production`, or `none` from the event and these inputs and never
-reads a caller configuration file. A pull request resolves the role from its base
-branch, a push resolves the role from the effective branch, and any other ref
-resolves `none`. The caller workflow has no `workflow_dispatch` trigger, so a
-same-SHA recovery re-runs an existing production `push` workflow run instead of
-starting a new manually dispatched run.
+The workflow resolves the logical role from the event and the two declared
+branches. A pull request resolves the role from its base branch; a push resolves
+it from the effective branch; any other ref resolves `none`. The physical branch
+names must be distinct valid Git branch names.
 
-When the role is `development` or `production`, the workflows deterministically
-discover exactly one SDK-style packable `.csproj` from the caller workspace and
-read `PackageId`, `Version`, and `IsPackable` through MSBuild. Zero or multiple
-candidates, non-packable or non-SDK-style projects, invalid project metadata, or
-invalid branch inputs fail closed. When the role is `none`, discovery is skipped
-entirely. The evaluated project `Version` remains a canonical `<major>.<minor>`
-compatibility line; callers do not supply a project path, package ID, version, or
-package visibility.
-
-The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
-authenticated repository metadata with bounded connect and total request
-timeouts, then emits the `repository-visibility` output. Only `public`,
-`private`, and `internal` visibility values are accepted; transport failures,
-timeouts, non-success responses, malformed metadata, and unknown values fail
-closed. It never reads `github.event.repository.visibility`.
-
-The reusable workflow validates its own repository and file path through the
+The workflow validates its own repository and file path through the
 caller-independent `job.workflow_*` contexts. It validates `job.workflow_ref` as
 the expected workflow identity ending in the same complete 40-character commit
 SHA reported by `job.workflow_sha`, then checks out that exact commit into
-`.gizmo-infra` and runs the bundled preflight action there; it never assumes a
+`.gizmo-infra` and runs the bundled `preflight` action there; it never assumes a
 caller-local `./.github/actions` path belongs to Gizmo.Infra. `job.workflow_sha`
 alone is a resolved commit and cannot establish that a caller used a full SHA;
 the original `job.workflow_ref` check enforces that invariant.
 
-## Preparation outputs for caller-owned routing
+The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
+authenticated repository metadata with bounded connect and total request
+timeouts, then emits the visibility. Only `public`, `private`, and `internal`
+visibility values are accepted; transport failures, timeouts, non-success
+responses, malformed metadata, and unknown values fail closed. It never reads
+`github.event.repository.visibility`.
 
-The publish workflow is a preparation authority. It exports `package-artifact`,
-`package-version`, `release-tag`, `release-tag-state`, `calculated-state`,
-`tag-state-fingerprint`, `package-id`, `branch-role`, and
-`repository-visibility` from its `build` job. The caller-owned jobs consume
-those outputs; the reusable workflow itself does not read its own
-`repository-visibility` output to select a registry, gate a job, or branch a
-step.
+### Routing outputs
 
-Discovered visibility, selected registry, and authentication are three separate
-concerns:
+The plan job exports `publisher`, `tag`, and `state`.
 
-| Discovered visibility | Selected registry | Authentication |
+`publisher` is `nuget`, `internal`, or `none`. `tag` is `true` only for a
+production push that selected a publisher. `state` is an opaque, explicitly
+versioned, bounded payload consumed only by Gizmo.Infra composite actions; the
+caller must forward it unchanged and must never parse it. It is an API
+simplification, not a signature or trust boundary: a caller can always alter its
+own workflow, so each privileged action independently revalidates the
+security-sensitive facts it needs from live GitHub, feed, and tag state.
+
+Discovered repository visibility, selected destination capability, and
+authentication are three separate concerns:
+
+| Discovered visibility | Selected capability | Authentication |
 | --- | --- | --- |
-| `public` | NuGet.org | Caller-owned OIDC (`id-token: write`), exchanged for a short-lived NuGet.org API key |
-| `private` | GitHub Packages | Caller `GITHUB_TOKEN` with `packages: write` |
-| `internal` | none | None; the caller must fail closed with no publication or tag work |
+| `public` | `nuget` | Caller-owned OIDC (`id-token: write`), exchanged for a short-lived NuGet.org API key |
+| `private` | `internal` | Caller `GITHUB_TOKEN` with `packages: write` |
+| `internal` | unsupported; fail closed | None; the plan job fails and no publication or tag work runs |
 
-The reusable publish workflow only discovers and exports visibility. The caller
-owns the registry decision and every credential. Internal visibility is
-explicitly fail-closed: a caller must not route it to either registry.
+The plan workflow only discovers and exports visibility. The caller owns the
+routing jobs and every credential. Repository visibility and destination registry
+are separate concerns; the concrete internal-registry backend is an
+implementation detail behind the `internal` action and is not part of the public
+contract.
 
 Callers grant permissions on the calling job; a called workflow cannot elevate
 them. Do not use `secrets: inherit`, pass an API key, or create a
 `NUGET_API_KEY` secret. The public publisher requests only `contents: read` and
-`id-token: write`; the private publisher requests only `contents: read` and
-`packages: write`; the tag job requests only `contents: write`. The reusable
-preparation workflow requests only `contents: read` and never requests OIDC.
+`id-token: write`; the internal publisher requests only `contents: read` and
+`packages: write`; the tag job requests only `contents: write`. The plan job
+requests only `contents: read` and never requests OIDC.
 
 ## Composite actions
 
-The reusable preparation workflow runs the bundled `preflight`
-composite action for discovery. The caller-owned jobs then compose these pinned
-Gizmo.Infra composite actions:
+The plan job runs the bundled `preflight` composite action for discovery. The
+caller-owned jobs then compose these pinned Gizmo.Infra composite actions:
 
-| Action | Registry | Credentials | Modes |
-| --- | --- | --- | --- |
-| `public` | NuGet.org | OIDC (`id-token: write`) | development and production |
-| `private` | GitHub Packages | Caller `GITHUB_TOKEN` (`packages: write`) | development and production |
-| `tag` | None | Caller `GITHUB_TOKEN` (`contents: write`) | production only; requires a `production` preparation `branch-role` and fails closed otherwise |
+| Action | Destination | Credentials | Inputs | Modes |
+| --- | --- | --- | --- | --- |
+| `nuget` | NuGet.org | OIDC (`id-token: write`) | `state`, `user` | development and production |
+| `internal` | internal registry | Caller `GITHUB_TOKEN` (`packages: write`) | `state` | development and production |
+| `tag` | none | Caller `GITHUB_TOKEN` (`contents: write`) | `state` | production only; fails closed otherwise |
 
-Each publisher re-downloads the exact prepared artifact, refetches the complete
-package tag state under the exact `<package-id>/` prefix, rechecks the
-calculated-state and tag-state fingerprint, and only then contacts its feed. A
-version that already exists with the caller SHA embedded as provenance is
-treated as an already-published success so the immutable release tag can be
-reconciled; a version that exists without matching provenance fails closed.
+Each action structurally parses and validates the versioned `state`, then
+independently revalidates the push event, the protected branch ref, the
+authenticated current visibility and destination, the current package version
+and tag-state fingerprint, the exact prepared artifact identity and digest, and
+its feed provenance before mutating anything. State that is missing, malformed,
+tampered, or unknown-version fails closed. A version that already exists with
+the caller SHA embedded as provenance is treated as an already-published success
+so the immutable release tag can be reconciled; a version that exists without
+matching provenance fails closed.
 
-The public publisher pushes the prepared `.nupkg` to the NuGet.org
+The `nuget` action pushes the prepared `.nupkg` to the NuGet.org
 `PackagePublish/2.0.0` resource (`PUT https://www.nuget.org/api/v2/package`,
 multipart body, authenticated by the short-lived OIDC-derived API key in the
 `X-NuGet-ApiKey` header and declaring the `X-NuGet-Protocol-Version: 4.1.0`
-header) and selects its path only from the structured HTTP
-status: any `2xx` acceptance succeeds immediately with no readback, `409` means
-the exact package ID and version already exists and continues to a bounded
-provenance readback, and every other status fails closed. NuGet.org
-repository-signs stored archives, so the stored package is not required to be
-byte-identical to the prepared artifact and no artifact digest is compared. The
-untrusted nuspec is parsed structurally and namespace-aware by the checked-in
-provenance script, which requires exactly one namespaced `package`, `metadata`,
-`id`, `version`, and `repository` with a single `commit` attribute and rejects
-malformed XML, DTDs and entities, duplicate or decoy elements, and non-nuspec
-namespaces. A duplicate is accepted only when the sole nuspec's package ID and
-version match the calculated values and its full 40-character `RepositoryCommit`
-equals the caller SHA; multiple nuspec entries, a decoy or unexpected nuspec
-name, or any provenance mismatch fails closed before any tag can be reconciled.
-The publish and readback requests carry explicit connect and total time budgets,
-and the key-bearing `PUT` never follows a redirect. The public publisher rejects
-any visibility other than `public`, and the private publisher rejects any
-visibility other than `private`, so internal visibility cannot be silently
-routed by a caller mistake.
+header) and selects its path only from the structured HTTP status: any `2xx`
+acceptance succeeds immediately with no readback, `409` means the exact package
+ID and version already exists and continues to a bounded provenance readback,
+and every other status fails closed. NuGet.org repository-signs stored archives,
+so the stored package is not required to be byte-identical to the prepared
+artifact. The untrusted nuspec is parsed structurally and namespace-aware by the
+shared checked-in provenance module, which requires exactly one namespaced
+`package`, `metadata`, `id`, `version`, and `repository` with a single `commit`
+attribute and rejects malformed XML, DTDs and entities, duplicate or decoy
+elements, and non-nuspec namespaces. A duplicate is accepted only when the sole
+nuspec's package ID and version match the calculated values and its full
+40-character `RepositoryCommit` equals the caller SHA; multiple nuspec entries, a
+decoy or unexpected nuspec name, or any provenance mismatch fails closed before
+any tag can be reconciled. Every publish, readback, and metadata request carries
+explicit connect and total time budgets, and the key-bearing `PUT` never follows
+a redirect. The `nuget` action rejects any visibility other than `public`, and
+the `internal` action rejects any visibility other than `private`, so an
+unsupported visibility cannot be silently routed by a caller mistake.
 
 ## Automatic versioning
 
@@ -212,20 +199,17 @@ from `1.7`, `1.8` and `2.0` are accepted, while `1.9` fails closed. The
 comparison authority is the package-qualified stable tag history for the package,
 not a previous project-file value in Git history. When no governed tag history
 exists yet, the declared canonical line may bootstrap, subject to the existing
-registry-inspection and adoption prerequisite; runtime tag logic never pretends
-that an unadopted registry history is safe.
+registry-inspection and adoption prerequisite.
 
-The publish workflow uses the preflight action as the only authority for branch
-role and never parses a caller configuration file. Its build job emits package
-version, complete calculated state, and a tag-state fingerprint only for
-`development` or `production`, plus the caller-routing outputs. When the preflight
-resolves `none`, the version calculation, restore, build, pack, and upload are
-skipped and the caller performs no publication or tag work.
+The plan job emits the package version, tag-state fingerprint, and no-op or
+routing outputs. When the role resolves `none`, the version calculation, restore,
+build, pack, and upload are skipped and the caller performs no publication or
+tag work.
 
 The canonical single caller workflow owns the only non-cancelling
 caller-repository concurrency group `nuget-${{ github.repository }}` around
 validation, preparation, publication, and tagging, so development and production
-do not overlap unbounded. Both reusable workflows declare no concurrency of their
+do not overlap unbounded. The reusable workflow declares no concurrency of its
 own: GitHub evaluates a called workflow against the caller's lock, and a nested
 declaration of the same group can deadlock the run against itself. GitHub does
 not guarantee FIFO: the latest pending run may replace an earlier pending run,
@@ -248,23 +232,22 @@ enabled:
 - **Natural bootstrap** — the active compatibility line has no stable package in
   the selected registry *and* no matching stable tag. Validation and development
   advertise the first `<major>.<minor>.0`, and a production run calculates
-  `<major>.<minor>.0` with `release-tag-state=missing`. The preparation workflow
-  never creates a synthetic tag; the immutable release tag is created only by the
-  caller-owned `tag` action, in a resolved `production` run, after
-  the selected publisher succeeded, and only for the exact calculated release tag.
-  This is the only case where steady state is safe without a migration step.
+  `<major>.<minor>.0` with `release-tag-state=missing`. The plan workflow never
+  creates a synthetic tag; the immutable release tag is created only by the
+  caller-owned `tag` action, in a resolved `production` run, after the selected
+  publisher succeeded, and only for the exact calculated release tag. This is the
+  only case where steady state is safe without a migration step.
 - **Migration required** — the active compatibility line already has any stable
   package in the selected registry. Do not enable or run steady state until the
-  migration procedure in
-  [caller.md](caller.md) completes.
-  With no line tags the tag-derived calculation is `<major>.<minor>.0`, and the
-  publisher sees no package at `<major>.<minor>.0`, so a steady-state run would
-  publish a new lower `<major>.<minor>.0` rather than detect the higher packages.
-  Migration adopts the highest stable `<major>.<minor>.<patch>` published for the
-  line, proves its `RepositoryCommit` is a real caller commit, deliberately
-  creates `<package-id>/v<major>.<minor>.<patch>`, and lets the next production
-  run claim `patch+1`. Adoption never selects the first `<major>.<minor>.0` when
-  higher stable line versions already exist.
+  migration procedure in [caller.md](caller.md) completes. With no line tags the
+  tag-derived calculation is `<major>.<minor>.0`, and the publisher sees no
+  package at `<major>.<minor>.0`, so a steady-state run would publish a new lower
+  `<major>.<minor>.0` rather than detect the higher packages. Migration adopts
+  the highest stable `<major>.<minor>.<patch>` published for the line, proves its
+  `RepositoryCommit` is a real caller commit, deliberately creates
+  `<package-id>/v<major>.<minor>.<patch>`, and lets the next production run claim
+  `patch+1`. Adoption never selects the first `<major>.<minor>.0` when higher
+  stable line versions already exist.
 - **Migration stays disabled** — when the highest stable line version cannot be
   provenance-proven, do not enable steady state, do not publish, and do not
   create a tag. The runtime cannot detect the unadopted higher version.
@@ -280,20 +263,7 @@ provenance recheck accepts an already-published *calculated* version only when
 the package carries the exact caller commit in its `RepositoryCommit` metadata;
 same-SHA recovery is the only automatic success. A stable package at the
 calculated version with absent, malformed, or different provenance fails closed,
-and the workflow neither publishes nor creates a recovery tag. Adopting a stable
-package whose matching tag is missing into the compatibility line requires
-conclusive `RepositoryCommit` provenance tied to a real caller commit in the
-caller repository before the tag is created.
-
-Runtime and migration fail closed separately. The runtime aborts on malformed,
-conflicting, or ambiguous tag state, on calculated-state or tag-state drift, and
-on an existing calculated version without matching provenance; that protects the
-calculated version and the governed tags only. The operator must keep steady
-state disabled whenever the registry shows a stable line package that cannot be
-adopted, because the runtime never observes those higher versions. The workflow
-carries no legacy bootstrap logic: the only bootstrap behavior is the generic
-next-patch derivation from the complete line tag state, and no workflow or action
-carries registry migration or adoption code.
+and the workflow neither publishes nor creates a recovery tag.
 
 ### Gizmo.Shared 1.0 migration and adoption
 
@@ -304,7 +274,7 @@ adopted. Prove that `Gizmo.Shared 1.0.13` embeds a real caller commit as its
 `RepositoryCommit` and deliberately create the immutable `Gizmo.Shared/v1.0.13`
 tag. Steady state then derives the next patch: the next development build is
 `1.0.14-dev.N`, the next stable release calculates `1.0.14`, and the caller-owned
-tag action creates the immutable `Gizmo.Shared/v1.0.14` tag.
+`tag` action creates the immutable `Gizmo.Shared/v1.0.14` tag.
 
 The evaluated project `<Version>` remains the compatibility line only and the
 pilot must ultimately use `<Version>1.0</Version>`; the `1.0.14` patch is
@@ -312,16 +282,16 @@ infrastructure-owned and is never encoded in the project `Version`.
 
 ## Artifacts, collision checks, and release recovery
 
-The build job packs the calculated version with the caller commit as repository
-metadata and uploads only its exact `.nupkg` path. Artifact names include both
-`github.run_id` and `github.run_attempt`, so a rerun can download the exact
-artifact that its preparation produced. The caller-owned publisher actions
-download that artifact by name and never rebuild it; they recheck collision and
-provenance immediately before publishing. Same-SHA recovery re-runs an existing
-production `push` workflow run rather than a new manually dispatched run: the
-re-run keeps the pushed caller commit and immutable tag state, so the publisher
-treats the matching package as already published and the tag job reconciles the
-release tag.
+The plan job packs the calculated version with the caller commit as repository
+metadata, computes the exact `.nupkg` digest, and uploads only its exact path.
+Artifact names include both `github.run_id` and `github.run_attempt`, so a rerun
+can download the exact artifact that its preparation produced. The caller-owned
+publisher actions download that artifact by name, verify its digest against the
+plan state, and never rebuild it; they recheck collision and provenance
+immediately before publishing. Same-SHA recovery re-runs an existing production
+`push` workflow run rather than a new manually dispatched run: the re-run keeps
+the pushed caller commit and immutable tag state, so the publisher treats the
+matching package as already published and the tag job reconciles the release tag.
 
 The public publisher's duplicate readback is deterministic and finite: it issues
 at most 13 flat-container `GET` requests spaced 10 seconds apart, with a
