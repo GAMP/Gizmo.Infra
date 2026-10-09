@@ -1,41 +1,78 @@
-name: NuGet package validation
+name: NuGet package
 
 on:
   workflow_call:
     inputs:
-      development-branch:
+      dev:
         description: Caller development branch name declared once in the single caller workflow.
         required: true
         type: string
-      production-branch:
+      prod:
         description: Caller production branch name declared once in the single caller workflow.
         required: true
         type: string
+    outputs:
+      publisher:
+        description: "Destination capability for a publishable run: nuget, internal, or none."
+        value: ${{ jobs.plan.outputs.publisher }}
+      tag:
+        description: Whether a caller-owned immutable production tag should be reconciled.
+        value: ${{ jobs.plan.outputs.tag }}
+      state:
+        description: Opaque versioned package state consumed only by Gizmo.Infra actions.
+        value: ${{ jobs.plan.outputs.state }}
 
 permissions: {}
 
 jobs:
-  validate:
-    name: Validate and pack
+  plan:
+    name: Plan, validate, and prepare package
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      package-version: ${{ steps.version-state.outputs.package-version }}
-      calculated-state: ${{ steps.version-state.outputs.calculated-state }}
-      tag-state-fingerprint: ${{ steps.version-state.outputs.tag-state-fingerprint }}
+      publisher: ${{ steps.gate.outputs.role == 'none' && 'none' || steps.plan.outputs.publisher }}
+      tag: ${{ steps.gate.outputs.role == 'none' && 'false' || steps.plan.outputs.tag }}
+      state: ${{ steps.gate.outputs.role == 'none' && '' || steps.seal.outputs.state }}
     steps:
+      - name: Resolve caller branch role cheaply
+        id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE_REF: ${{ github.base_ref }}
+          DEV_BRANCH: ${{ inputs.dev }}
+          PROD_BRANCH: ${{ inputs.prod }}
+        run: |
+          set -euo pipefail
+          fail() { echo "$1" >&2; exit 1; }
+          [[ -n "$DEV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The dev and prod branch inputs are both required."
+          [[ "$DEV_BRANCH" != "$PROD_BRANCH" ]] || fail "The dev and prod branches must differ."
+          git check-ref-format --branch "$DEV_BRANCH" > /dev/null 2>&1 || fail "The dev branch input is not a valid branch name."
+          git check-ref-format --branch "$PROD_BRANCH" > /dev/null 2>&1 || fail "The prod branch input is not a valid branch name."
+          effective_ref="$REF"
+          if [[ "$EVENT_NAME" == pull_request ]]; then effective_ref="refs/heads/$BASE_REF"; fi
+          role=none
+          if [[ "$effective_ref" == "refs/heads/$DEV_BRANCH" ]]; then role=development
+          elif [[ "$effective_ref" == "refs/heads/$PROD_BRANCH" ]]; then role=production
+          fi
+          printf 'role=%s\n' "$role" >> "$GITHUB_OUTPUT"
+
       - name: Checkout caller repository
+        if: ${{ steps.gate.outputs.role != 'none' }}
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Set up .NET
+        if: ${{ steps.gate.outputs.role != 'none' }}
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 11.0.x
 
       - name: Validate immutable Gizmo.Infra workflow identity
+        if: ${{ steps.gate.outputs.role != 'none' }}
         id: infra-source
         shell: bash
         env:
@@ -45,15 +82,16 @@ jobs:
           WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         run: |
           set -euo pipefail
-          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package-validation.yml@"
+          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package.yml@"
           workflow_ref_sha=${WORKFLOW_REF#"$expected_workflow_ref"}
-          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package-validation.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
+          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
             echo "The reusable workflow must be called from the expected Gizmo.Infra file with a complete immutable commit SHA." >&2
             exit 1
           fi
           printf 'repository=%s\nref=%s\n' "$WORKFLOW_REPOSITORY" "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout immutable Gizmo.Infra action source
+        if: ${{ steps.gate.outputs.role != 'none' }}
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ steps.infra-source.outputs.repository }}
@@ -62,30 +100,36 @@ jobs:
           persist-credentials: false
 
       - name: Discover caller package metadata
+        if: ${{ steps.gate.outputs.role != 'none' }}
         id: metadata
         uses: ./.gizmo-infra/.github/actions/preflight
         with:
           caller-repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          development-branch: ${{ inputs.development-branch }}
-          production-branch: ${{ inputs.production-branch }}
+          dev: ${{ inputs.dev }}
+          prod: ${{ inputs.prod }}
           current-ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
-      - name: Calculate package version and tag state
-        id: version-state
-        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
+      - name: Plan package version and tag state
+        if: ${{ steps.gate.outputs.role != 'none' }}
+        id: plan
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
+          DEV_BRANCH: ${{ inputs.dev }}
+          PROD_BRANCH: ${{ inputs.prod }}
+          BRANCH_ROLE: ${{ steps.metadata.outputs.branch-role }}
           PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
           COMPATIBILITY_LINE: ${{ steps.metadata.outputs.compatibility-line }}
-          PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
+          VISIBILITY: ${{ steps.metadata.outputs.repository-visibility }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export LC_ALL=C
-          response_file=$(mktemp)
-          tag_object_file=$(mktemp)
-          trap 'rm -f "$response_file" "$tag_object_file"' EXIT
+          STATE_PY="$GITHUB_WORKSPACE/.gizmo-infra/.github/package/state.py"
+          response_file=$(mktemp); tag_object_file=$(mktemp); rows_file=$(mktemp); request_file=$(mktemp)
+          trap 'rm -f "$response_file" "$tag_object_file" "$rows_file" "$request_file"' EXIT
           fetch_tag_rows() {
             local page=1 count status
             while :; do
@@ -125,120 +169,72 @@ jobs:
               esac
             done
           }
-          increment_decimal() {
-            local value=$1 result='' digit carry=1 i
-            for ((i=${#value}-1; i>=0; i--)); do
-              digit=${value:i:1}
-              if (( carry )); then
-                if [[ "$digit" == 9 ]]; then
-                  digit=0
-                else
-                  digit=$((10#$digit + 1))
-                  carry=0
-                fi
-              fi
-              result="$digit$result"
-            done
-            if (( carry )); then result="1$result"; fi
-            printf '%s' "$result"
-          }
-          # Canonical decimals on the same length compare ordinally; a longer canonical decimal is numerically larger.
-          decimal_gt() {
-            local left=$1 right=$2
-            if (( ${#left} != ${#right} )); then
-              (( ${#left} > ${#right} ))
-            else
-              [[ "$left" > "$right" ]]
-            fi
-          }
           tag_rows=$(fetch_tag_rows)
-          tag_prefix="refs/tags/${PACKAGE_ID}/"
-          max_patch=''
-          governed_major=''
-          governed_minor=''
-          tag_snapshot=''
+          : > "$rows_file"
           while IFS=$'\t' read -r ref object_type object_sha; do
             [[ -z "$ref" ]] && continue
-            if [[ "$ref" != "$tag_prefix"* ]]; then
-              echo "GitHub returned a tag outside the requested package prefix." >&2
-              exit 1
-            fi
-            tag_leaf=${ref#"$tag_prefix"}
-            if [[ ! "$tag_leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "Malformed tag under the exact package prefix: $ref" >&2
-              exit 1
-            fi
-            tag_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-            tag_major=${BASH_REMATCH[1]}
-            tag_minor=${BASH_REMATCH[2]}
-            tag_patch=${BASH_REMATCH[3]}
-            tag_commit=$(resolve_commit "$object_type" "$object_sha")
-            tag_snapshot+="${ref}=${object_sha}"$'\n'
-            if [[ -z "$governed_major" ]] || decimal_gt "$tag_major" "$governed_major" || { [[ "$tag_major" == "$governed_major" ]] && decimal_gt "$tag_minor" "$governed_minor"; }; then
-              governed_major=$tag_major
-              governed_minor=$tag_minor
-            fi
-            if [[ "$tag_line" == "$COMPATIBILITY_LINE" ]] && { [[ -z "$max_patch" ]] || (( ${#tag_patch} > ${#max_patch} )) || { (( ${#tag_patch} == ${#max_patch} )) && [[ "$tag_patch" > "$max_patch" ]]; }; }; then
-              max_patch=$tag_patch
-            fi
+            commit=$(resolve_commit "$object_type" "$object_sha") || exit 1
+            printf '%s\t%s\t%s\n' "$ref" "$object_sha" "$commit" >> "$rows_file"
           done <<< "$tag_rows"
-          # The project line may only stay on the highest governed line, advance one minor, or advance one major with a minor reset.
-          if [[ -n "$governed_major" ]]; then
-            declared_major=${COMPATIBILITY_LINE%%.*}
-            declared_minor=${COMPATIBILITY_LINE#*.}
-            expected_minor=$(increment_decimal "$governed_minor")
-            expected_major=$(increment_decimal "$governed_major")
-            if [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$governed_minor" ]]; then
-              :
-            elif [[ "$declared_major" == "$governed_major" && "$declared_minor" == "$expected_minor" ]]; then
-              :
-            elif [[ "$declared_major" == "$expected_major" && "$declared_minor" == 0 ]]; then
-              :
-            else
-              echo "Declared compatibility line ${COMPATIBILITY_LINE} is not a governed transition from ${governed_major}.${governed_minor}." >&2
-              exit 1
-            fi
-          fi
-          if [[ -z "$max_patch" ]]; then
-            patch=0
-          else
-            patch=$(increment_decimal "$max_patch")
-          fi
-          base_version="${COMPATIBILITY_LINE}.${patch}"
-          package_version="${base_version}-pr.${GITHUB_RUN_NUMBER}"
-          tag_snapshot=$(printf '%s' "$tag_snapshot" | sort)
-          tag_state_fingerprint=$(printf '%s' "$tag_snapshot" | sha256sum | cut -d ' ' -f1)
-          tag_state=$(printf '%s' "$tag_snapshot" | base64 --wrap=0)
-          calculated_state="package-id=${PACKAGE_ID};compatibility-line=${COMPATIBILITY_LINE};base-version=${base_version};package-version=${package_version};release-tag=${PACKAGE_ID}/v${base_version};tag-state=${tag_state}"
-          package_artifact="artifacts/${PACKAGE_ID}.${package_version}.nupkg"
-          printf 'base-version=%s\npackage-version=%s\npackage-artifact=%s\ncalculated-state=%s\ntag-state-fingerprint=%s\n' "$base_version" "$package_version" "$package_artifact" "$calculated_state" "$tag_state_fingerprint" >> "$GITHUB_OUTPUT"
+          tags_json=$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {ref: .[0], objectSha: .[1], commit: .[2]})' "$rows_file")
+          jq -nc \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg sha "$GITHUB_SHA" \
+            --arg ref "$CURRENT_REF" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg event "$EVENT_NAME" \
+            --arg dev "$DEV_BRANCH" \
+            --arg prod "$PROD_BRANCH" \
+            --arg role "$BRANCH_ROLE" \
+            --arg packageId "$PACKAGE_ID" \
+            --arg compatibilityLine "$COMPATIBILITY_LINE" \
+            --arg runNumber "$GITHUB_RUN_NUMBER" \
+            --arg visibility "$VISIBILITY" \
+            --argjson tags "$tags_json" \
+            '{repo: $repo, sha: $sha, ref: $ref, run: $run, attempt: $attempt, event: $event, dev: $dev, prod: $prod, role: $role, packageId: $packageId, compatibilityLine: $compatibilityLine, runNumber: $runNumber, visibility: $visibility, tags: $tags}' > "$request_file"
+          python3 "$STATE_PY" plan < "$request_file" >> "$GITHUB_OUTPUT"
 
       - name: Restore with NuGet audit
-        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
+        if: ${{ steps.gate.outputs.role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
 
       - name: Build
-        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
+        if: ${{ steps.gate.outputs.role != 'none' }}
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
 
-      - name: Pack calculated validation version
-        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
+      - name: Pack calculated package version
+        if: ${{ steps.gate.outputs.role != 'none' }}
         shell: bash
         env:
-          CALCULATED_VERSION: ${{ steps.version-state.outputs.package-version }}
+          CALCULATED_VERSION: ${{ steps.plan.outputs.package-version }}
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
         run: dotnet pack "$PROJECT_PATH" --configuration Release --no-restore --output artifacts -p:RepositoryCommit="$GITHUB_SHA" -p:PackageVersion="$CALCULATED_VERSION"
 
+      - name: Seal package state with artifact digest
+        if: ${{ steps.gate.outputs.role != 'none' }}
+        id: seal
+        shell: bash
+        env:
+          PLANNED_STATE: ${{ steps.plan.outputs.planned-state }}
+          ARTIFACT_PATH: ${{ steps.plan.outputs.package-artifact }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          STATE_PY="$GITHUB_WORKSPACE/.gizmo-infra/.github/package/state.py"
+          digest=$(sha256sum "$ARTIFACT_PATH" | cut -d ' ' -f1)
+          printf '%s' "$PLANNED_STATE" | python3 "$STATE_PY" seal --digest "$digest" >> "$GITHUB_OUTPUT"
+
       - name: Upload exact package artifact
-        if: ${{ steps.metadata.outputs.branch-role != 'none' }}
+        if: ${{ steps.gate.outputs.role != 'none' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.version-state.outputs.package-artifact }}
+          path: ${{ steps.plan.outputs.package-artifact }}
           if-no-files-found: error

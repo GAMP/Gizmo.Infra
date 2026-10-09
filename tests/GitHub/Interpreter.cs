@@ -12,7 +12,6 @@ public sealed class InlineInterpreterContractTests
     [
         Path.Combine(".github", "actions"),
         Path.Combine("tests", "TestSupport"),
-        Path.Combine("tests", "GitHub", "fixtures"),
     ];
 
     // Inline evaluation and heredoc forms execute an opaque anonymous program, so a named module is required.

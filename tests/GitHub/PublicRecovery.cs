@@ -1,731 +1,1050 @@
+using System.Text.Json;
 using Gizmo.Infra.Tests.TestSupport;
 using YamlDotNet.RepresentationModel;
 
 namespace Gizmo.Infra.Tests.GitHub;
 
-/// <summary>
-/// Executable coverage for the public NuGet.org same-SHA recovery path; each test runs the committed precheck or publish shell block with local stubs for curl, jq, unzip, and sleep, so the structured duplicate discrimination, the finite polling policy, and the fail-closed provenance decisions are proven without a feed or real delay.
-/// </summary>
-public sealed class PublicPublisherRecoveryTests
+public sealed class PrivilegedActionStateGuardTests
 {
-    private const string Action = "public";
-    private const string PublishStepName = "Publish exact package and reconcile duplicate provenance";
-    private const string PackageId = "Gizmo.Widget";
-    private const string PackageVersion = "1.0.14";
+    private static string Root => InfraRepositoryLocator.ResolveRoot();
+    private static string StateScript => Path.Combine(Root, ".github", "package", "state.py");
+    private static readonly string Sha = new('a', 40);
 
-    private const string LocalArtifactBody = "local-prepared-nupkg-bytes";
-    private const string ExpectedNuspecName = PackageId + ".nuspec";
-    private const string ArtifactRelativePath = "artifacts/Gizmo.Widget.1.0.14.nupkg";
-
-    private static readonly string CurrentSha = new('a', 40);
-    private static readonly string OtherSha = new('b', 40);
-    private static readonly string MatchingNuspec = Nuspec(CurrentSha);
-    private static readonly string DivergentNuspec = Nuspec(OtherSha);
-    private static readonly string MalformedNuspec = Nuspec(new string('z', 40));
-    private static readonly string WrongIdNuspec = Nuspec(CurrentSha, id: "Other.Widget");
-    private static readonly string WrongVersionNuspec = Nuspec(CurrentSha, version: "9.9.9");
-    private static readonly string MissingProvenanceNuspec = """
-        <?xml version="1.0" encoding="utf-8"?>
-        <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
-          <metadata>
-            <id>Gizmo.Widget</id>
-            <version>1.0.14</version>
-            <repository type="git" url="https://github.com/owner/repository" />
-          </metadata>
-        </package>
-        """;
-
-    // A nested decoy with the caller SHA must not authorize a repository that commits a different SHA.
-    private static readonly string NestedDecoyNuspec = $"""
-        <?xml version="1.0" encoding="utf-8"?>
-        <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
-          <metadata>
-            <id>{PackageId}</id>
-            <version>{PackageVersion}</version>
-            <description>decoy <repository commit="{CurrentSha}" /></description>
-            <repository type="git" url="https://github.com/owner/repository" commit="{OtherSha}" />
-          </metadata>
-        </package>
-        """;
-
-    private static string ActionContent => WorkflowShell.ReadAction(Action);
-
-    private static string PublicActionPath() =>
-        Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "actions", "public")
-            .Replace('\\', '/');
-
-    private static string ProvenanceScriptPath() =>
-        Path.Combine(
-            InfraRepositoryLocator.ResolveRoot(),
-            ".github",
-            "actions",
-            "public",
-            "scripts",
-            "nuspec_provenance.py");
-
-    [Fact]
-    public void Precheck_ExactVersionWithSameShaProvenance_MarksPublishedAndSkipsPush()
+    [Theory]
+    [InlineData("nuget", "nuget", "development")]
+    [InlineData("internal", "internal", "development")]
+    [InlineData("tag", "publishable", "production")]
+    public void Mutators_RejectMalformedStateBeforeAuthenticatedOrMutationCalls(string action, string expectedPublisher, string role)
     {
         using var repository = new TempRepository();
+        var content = ReadAction(action);
+        var step = FindStep(content, action == "tag" ? "Parse state and revalidate production policy role" : "Parse state and revalidate destination and artifact");
+        var outputPath = repository.WriteFile("github-env", string.Empty);
+        var tempDirectory = repository.AbsolutePath("runner-temp");
+        Directory.CreateDirectory(tempDirectory);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step, repository.Root,
+            ActionEnvironment(repository, "not-base64", outputPath, tempDirectory, curlLog));
 
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: MatchingNuspec);
-
-        Assert.True(outcome.Result.ExitCode == 0, outcome.Result.StandardError);
-        Assert.Contains("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-        Assert.DoesNotContain("package-state=unpublished", outcome.GithubOutput, StringComparison.Ordinal);
-
-        // The publish step is gated on the unpublished state, so a matching collision never pushes.
-        Assert.Contains(
-            "if: ${{ steps.collision.outputs.package-state != 'published' }}",
-            ActionContent,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_ExactVersionWithDifferentShaProvenance_FailsClosed()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: DivergentNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "no authenticated provenance for this caller SHA",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_DecoyNestedCommitWithDivergentRepository_FailsClosed()
-    {
-        // A structural parse must ignore the nested matching-SHA decoy and reject the real repository's divergent commit.
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: NestedDecoyNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "no authenticated provenance for this caller SHA",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_RepositorySignedDifferentBytesWithMatchingMetadata_IsAccepted()
-    {
-        // NuGet.org repository-signs the stored archive, so differing bytes still prove recovery by matching metadata.
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: MatchingNuspec,
-            localBody: "prepared-artifact-bytes",
-            downloadedBody: "repository-signed-stored-bytes");
-
-        Assert.True(outcome.Result.ExitCode == 0, outcome.Result.StandardError);
-        Assert.Contains("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_MultipleNuspecEntries_FailsClosed()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: MatchingNuspec,
-            nuspecEntries: ExpectedNuspecName + "\ndecoy.nuspec");
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "does not contain exactly one nuspec",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain("package-state=published", outcome.GithubOutput, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_UnexpectedNuspecName_FailsClosed()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: MatchingNuspec,
-            nuspecEntries: "decoy.nuspec");
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "nuspec is not the expected package nuspec",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_PackageIdMismatch_FailsClosed()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: WrongIdNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "nuspec ID does not match the expected package ID",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Precheck_PackageVersionMismatch_FailsClosed()
-    {
-        using var repository = new TempRepository();
-
-        var outcome = RunPrecheck(
-            repository,
-            indexStatus: "200",
-            versionPresent: true,
-            nupkgStatus: "200",
-            nuspec: WrongVersionNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "nuspec version does not match the expected package version",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("missing, malformed, tampered, or unknown-version", result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(curlLog));
+        Assert.Empty(File.ReadAllText(outputPath));
+        Assert.Contains("--expect-publisher " + expectedPublisher, content, StringComparison.Ordinal);
+        Assert.Contains("--role " + (action == "tag" ? "production" : "publishable"), content, StringComparison.Ordinal);
+        _ = role;
     }
 
     [Theory]
-    [InlineData("201")]
-    [InlineData("202")]
-    public void Push_AcceptedStatus_SucceedsWithoutReadback(string pushStatus)
+    [InlineData("nuget", "public")]
+    [InlineData("internal", "private")]
+    public void Publisher_RejectsArtifactDigestDriftBeforeCallingGitHub(string publisher, string visibility)
     {
-        // A new package is accepted on the push's own structured status, so no propagation readback is incurred.
         using var repository = new TempRepository();
+        var expectedBytes = "signed-prepared-package";
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "altered-package");
+        var state = CreateSealedState(repository, visibility, "development", expectedBytes);
+        var content = ReadAction(publisher);
+        var step = FindStep(content, "Parse state and revalidate destination and artifact");
+        var envFile = repository.WriteFile("github-env", string.Empty);
+        var tempDirectory = repository.AbsolutePath("runner-temp");
+        Directory.CreateDirectory(tempDirectory);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var environment = ActionEnvironment(repository, state, envFile, tempDirectory, curlLog);
+        environment["GIZMO_ARTIFACT_PATH"] = artifact;
+        environment["STUB_VISIBILITY"] = visibility;
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n"
+            + "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; *) shift ;; esac; done; echo called >> \"$CURL_LOG\"; printf '{\"visibility\":\"%s\"}' \"$STUB_VISIBILITY\" > \"$output\"; printf 200; }\n"
+            + "jq() { printf '%s' \"$STUB_VISIBILITY\"; }\n" + step, repository.Root, environment);
 
-        var outcome = RunPublish(repository, pushStatus, nupkgStatuses: "404", nuspec: MatchingNuspec);
-
-        Assert.Equal(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "NuGet.org accepted public package 1.0.14.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
-        Assert.Empty(outcome.SleepLog.Trim());
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("artifact digest does not match", result.StandardError, StringComparison.Ordinal);
+        Assert.Equal("called", File.ReadAllText(curlLog).Trim());
     }
 
     [Fact]
-    public void Push_DuplicateThenDelayedMatchingReadback_Succeeds()
+    public void InternalAction_RejectsNugetPlannedStateBeforeMetadataOrRegistryRequests()
     {
         using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, repository.AbsolutePath("curl.log"));
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
+            repository.Root, environment);
 
-        // The push answers 409, and flat-container reads return 404 twice before the package is readable.
-        var outcome = RunPublish(repository, "409", nupkgStatuses: "404 404 200", nuspec: MatchingNuspec);
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("missing, malformed, tampered, or unknown-version", result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(repository.AbsolutePath("curl.log")));
+        Assert.Empty(File.ReadAllText(output));
+    }
 
-        Assert.Equal(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "NuGet.org already has public package 1.0.14; reconciling the existing package provenance.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Equal(3, ReadbackAttempts(outcome.CurlLog));
-        Assert.Equal("10\n10", outcome.SleepLog.Trim());
-        Assert.Contains(
-            "Verified published public package 1.0.14 provenance on readback attempt 3.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
+    [Theory]
+    [InlineData("unknown-version")]
+    [InlineData("unsupported-routing")]
+    public void InternalAction_RejectsUnknownOrUnsupportedPolicyStateBeforeMetadata(string fault)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "development", "prepared");
+        state = fault == "unknown-version"
+            ? ReplaceStateField(state, "v", "2")
+            : ReplaceStateField(ReplaceStateField(state, "repositoryVisibility", "\"internal\""), "publisher", "\"internal\"");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
+            repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(fault, result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(curlLog));
+        Assert.Empty(File.ReadAllText(output));
     }
 
     [Fact]
-    public void Push_DuplicateRepositorySignedDifferentBytesWithMatchingMetadata_Succeeds()
+    public void InternalAction_RejectsLiveVisibilityDriftBeforePackageFeedOrPublicationCalls()
     {
-        // The stored duplicate is repository-signed and differs from the prepared artifact, but matching metadata still proves this caller SHA.
         using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
+        var curlLog = repository.AbsolutePath("curl.log");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
+        environment["STUB_LIVE_VISIBILITY"] = "public";
+        var stubs = "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --write-out|--header) shift 2 ;; --silent|--show-error|--location) shift ;; *) shift ;; esac; done; printf '{\"visibility\":\"%s\"}' \"$STUB_LIVE_VISIBILITY\" > \"$output\"; printf 200; echo \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY\" >> \"$CURL_LOG\"; }\n"
+            + "jq() { printf '%s' \"$STUB_LIVE_VISIBILITY\"; }\n";
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + stubs + step, repository.Root, environment);
 
-        var outcome = RunPublish(
-            repository,
-            "409",
-            nupkgStatuses: "200",
-            nuspec: MatchingNuspec,
-            localBody: "prepared-artifact-bytes",
-            downloadedBody: "repository-signed-stored-bytes");
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("visibility drifted from the planned state", result.StandardError, StringComparison.Ordinal);
+        var requests = File.ReadAllLines(curlLog);
+        Assert.Single(requests);
+        Assert.Contains("/repos/owner/repository", requests[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("nuget.pkg.github.com", string.Join('\n', requests), StringComparison.Ordinal);
+        Assert.DoesNotContain("/git/refs", string.Join('\n', requests), StringComparison.Ordinal);
+    }
 
-        Assert.Equal(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "Verified published public package 1.0.14 provenance on readback attempt 1.",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
+    [Theory]
+    [InlineData("private")]
+    [InlineData("internal")]
+    [InlineData("unknown")]
+    public void NugetAction_RejectsLiveVisibilityDriftBeforeOidcOrPackageFeedMutation(string liveVisibility)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("nuget"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "nuget").Replace('\\', '/');
+        environment["STUB_LIVE_VISIBILITY"] = liveVisibility;
+        var stubs = "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --write-out|--header|--connect-timeout|--max-time) shift 2 ;; --silent|--show-error|--location) shift ;; *) shift ;; esac; done; printf '{\"visibility\":\"%s\"}' \"$STUB_LIVE_VISIBILITY\" > \"$output\"; printf 200; echo \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY\" >> \"$CURL_LOG\"; }\n"
+            + "jq() { printf '%s' \"$STUB_LIVE_VISIBILITY\"; }\n";
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + stubs + step, repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("visibility drifted from the planned state", result.StandardError, StringComparison.Ordinal);
+        var requests = File.ReadAllLines(curlLog);
+        Assert.Single(requests);
+        Assert.Contains("/repos/owner/repository", requests[0], StringComparison.Ordinal);
+        var requestLog = string.Join('\n', requests);
+        Assert.DoesNotContain("api.nuget.org", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("www.nuget.org", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("oidc", requestLog, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/git/matching-refs/tags/", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("/git/refs", requestLog, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Push_DuplicateThenDivergentProvenance_FailsClosedImmediately()
+    public void PublisherSameShaCollisionIsGatedAndTagCannotMoveExistingReleaseRef()
     {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: DivergentNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "divergent provenance for this caller SHA",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        // A readable but foreign package is terminal; it is never retried.
-        Assert.Empty(outcome.SleepLog.Trim());
-        Assert.Equal(1, ReadbackAttempts(outcome.CurlLog));
+        var nuget = ReadAction("nuget");
+        var internalAction = ReadAction("internal");
+        Assert.Contains("package-state=published", nuget, StringComparison.Ordinal);
+        Assert.Contains("package-state=published", internalAction, StringComparison.Ordinal);
+        Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", nuget, StringComparison.Ordinal);
+        Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", internalAction, StringComparison.Ordinal);
+        Assert.Contains("Release tag already exists for a different commit; refusing to move it.", ReadAction("tag"), StringComparison.Ordinal);
+        Assert.Contains("--request POST", ReadAction("tag"), StringComparison.Ordinal);
+        Assert.DoesNotContain("--request PATCH", ReadAction("tag"), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void Push_DuplicateThenNeverReadable_FailsClosedAfterBoundedAttempts()
+    public void NugetFreshPackage_IsPublishedThroughMockedOidcAndAcceptedPush()
     {
         using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var shell = StateShell(state, "publishable", "nuget");
+        var script = shell + "\n" + CurlPublishingStub() + "\n" + JqPublishingStub() + "\n" + PublishStep("nuget");
+        var result = WorkflowShell.RunBash(script, repository.Root, PublishingEnvironment(repository, artifact));
 
-        var outcome = RunPublish(repository, "409", nupkgStatuses: "404", nuspec: MatchingNuspec);
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("NuGet.org accepted public package 3.0.0-dev.42.", result.StandardOutput, StringComparison.Ordinal);
+        var requests = File.ReadAllText(repository.AbsolutePath("requests.log"));
+        Assert.Contains("PUT https://www.nuget.org/api/v2/package", requests, StringComparison.Ordinal);
+        Assert.Contains("X-NuGet-ApiKey: nuget-api-key", requests, StringComparison.Ordinal);
+        Assert.DoesNotContain("location=yes", requests, StringComparison.Ordinal);
+        Assert.DoesNotContain("real", requests, StringComparison.OrdinalIgnoreCase);
+    }
 
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "Could not read back the published public package for 1.0.14 after 13 attempts; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
+    [Fact]
+    public void NugetDuplicatePush_ReconcilesMatchingSameShaProvenanceOnReadback()
+    {
+        using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var script = StateShell(state, "publishable", "nuget") + "\n" + CurlPublishingStub() + "\n"
+            + JqPublishingStub() + "\nunzip() { if [[ \"$1\" == -Z1 ]]; then printf 'Gizmo.Widget.nuspec'; else printf '%s' \"$STUB_NUSPEC\"; fi; }\n"
+            + PublishStep("nuget");
+        var environment = PublishingEnvironment(repository, artifact);
+        environment["STUB_PUSH_STATUS"] = "409";
+        environment["STUB_NUSPEC"] = Nuspec(Sha);
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + script, repository.Root, environment);
 
-        // Thirteen attempts with ten seconds between yield exactly twelve bounded sleeps and a 120-second ceiling.
-        var delays = outcome.SleepLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.Equal(12, delays.Length);
-        Assert.All(delays, delay => Assert.Equal("10", delay));
-        Assert.Equal(13, ReadbackAttempts(outcome.CurlLog));
+        Assert.True(result.ExitCode == 0, result.StandardError + "\n" + result.StandardOutput);
+        Assert.Contains("Verified published public package 3.0.0-dev.42 provenance", result.StandardOutput, StringComparison.Ordinal);
+        Assert.Contains("GET https://api.nuget.org/v3-flatcontainer/gizmo.widget/3.0.0-dev.42/gizmo.widget.3.0.0-dev.42.nupkg", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
+    }
 
-        // Publisher failure leaves the tag job unsatisfied, so no tag is created.
-        AssertTagJobRequiresPublisherSuccess();
+    [Fact]
+    public void NugetDuplicateReadback_RetriesDelayedIndexingWithinBoundedBudget()
+    {
+        using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var environment = PublishingEnvironment(repository, artifact);
+        environment["STUB_PUSH_STATUS"] = "409";
+        environment["STUB_READBACK_STATUSES"] = "404 404 200";
+        environment["STUB_NUSPEC"] = Nuspec(Sha);
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n"
+            + StateShell(state, "publishable", "nuget") + "\n" + CurlPublishingStub() + "\n"
+            + JqPublishingStub() + "\nunzip() { if [[ \"$1\" == -Z1 ]]; then printf 'Gizmo.Widget.nuspec'; else printf '%s' \"$STUB_NUSPEC\"; fi; }\n"
+            + "sleep() { printf '%s\\n' \"$1\" >> \"$STUB_SLEEP_LOG\"; }\n" + PublishStep("nuget"), repository.Root, environment);
+
+        Assert.True(result.ExitCode == 0, result.StandardError + "\n" + result.StandardOutput);
+        Assert.Contains("provenance on readback attempt 3", result.StandardOutput, StringComparison.Ordinal);
+        Assert.Equal(new[] { "10", "10" }, File.ReadAllLines(repository.AbsolutePath("sleep.log")));
+        Assert.Equal(3, File.ReadAllLines(repository.AbsolutePath("requests.log")).Count(line => line.Contains(".nupkg", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void NugetDuplicateReadback_ForeignCommitFailsImmediately() =>
+        AssertNugetReadbackRejected(Nuspec(new string('b', 40)), "Gizmo.Widget.nuspec", "divergent provenance");
+
+    [Fact]
+    public void NugetDuplicateReadback_MalformedNuspecFailsImmediately() =>
+        AssertNugetReadbackRejected("<package>", "Gizmo.Widget.nuspec", "missing or malformed provenance");
+
+    [Fact]
+    public void NugetDuplicateReadback_WrongPackageIdFailsImmediately() =>
+        AssertNugetReadbackRejected(Nuspec(Sha, "Other.Widget"), "Gizmo.Widget.nuspec", "nuspec ID does not match");
+
+    [Fact]
+    public void NugetDuplicateReadback_WrongVersionFailsImmediately() =>
+        AssertNugetReadbackRejected(Nuspec(Sha, version: "9.9.9"), "Gizmo.Widget.nuspec", "nuspec version does not match");
+
+    [Fact]
+    public void NugetDuplicateReadback_MultipleNuspecEntriesFailImmediately() =>
+        AssertNugetReadbackRejected(Nuspec(Sha), "Gizmo.Widget.nuspec\ndecoy.nuspec", "exactly one nuspec");
+
+    [Fact]
+    public void NugetDuplicateReadback_UnexpectedNuspecNameFailsImmediately() =>
+        AssertNugetReadbackRejected(Nuspec(Sha), "decoy.nuspec", "expected package nuspec");
+
+    [Fact]
+    public void NugetDuplicateReadback_UnreadablePackageExhaustsThirteenAttemptsAndTwelveMockSleeps()
+    {
+        using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var environment = PublishingEnvironment(repository, artifact);
+        environment["STUB_PUSH_STATUS"] = "409";
+        environment["STUB_READBACK_STATUSES"] = "000";
+        var result = RunNugetPublishReadback(repository, state, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("after 13 attempts", result.StandardError, StringComparison.Ordinal);
+        Assert.Equal(12, File.ReadAllLines(repository.AbsolutePath("sleep.log")).Length);
+        Assert.All(File.ReadAllLines(repository.AbsolutePath("sleep.log")), delay => Assert.Equal("10", delay));
+        Assert.Equal(13, File.ReadAllLines(repository.AbsolutePath("requests.log")).Count(line => line.Contains(".nupkg", StringComparison.Ordinal)));
     }
 
     [Theory]
     [InlineData("400")]
     [InlineData("403")]
     [InlineData("500")]
-    public void Push_OtherStatus_FailsBeforeAnyReadback(string pushStatus)
+    [InlineData("000")]
+    public void NugetUnexpectedPushStatus_FailsWithoutReadback(string pushStatus)
     {
-        // Only a duplicate 409 may continue to provenance reconciliation.
         using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var environment = PublishingEnvironment(repository, artifact);
+        environment["STUB_PUSH_STATUS"] = pushStatus;
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n"
+            + StateShell(state, "publishable", "nuget") + "\n" + CurlPublishingStub() + "\n"
+            + JqPublishingStub() + "\n" + PublishStep("nuget"), repository.Root, environment);
 
-        var outcome = RunPublish(repository, pushStatus, nupkgStatuses: "200", nuspec: MatchingNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            $"NuGet.org returned HTTP {pushStatus} for the push; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
-        Assert.Empty(outcome.SleepLog.Trim());
+        Assert.NotEqual(0, result.ExitCode);
+        var expected = pushStatus == "000" ? "Could not reach the NuGet.org package-publish endpoint" : "HTTP " + pushStatus + " for the push";
+        Assert.Contains(expected, result.StandardError, StringComparison.Ordinal);
+        Assert.DoesNotContain(".nupkg", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
+        Assert.Empty(File.ReadAllText(repository.AbsolutePath("sleep.log")));
     }
 
     [Fact]
-    public void Push_TransportFailure_FailsBeforeAnyReadback()
-    {
-        // A transport failure never yields a structured status, so it fails closed.
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, "000", nupkgStatuses: "200", nuspec: MatchingNuspec);
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "Could not reach the NuGet.org package-publish endpoint.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.Equal(0, ReadbackAttempts(outcome.CurlLog));
-        Assert.Empty(outcome.SleepLog.Trim());
-    }
+    public void NugetSameShaCollision_MatchingProvenanceSkipsDuplicatePush() =>
+        AssertNugetCollision(Nuspec(Sha), "Gizmo.Widget.nuspec", shouldPass: true);
 
     [Fact]
-    public void Push_AuthenticatedPut_CarriesApiKeyAndProtocolVersionWithoutRedirect()
-    {
-        // The OIDC-derived key must travel with the NuGet protocol version, and the key-bearing PUT must never follow a redirect.
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, "201", nupkgStatuses: "404", nuspec: MatchingNuspec);
-
-        Assert.Equal(0, outcome.Result.ExitCode);
-        var putRequest = outcome.RequestLog
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Single(line => line.StartsWith("method=PUT ", StringComparison.Ordinal));
-
-        Assert.Contains("location=no", putRequest, StringComparison.Ordinal);
-        Assert.Contains("url=https://www.nuget.org/api/v2/package", putRequest, StringComparison.Ordinal);
-        Assert.Contains("X-NuGet-ApiKey: nuget-api-key", putRequest, StringComparison.Ordinal);
-        Assert.Contains("X-NuGet-Protocol-Version: 4.1.0", putRequest, StringComparison.Ordinal);
-        Assert.DoesNotContain("X-NuGet-Client-Version", putRequest, StringComparison.Ordinal);
-    }
+    public void NugetCollision_ForeignCommitProvenanceFailsClosed() =>
+        AssertNugetCollision(Nuspec(new string('b', 40)), "Gizmo.Widget.nuspec", shouldPass: false);
 
     [Fact]
-    public void Push_DuplicateMissingOrMalformedProvenance_FailsClosed()
+    public void NugetCollision_WrongPackageIdFailsClosed() =>
+        AssertNugetCollision(Nuspec(Sha, "Other.Widget"), "Gizmo.Widget.nuspec", shouldPass: false);
+
+    [Fact]
+    public void NugetCollision_WrongVersionFailsClosed() =>
+        AssertNugetCollision(Nuspec(Sha, version: "9.9.9"), "Gizmo.Widget.nuspec", shouldPass: false);
+
+    [Fact]
+    public void NugetCollision_MalformedNuspecFailsClosed() =>
+        AssertNugetCollision("<package>", "Gizmo.Widget.nuspec", shouldPass: false);
+
+    [Fact]
+    public void NugetCollision_MultipleNuspecEntriesFailClosed() =>
+        AssertNugetCollision(Nuspec(Sha), "Gizmo.Widget.nuspec\ndecoy.nuspec", shouldPass: false);
+
+    [Fact]
+    public void NugetCollision_PrecheckReturnsUnpublishedForMissingVersionAndRejectsUnreadableExistingPackage()
     {
-        foreach (var nuspec in new[] { MissingProvenanceNuspec, MalformedNuspec })
+        using (var repository = new TempRepository())
         {
-            using var repository = new TempRepository();
+            var state = CreateSealedState(repository, "public", "development", "prepared");
+            var missing = RunCollision(repository, "nuget", state, "public", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: false);
+            Assert.Equal(0, missing.ExitCode);
+            Assert.Contains("package-state=unpublished", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
+        }
 
-            var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: nuspec);
-
-            Assert.NotEqual(0, outcome.Result.ExitCode);
-            Assert.Contains(
-                "missing or malformed provenance; failing closed",
-                outcome.Result.StandardError,
-                StringComparison.Ordinal);
-            Assert.Empty(outcome.SleepLog.Trim());
+        using (var repository = new TempRepository())
+        {
+            var state = CreateSealedState(repository, "public", "development", "prepared");
+            var unreadable = RunCollision(repository, "nuget", state, "public", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: true, packageStatus: "404");
+            Assert.NotEqual(0, unreadable.ExitCode);
+            Assert.Contains("unverifiable collision", unreadable.StandardError, StringComparison.Ordinal);
+            Assert.DoesNotContain("package-state=published", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
         }
     }
 
     [Fact]
-    public void Push_DuplicateMultipleNuspecEntries_FailsClosedImmediately()
+    public void NugetCollision_AcceptsRepositoryResignedArchiveBytesWhenNuspecProvenanceMatches()
     {
         using var repository = new TempRepository();
-
-        var outcome = RunPublish(
-            repository,
-            "409",
-            nupkgStatuses: "200",
-            nuspec: MatchingNuspec,
-            nuspecEntries: ExpectedNuspecName + "\ndecoy.nuspec");
-
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The published public package does not contain exactly one nuspec; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
+        var localBytes = "prepared-artifact-bytes";
+        var storedBytes = "repository-resigned-stored-bytes";
+        var localArtifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", localBytes);
+        var state = CreateSealedState(repository, "public", "development", localBytes);
+        var collision = RunCollision(repository, "nuget", state, "public", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: true);
+        Assert.Equal(0, collision.ExitCode);
+        Assert.NotEqual(File.ReadAllText(localArtifact), storedBytes);
+        Assert.Equal(storedBytes, File.ReadAllText(repository.AbsolutePath("downloaded-package.nupkg")));
+        Assert.Contains("package-state=published", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Push_DuplicatePackageIdMismatch_FailsClosedImmediately()
+    public void InternalPublisher_RechecksProtectedRouteAndSameShaCollisionWithoutPublishingAgain()
     {
         using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "development", "prepared");
+        var guard = FindStep(ReadAction("internal"), "Validate internal publisher invocation");
+        var protectedPush = WorkflowShell.RunBash(guard, repository.Root,
+            new Dictionary<string, string> { ["EVENT_NAME"] = "push", ["REF_PROTECTED"] = "true", ["REF_NAME"] = "refs/heads/pre-release" });
+        Assert.Equal(0, protectedPush.ExitCode);
 
-        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: WrongIdNuspec);
+        var collision = RunCollision(repository, "internal", state, "private", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: true);
+        Assert.True(collision.ExitCode == 0, collision.StandardError + "\n" + collision.StandardOutput);
+        Assert.Contains("package-state=published", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
+        Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", ReadAction("internal"), StringComparison.Ordinal);
+        var requests = File.ReadAllLines(repository.AbsolutePath("curl.log"));
+        var serviceIndex = Array.FindIndex(requests, line => line.EndsWith("https://nuget.pkg.github.com/owner/index.json", StringComparison.Ordinal));
+        var packageIndex = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/index.json", StringComparison.Ordinal));
+        var packageDownload = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/3.0.0-dev.42/gizmo.widget.3.0.0-dev.42.nupkg", StringComparison.Ordinal));
+        Assert.True(serviceIndex >= 0 && packageIndex > serviceIndex && packageDownload > packageIndex,
+            string.Join(Environment.NewLine, requests));
 
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The published public package nuspec ID does not match the expected package ID; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
+        var unprotected = WorkflowShell.RunBash(guard, repository.Root,
+            new Dictionary<string, string> { ["EVENT_NAME"] = "push", ["REF_PROTECTED"] = "false", ["REF_NAME"] = "refs/heads/pre-release" });
+        Assert.NotEqual(0, unprotected.ExitCode);
+        Assert.Contains("protected branch", unprotected.StandardError, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Push_DuplicateUnexpectedNuspecName_FailsClosedImmediately()
+    public void TagAction_ReconcilesSameShaAndRefusesForeignShaAndCreatesOnlyMissingTag()
     {
         using var repository = new TempRepository();
+        var tagObjectSha = new string('c', 40);
+        var tagRows = new object[] { new { @ref = "refs/tags/Gizmo.Widget/v3.0.0", objectSha = tagObjectSha, commit = Sha } };
+        var state = CreateSealedState(repository, "public", "production", "prepared", tagRows);
+        var vars = StateShell(state, "production", "publishable");
+        var recheckStep = FindStep(ReadAction("tag"), "Refetch and recheck calculated state before tagging");
+        var refetch = RunTagRecheck(repository, vars, recheckStep, tagObjectSha, Sha);
+        Assert.True(refetch.ExitCode == 0, refetch.StandardError + "\n" + refetch.StandardOutput);
+        Assert.Contains("/git/tags/" + tagObjectSha, File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
 
-        var outcome = RunPublish(
-            repository,
-            "409",
-            nupkgStatuses: "200",
-            nuspec: MatchingNuspec,
-            nuspecEntries: "decoy.nuspec");
+        var drift = RunTagRecheck(repository, vars, recheckStep, new string('d', 40), Sha);
+        Assert.NotEqual(0, drift.ExitCode);
+        Assert.Contains("Calculated package state drifted before tagging", drift.StandardError, StringComparison.Ordinal);
+        Assert.DoesNotContain("/git/ref/tags/", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
 
-        // A readable duplicate whose only nuspec is not the expected name is terminal; it is never retried.
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The published public package nuspec is not the expected package nuspec; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "Verified published public package",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
-        Assert.Equal(1, ReadbackAttempts(outcome.CurlLog));
-        AssertTagJobRequiresPublisherSuccess();
+        var step = FindStep(ReadAction("tag"), "Create or reconcile immutable release tag");
+        var same = RunTagMutation(repository, vars, step, "200", "commit", Sha, []);
+        Assert.True(same.Result.ExitCode == 0, same.Result.StandardError + "\n" + same.Result.StandardOutput);
+        Assert.Contains("GET https://api.github.com/repos/owner/repository/git/ref/tags/Gizmo.Widget/v3.0.0", same.RequestLog, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(repository);
+
+        var foreign = RunTagMutation(repository, vars, step, "200", "commit", new string('b', 40), []);
+        Assert.NotEqual(0, foreign.Result.ExitCode);
+        Assert.Contains("refusing to move it", foreign.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(repository);
+
+        var missing = RunTagMutation(repository, vars, step, "404", string.Empty, string.Empty, []);
+        Assert.Equal(0, missing.Result.ExitCode);
+        Assert.Contains("POST https://api.github.com/repos/owner/repository/git/refs", missing.RequestLog, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Push_DuplicatePackageVersionMismatch_FailsClosedImmediately()
+    public void TagRelease_AnnotatedOneHopSameCommitReconcilesWithoutMutation()
     {
-        using var repository = new TempRepository();
-
-        var outcome = RunPublish(repository, "409", nupkgStatuses: "200", nuspec: WrongVersionNuspec);
-
-        // A readable duplicate with a mismatched declared version is terminal; it is never retried.
-        Assert.NotEqual(0, outcome.Result.ExitCode);
-        Assert.Contains(
-            "The published public package nuspec version does not match the expected package version; failing closed.",
-            outcome.Result.StandardError,
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "Verified published public package",
-            outcome.Result.StandardOutput,
-            StringComparison.Ordinal);
-        Assert.Empty(outcome.SleepLog.Trim());
-        Assert.Equal(1, ReadbackAttempts(outcome.CurlLog));
-        AssertTagJobRequiresPublisherSuccess();
+        var result = RunTagResolution([new TagObjectReply("commit", Sha)]);
+        Assert.True(result.Result.ExitCode == 0, result.Result.StandardError + "\n" + result.Result.StandardOutput);
+        Assert.Contains("/git/tags/" + new string('c', 40), result.RequestLog, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
     }
 
     [Fact]
-    public void CommittedPublishAndPrecheckSteps_AreValidBash()
+    public void TagRelease_AnnotatedMultiHopSameCommitReconcilesWithoutMutation()
     {
-        var precheck = WorkflowShell.ExtractBlock(ActionContent, "package_id_lower=$(printf", "esac");
-        var publish = RunStep(PublishStepName);
-
-        Assert.Equal(0, WorkflowShell.CheckBashSyntax(precheck).ExitCode);
-        Assert.Equal(0, WorkflowShell.CheckBashSyntax(publish).ExitCode);
+        var result = RunTagResolution([
+            new TagObjectReply("tag", new string('d', 40)),
+            new TagObjectReply("commit", Sha),
+        ]);
+        Assert.True(result.Result.ExitCode == 0, result.Result.StandardError + "\n" + result.Result.StandardOutput);
+        var requests = result.RequestLog;
+        Assert.Contains("/git/tags/" + new string('c', 40), requests, StringComparison.Ordinal);
+        Assert.Contains("/git/tags/" + new string('d', 40), requests, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
     }
 
-    private static int ReadbackAttempts(string curlLog) =>
-        curlLog.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Count(line => line.EndsWith(".nupkg", StringComparison.Ordinal));
-
-    private static void AssertTagJobRequiresPublisherSuccess()
+    [Fact]
+    public void TagRelease_AnnotatedForeignCommitRefusesWithoutMutation()
     {
-        var template = File.ReadAllText(Path.Combine(
-            InfraRepositoryLocator.ResolveRoot(), ".github", "templates", "package.yml"));
-
-        Assert.Contains("needs.publish-public.result == 'success'", template, StringComparison.Ordinal);
-        Assert.Contains("needs.publish-private.result == 'success'", template, StringComparison.Ordinal);
+        var result = RunTagResolution([new TagObjectReply("commit", new string('b', 40))]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("different commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
     }
 
-    private sealed record PublishOutcome(
-        ShellResult Result,
-        string GithubOutput,
-        string SleepLog,
-        string CurlLog,
-        string RequestLog);
-
-    private sealed record PrecheckOutcome(ShellResult Result, string GithubOutput);
-
-    private static PublishOutcome RunPublish(
-        TempRepository repository,
-        string pushStatus,
-        string nupkgStatuses,
-        string nuspec,
-        string? localBody = null,
-        string? downloadedBody = null,
-        string? nuspecEntries = null)
+    [Fact]
+    public void TagRelease_UnsupportedRootObjectTypeFailsClosed()
     {
-        var githubOutput = repository.WriteFile("github-output.txt", string.Empty);
-        var sleepLog = repository.WriteFile("sleep.log", string.Empty);
-        var curlLog = repository.WriteFile("curl.log", string.Empty);
-        var requestLog = repository.WriteFile("request.log", string.Empty);
-        repository.WriteFile(ArtifactRelativePath, localBody ?? LocalArtifactBody);
+        var result = RunTagResolution([], referenceType: "tree");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("does not resolve to a commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
 
+    [Fact]
+    public void TagRelease_MissingRootObjectTypeFailsClosed()
+    {
+        var result = RunTagResolution([], referenceType: "__missing__");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_MissingRootObjectShaFailsClosed()
+    {
+        var result = RunTagResolution([], referenceSha: "__missing__");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_InvalidRootObjectShaFailsClosed()
+    {
+        var result = RunTagResolution([], referenceSha: "not-a-sha");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed release-tag object SHA", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseMissingTypeFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("__missing__", Sha)]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseMissingShaFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", "__missing__")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag response", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedResponseInvalidShaFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", "not-a-sha")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("malformed annotated release-tag object SHA", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedApiHttpFailureFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", Sha, "500")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("HTTP 500 while resolving", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_ReleaseRefApiHttpFailureFailsClosed()
+    {
+        var result = RunTagResolution([], referenceStatus: "500");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("HTTP 500 while checking the release tag", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_ReleaseRefTransportFailureFailsClosed()
+    {
+        var result = RunTagResolution([], referenceStatus: "transport");
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("Could not check whether the release tag is already claimed", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedTransportFailureFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("commit", Sha, "transport")]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("Could not resolve the annotated release tag", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedUnsupportedTargetTypeFailsClosed()
+    {
+        var result = RunTagResolution([new TagObjectReply("tree", Sha)]);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("does not resolve to a commit", result.Result.StandardError, StringComparison.Ordinal);
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagRelease_AnnotatedDepthOverflowFailsClosedWithoutMutation()
+    {
+        var chain = Enumerable.Range(0, 17)
+            .Select(index => new TagObjectReply("tag", index.ToString("x").PadLeft(40, '0')))
+            .ToArray();
+        var result = RunTagResolution(chain);
+        Assert.NotEqual(0, result.Result.ExitCode);
+        Assert.Contains("depth limit", result.Result.StandardError, StringComparison.Ordinal);
+        Assert.Equal(16, result.RequestLog.Split('\n', StringSplitOptions.RemoveEmptyEntries).Count(line => line.Contains("/git/tags/", StringComparison.Ordinal)));
+        AssertExistingTagWasNeverMutated(result.RequestLog);
+    }
+
+    [Fact]
+    public void TagStateParser_ExportsTheShaConsumedByTagMutation()
+    {
+        var stateModule = File.ReadAllText(StateScript);
+        Assert.Contains("(\"GIZMO_SHA\", \"sha\")", stateModule, StringComparison.Ordinal);
+        Assert.Contains("$GIZMO_SHA", ReadAction("tag"), StringComparison.Ordinal);
+        Assert.DoesNotContain("GIZMO_SOURCE_SHA", ReadAction("tag"), StringComparison.Ordinal);
+    }
+
+    private static void AssertNugetReadbackRejected(string nuspec, string nuspecEntries, string expectedError)
+    {
+        using var repository = new TempRepository();
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var environment = PublishingEnvironment(repository, artifact);
+        environment["STUB_PUSH_STATUS"] = "409";
+        environment["STUB_READBACK_STATUSES"] = "200";
+        environment["STUB_NUSPEC"] = nuspec;
+        environment["STUB_NUSPEC_ENTRIES"] = nuspecEntries;
+        var result = RunNugetPublishReadback(repository, state, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedError, result.StandardError, StringComparison.Ordinal);
+        Assert.Empty(File.ReadAllText(repository.AbsolutePath("sleep.log")));
+        Assert.Single(File.ReadAllLines(repository.AbsolutePath("requests.log")), line => line.Contains(".nupkg", StringComparison.Ordinal));
+    }
+
+    private static ShellResult RunNugetPublishReadback(TempRepository repository, string state, IReadOnlyDictionary<string, string> environment) =>
+        WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n"
+            + StateShell(state, "publishable", "nuget") + "\n" + CurlPublishingStub() + "\n"
+            + JqPublishingStub() + "\nunzip() { if [[ \"$1\" == -Z1 ]]; then printf '%s\\n' \"$STUB_NUSPEC_ENTRIES\"; else printf '%s' \"$STUB_NUSPEC\"; fi; }\n"
+            + "sleep() { printf '%s\\n' \"$1\" >> \"$STUB_SLEEP_LOG\"; }\n" + PublishStep("nuget"), repository.Root, environment);
+
+    private static void AssertNugetCollision(string nuspec, string entries, bool shouldPass)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var result = RunCollision(repository, "nuget", state, "public", nuspec, entries, versionPresent: true);
+        var output = File.ReadAllText(repository.AbsolutePath("github-output"));
+        if (shouldPass)
+        {
+            Assert.True(result.ExitCode == 0, result.StandardError + "\n" + result.StandardOutput);
+            Assert.Contains("package-state=published", output, StringComparison.Ordinal);
+            Assert.Contains("steps.collision.outputs.package-state != 'published'", ReadAction("nuget"), StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.DoesNotContain("package-state=published", output, StringComparison.Ordinal);
+        }
+    }
+
+    private static string CreateSealedState(TempRepository repository, string visibility, string role, string digestSource, object[]? tags = null)
+    {
+        var reference = role == "production" ? "refs/heads/release" : "refs/heads/pre-release";
+        var request = JsonSerializer.Serialize(new
+        {
+            repo = "owner/repository", sha = Sha, @ref = reference, run = "700", attempt = "1", @event = "push",
+            dev = "pre-release", prod = "release", role, packageId = "Gizmo.Widget", compatibilityLine = "3.0",
+            runNumber = "42", visibility, tags = tags ?? Array.Empty<object>(),
+        });
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["EXPECTED_PACKAGE_ID"] = PackageId,
-            ["PACKAGE_VERSION"] = PackageVersion,
-            ["NUGET_USER"] = "test-nuget-user",
-            ["PACKAGE_ARTIFACT"] = ArtifactRelativePath,
-            ["GITHUB_SHA"] = CurrentSha,
-            ["GITHUB_OUTPUT"] = githubOutput,
-            ["GITHUB_ACTION_PATH"] = PublicActionPath(),
-            ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "id-token-request-token",
-            ["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://pipelines.example/oidc?api-version=2.0",
-            ["STUB_PUSH_STATUS"] = pushStatus,
-            ["STUB_NUPKG_STATUSES"] = nupkgStatuses,
-            ["STUB_NUSPEC"] = nuspec,
-            ["STUB_NUPKG_BODY"] = downloadedBody ?? (localBody ?? LocalArtifactBody),
-            ["STUB_NUSPEC_ENTRIES"] = nuspecEntries ?? ExpectedNuspecName,
-            ["STUB_NUPKG_COUNTER"] = repository.AbsolutePath("nupkg-counter.txt"),
-            ["STUB_SLEEP_LOG"] = sleepLog,
-            ["STUB_CURL_LOG"] = curlLog,
-            ["STUB_REQUEST_LOG"] = requestLog,
+            ["GITHUB_EVENT_NAME"] = "push",
+            ["GITHUB_REF"] = reference,
+            ["GITHUB_BASE_REF"] = string.Empty,
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GITHUB_SHA"] = Sha,
+            ["GITHUB_RUN_ID"] = "700",
+            ["GITHUB_RUN_ATTEMPT"] = "1",
         };
-
-        var result = WorkflowShell.RunBash(PublishScript(), repository.Root, environment);
-        return new PublishOutcome(
-            result,
-            File.ReadAllText(githubOutput),
-            File.ReadAllText(sleepLog),
-            File.ReadAllText(curlLog),
-            File.ReadAllText(requestLog));
+        var plan = RunState("plan", request, environment);
+        Assert.Equal(0, plan.ExitCode);
+        var plannedState = Parse(plan.StandardOutput)["planned-state"];
+        var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(digestSource))).ToLowerInvariant();
+        var seal = RunState("seal --digest " + digest, plannedState, environment);
+        Assert.Equal(0, seal.ExitCode);
+        return Parse(seal.StandardOutput)["state"];
     }
 
-    private static PrecheckOutcome RunPrecheck(
+    private static string ReplaceStateField(string state, string key, string jsonValue)
+    {
+        var normalized = state.Replace('-', '+').Replace('_', '/');
+        normalized += new string('=', (4 - normalized.Length % 4) % 4);
+        using var document = JsonDocument.Parse(Convert.FromBase64String(normalized));
+        var fields = document.RootElement.EnumerateObject()
+            .ToDictionary(property => property.Name, property => property.Value.Clone(), StringComparer.Ordinal);
+        using var replacement = JsonDocument.Parse(jsonValue);
+        fields[key] = replacement.RootElement.Clone();
+        return Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(fields))
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
+    private static ShellResult RunCollision(
         TempRepository repository,
-        string indexStatus,
+        string action,
+        string state,
+        string visibility,
+        string nuspec,
+        string nuspecEntries,
         bool versionPresent,
-        string nupkgStatus,
-        string nuspec,
-        string? localBody = null,
-        string? downloadedBody = null,
-        string? nuspecEntries = null)
+        string packageStatus = "200")
     {
-        var githubOutput = repository.WriteFile("github-output.txt", string.Empty);
-        repository.WriteFile(ArtifactRelativePath, localBody ?? LocalArtifactBody);
+        var output = repository.WriteFile("github-output", string.Empty);
+        var stateRole = "publishable";
+        var publisher = action == "nuget" ? "nuget" : "internal";
+        var shellState = StateShell(state, stateRole, publisher);
+        var stepName = action == "nuget"
+            ? "Recheck tag state and NuGet package provenance"
+            : "Recheck tag state and internal package provenance";
+        var step = FindStep(ReadAction(action), stepName);
+        var packagePath = repository.WriteFile("artifact.nupkg", "stored package");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, repository.AbsolutePath("curl.log"));
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", action).Replace('\\', '/');
+        environment["NUSPEC_PARSER"] = Path.Combine(Root, ".github", "package", "nuspec.py").Replace('\\', '/');
+        environment["VALIDATE_ORIGIN"] = Path.Combine(Root, ".github", "actions", "internal", "scripts", "validate.mjs").Replace('\\', '/');
+        environment["STUB_VISIBILITY"] = visibility;
+        environment["STUB_VERSION_PRESENT"] = versionPresent ? "true" : "false";
+        environment["STUB_PACKAGE_STATUS"] = packageStatus;
+        environment["STUB_NUSPEC"] = nuspec;
+        environment["STUB_NUSPEC_ENTRIES"] = nuspecEntries;
+        environment["STUB_PACKAGE_FILE"] = packagePath.Replace('\\', '/');
+        environment["STUB_PACKAGE_BASE"] = "https://nuget.pkg.github.com/owner/download";
+        environment["STUB_NUPKG_BODY"] = "repository-resigned-stored-bytes";
+        environment["STUB_DOWNLOADED_PACKAGE"] = repository.AbsolutePath("downloaded-package.nupkg");
+        var wrapper = shellState + "\n" + CollisionCurlStub() + "\n" + CollisionJqStub() + "\n" + CollisionUnzipStub();
+        return WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + wrapper + "\n" + step, repository.Root, environment);
+    }
 
-        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+    private static string StateShell(string state, string role, string publisher)
+    {
+        var identity = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["EXPECTED_PACKAGE_ID"] = PackageId,
-            ["PACKAGE_VERSION"] = PackageVersion,
-            ["PACKAGE_ARTIFACT"] = ArtifactRelativePath,
-            ["GITHUB_SHA"] = CurrentSha,
-            ["GITHUB_OUTPUT"] = githubOutput,
-            ["GITHUB_ACTION_PATH"] = PublicActionPath(),
-            ["STUB_INDEX_STATUS"] = indexStatus,
-            ["STUB_NUPKG_STATUS"] = nupkgStatus,
-            ["STUB_NUSPEC"] = nuspec,
-            ["STUB_NUPKG_BODY"] = downloadedBody ?? (localBody ?? LocalArtifactBody),
-            ["STUB_NUSPEC_ENTRIES"] = nuspecEntries ?? ExpectedNuspecName,
-            ["STUB_VERSION_PRESENT"] = versionPresent ? "1" : string.Empty,
-            ["STUB_RESPONSE_FILE"] = repository.AbsolutePath("response.json"),
-            ["STUB_PACKAGE_FILE"] = repository.AbsolutePath("package.nupkg"),
+            ["GITHUB_EVENT_NAME"] = "push",
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GITHUB_SHA"] = Sha,
+            ["GITHUB_REF"] = role == "production" ? "refs/heads/release" : "refs/heads/pre-release",
+            ["GITHUB_BASE_REF"] = string.Empty,
+            ["GITHUB_RUN_ID"] = "700",
+            ["GITHUB_RUN_ATTEMPT"] = "1",
         };
-
-        var result = WorkflowShell.RunBash(PrecheckScript(), repository.Root, environment);
-        return new PrecheckOutcome(result, File.ReadAllText(githubOutput));
+        var parsed = WorkflowShell.RunPythonCli(StateScript,
+            ["validate", "--role", role, "--expect-publisher", publisher], state, identity);
+        Assert.Equal(0, parsed.ExitCode);
+        return parsed.StandardOutput;
     }
 
-    private static string RunStep(string name)
+    private static string CollisionCurlStub() => """
+        curl() {
+          local output='' method='GET' url=''
+          while (( $# )); do
+            case "$1" in
+              --output) output=$2; shift 2 ;;
+              --request) method=$2; shift 2 ;;
+              --write-out|--header|--user|--connect-timeout|--max-time|--data) shift 2 ;;
+              --silent|--show-error|--location|--fail) shift ;;
+              *) url=$1; shift ;;
+            esac
+          done
+          printf '%s %s\n' "$method" "$url" >> "$CURL_LOG"
+          case "$url" in
+            */git/matching-refs/tags/*) printf '[]' > "$output"; printf 200 ;;
+            https://api.nuget.org/*/index.json)
+              if [[ "$url" == *flatcontainer* ]]; then
+                if [[ "$STUB_VERSION_PRESENT" == true ]]; then printf '{"versions":["%s"]}' "$GIZMO_PACKAGE_VERSION" > "$output"; printf 200; else printf '{"versions":[]}' > "$output"; printf 404; fi
+              else printf '{"versions":["%s"]}' "$GIZMO_PACKAGE_VERSION" > "$output"; printf 200; fi ;;
+            https://api.nuget.org/*/*.nupkg)
+              if [[ "$STUB_PACKAGE_STATUS" == 200 ]]; then printf '%s' "${STUB_NUPKG_BODY:-mock-nupkg}" > "$output"; cp "$output" "$STUB_DOWNLOADED_PACKAGE"; fi
+              printf '%s' "$STUB_PACKAGE_STATUS" ;;
+            https://nuget.pkg.github.com/owner/index.json)
+              printf '{"resources":[{"@type":"PackageBaseAddress/3.0.0","@id":"%s"}]}' "$STUB_PACKAGE_BASE" > "$output"; printf 200 ;;
+            https://nuget.pkg.github.com/*/download/*/index.json)
+              if [[ "$STUB_VERSION_PRESENT" == true ]]; then printf '{"versions":["%s"]}' "$GIZMO_PACKAGE_VERSION" > "$output"; printf 200; else printf '{"versions":[]}' > "$output"; printf 404; fi ;;
+            https://nuget.pkg.github.com/*/download/*.nupkg) printf 'mock-nupkg' > "$output"; printf 200 ;;
+            *) echo "unexpected mock URL: $url" >&2; return 9 ;;
+          esac
+        }
+        """;
+
+    private static string CollisionJqStub() => """
+        jq() {
+          local joined="$*"
+          case "$joined" in
+            *'PackageBaseAddress/3.0.0'*) printf '%s' "$STUB_PACKAGE_BASE" ;;
+            *'index($version)'*) [[ "$STUB_VERSION_PRESENT" == true ]] && return 0 || return 1 ;;
+            *'-nc --arg id '*|*'-R -s'*) printf '{"packageId":"%s","tags":[]}' "$GIZMO_PACKAGE_ID" ;;
+            *'.[] | [.ref, .object.type, .object.sha] | @tsv'*) printf '%s' "${STUB_TAG_ROWS:-}" ;;
+            *'length'*) printf '0\n' ;;
+            *'type == "array"'*|*'type == "object"'*) printf 'true\n' ;;
+            *) echo "unexpected jq filter: $joined" >&2; return 8 ;;
+          esac
+        }
+        """;
+
+    private static string CollisionUnzipStub() => """
+        unzip() {
+          if [[ "$1" == -Z1 ]]; then printf '%s\n' "$STUB_NUSPEC_ENTRIES"; else printf '%s' "$STUB_NUSPEC"; fi
+        }
+        """;
+
+    private static string CurlPublishingStub() => """
+        curl() {
+          local output='' method='GET' url='' headers=''
+          while (( $# )); do
+            case "$1" in
+              --output) output=$2; shift 2 ;;
+              --request) method=$2; shift 2 ;;
+              --header) headers+="$2;"; shift 2 ;;
+              --write-out|--connect-timeout|--max-time|--data|--form) shift 2 ;;
+              --silent|--show-error|--fail) shift ;;
+              *) url=$1; shift ;;
+            esac
+          done
+          printf '%s %s headers=%s\n' "$method" "$url" "$headers" >> "$REQUEST_LOG"
+          case "$url" in
+            *audience=*) printf '{"value":"oidc-token"}' ;;
+            https://www.nuget.org/api/v2/token) printf '{"apiKey":"nuget-api-key"}' ;;
+            https://www.nuget.org/api/v2/package) [[ "${STUB_PUSH_STATUS:-201}" != 000 ]] || return 7; printf '%s' "${STUB_PUSH_STATUS:-201}" ;;
+            https://api.nuget.org/v3-flatcontainer/*.nupkg)
+              local count=0
+              [[ -f "$STUB_READBACK_COUNTER" ]] && count=$(<"$STUB_READBACK_COUNTER")
+              count=$((count + 1)); printf '%s' "$count" > "$STUB_READBACK_COUNTER"
+              local statuses=( ${STUB_READBACK_STATUSES:-200} )
+              local index=$((count - 1)); (( index < ${#statuses[@]} )) || index=$((${#statuses[@]} - 1))
+              local code=${statuses[$index]}
+              [[ "$code" != 200 || -z "$output" ]] || printf '%s' "$STUB_NUSPEC" > "$output"
+              printf '%s' "$code" ;;
+            *) echo "unexpected publish URL: $url" >&2; return 9 ;;
+          esac
+        }
+        """;
+
+    private static string JqPublishingStub() => """
+        jq() {
+          case "$*" in
+            *'.value'*) printf 'oidc-token' ;;
+            *'.apiKey'*) printf 'nuget-api-key' ;;
+            *'-nc'*) printf '{}' ;;
+            *) echo "unexpected jq filter: $*" >&2; return 8 ;;
+          esac
+        }
+        """;
+
+    private static string PublishStep(string action) => FindStep(ReadAction(action), "Publish exact package and reconcile duplicate provenance");
+
+    private static Dictionary<string, string> PublishingEnvironment(TempRepository repository, string artifact) => new(StringComparer.Ordinal)
     {
-        var runs = YamlWorkflowReader.MappingChild(YamlWorkflowReader.Parse(ActionContent), "runs");
-        var step = YamlWorkflowReader.MappingSequence(runs, "steps").Single(candidate =>
-            YamlWorkflowReader.ScalarChild(candidate, "name") == name);
-        return YamlWorkflowReader.ScalarChild(step, "run");
+        ["NUSPEC_PARSER"] = Path.Combine(Root, ".github", "package", "nuspec.py").Replace('\\', '/'),
+        ["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "nuget").Replace('\\', '/'),
+        ["GITHUB_SHA"] = Sha,
+        ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "mock-request-token",
+        ["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://oidc.example/token?api-version=2.0",
+        ["NUGET_USER"] = "mock-profile",
+        ["GIZMO_ARTIFACT_PATH"] = artifact.Replace('\\', '/'),
+        ["GIZMO_PACKAGE_ID"] = "Gizmo.Widget",
+        ["GIZMO_PACKAGE_VERSION"] = "3.0.0-dev.42",
+        ["REQUEST_LOG"] = repository.AbsolutePath("requests.log"),
+        ["STUB_READBACK_STATUSES"] = "200",
+        ["STUB_NUSPEC"] = Nuspec(Sha),
+        ["STUB_NUSPEC_ENTRIES"] = "Gizmo.Widget.nuspec",
+        ["STUB_READBACK_COUNTER"] = repository.AbsolutePath("readback-counter.txt"),
+        ["STUB_SLEEP_LOG"] = repository.WriteFile("sleep.log", string.Empty),
+    };
+
+    private sealed record TagObjectReply(string Type, string Sha, string Status = "200");
+
+    private sealed record TagMutationRun(ShellResult Result, string RequestLog);
+
+    private static TagMutationRun RunTagResolution(
+        IReadOnlyList<TagObjectReply> replies,
+        string referenceStatus = "200",
+        string? referenceType = null,
+        string? referenceSha = null)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "production", "prepared");
+        var shellState = StateShell(state, "production", "publishable");
+        var step = FindStep(ReadAction("tag"), "Create or reconcile immutable release tag");
+        var rootType = referenceType ?? (replies.Count > 0 ? "tag" : "commit");
+        var rootSha = referenceSha ?? (rootType == "tag" ? new string('c', 40) : Sha);
+        var run = RunTagMutation(repository, shellState, step, referenceStatus, rootType, rootSha, replies);
+        return run with { RequestLog = File.ReadAllText(repository.AbsolutePath("requests.log")) };
     }
 
-    private static string PublishScript()
+    private static TagMutationRun RunTagMutation(
+        TempRepository repository,
+        string shellState,
+        string step,
+        string referenceStatus,
+        string referenceType,
+        string referenceSha,
+        IReadOnlyList<TagObjectReply> replies)
     {
-        var run = RunStep(PublishStepName);
-        return $$"""
-            set -euo pipefail
+        var log = repository.WriteFile("requests.log", string.Empty);
+        var curl = """
             curl() {
-              local output='' url='' method='' location='no' headers=''
+              local output='' method='GET' url=''
               while (( $# )); do
                 case "$1" in
                   --output) output=$2; shift 2 ;;
-                  --header) headers+="$2"$'\n'; shift 2 ;;
                   --request) method=$2; shift 2 ;;
-                  --write-out|--data|--form|--connect-timeout|--max-time) shift 2 ;;
-                  --location) location='yes'; shift ;;
-                  --fail|--silent|--show-error) shift ;;
-                  *) url=$1; shift ;;
-                esac
-              done
-              printf '%s\n' "$url" >> "$STUB_CURL_LOG"
-              printf 'method=%s location=%s url=%s headers=%s\n' "$method" "$location" "$url" "$(printf '%s' "$headers" | tr '\n' ';')" >> "$STUB_REQUEST_LOG"
-              case "$url" in
-                *audience=*) printf '%s' '{"value":"oidc-token"}'; return 0 ;;
-                https://www.nuget.org/api/v2/token) printf '%s' '{"apiKey":"nuget-api-key"}'; return 0 ;;
-                https://www.nuget.org/api/v2/package)
-                  [[ -n "$output" ]] && printf '%s' "${STUB_PUSH_BODY:-}" > "$output"
-                  if [[ "${STUB_PUSH_STATUS:-201}" == "000" ]]; then return 7; fi
-                  printf '%s' "${STUB_PUSH_STATUS:-201}"
-                  return 0
-                  ;;
-                *.nupkg)
-                  local count=0
-                  if [[ -f "$STUB_NUPKG_COUNTER" ]]; then count=$(cat "$STUB_NUPKG_COUNTER"); fi
-                  count=$(( count + 1 ))
-                  printf '%s' "$count" > "$STUB_NUPKG_COUNTER"
-                  local statuses=( $STUB_NUPKG_STATUSES )
-                  local index=$(( count - 1 ))
-                  if (( index >= ${#statuses[@]} )); then index=$(( ${#statuses[@]} - 1 )); fi
-                  local code=${statuses[$index]}
-                  if [[ "$code" == 000 ]]; then return 7; fi
-                  [[ -n "$output" ]] && printf '%s' "${STUB_NUPKG_BODY:-nupkg-bytes}" > "$output"
-                  printf '%s' "$code"
-                  return 0
-                  ;;
-                *) printf '%s' '200'; return 0 ;;
-              esac
-            }
-            jq() {
-              local joined="$*"
-              case "$joined" in
-                *'.value'*) printf '%s' 'oidc-token' ;;
-                *'.apiKey'*) printf '%s' 'nuget-api-key' ;;
-                *) printf '%s' '{}' ;;
-              esac
-            }
-            unzip() {
-              if [[ "$1" == "-Z1" ]]; then printf '%s\n' "${STUB_NUSPEC_ENTRIES:-Gizmo.Widget.nuspec}"; return 0; fi
-              printf '%s' "${STUB_NUSPEC:-}"
-            }
-            {{WorkflowShell.PythonBashFunction()}}
-            sleep() { printf '%s\n' "$1" >> "$STUB_SLEEP_LOG"; }
-            {{run}}
-            """;
-    }
-
-    private static string PrecheckScript()
-    {
-        var block = WorkflowShell.ExtractBlock(ActionContent, "package_id_lower=$(printf", "esac");
-        return $$"""
-            set -euo pipefail
-            response_file="$STUB_RESPONSE_FILE"
-            package_file="$STUB_PACKAGE_FILE"
-            curl() {
-              local output='' url=''
-              while (( $# )); do
-                case "$1" in
-                  --output) output=$2; shift 2 ;;
-                  --write-out|--connect-timeout|--max-time|--header) shift 2 ;;
+                  --header|--data|--write-out) shift 2 ;;
                   --silent|--show-error|--location) shift ;;
                   *) url=$1; shift ;;
                 esac
               done
-              case "$url" in
-                *.nupkg)
-                  [[ -n "$output" ]] && printf '%s' "${STUB_NUPKG_BODY:-nupkg-bytes}" > "$output"
-                  printf '%s' "${STUB_NUPKG_STATUS:-200}"
-                  ;;
-                *index.json)
-                  [[ -n "$output" ]] && printf '%s' '{"versions":[]}' > "$output"
-                  printf '%s' "${STUB_INDEX_STATUS:-200}"
-                  ;;
-                *) printf '%s' '200' ;;
-              esac
-              return 0
+              printf '%s %s\n' "$method" "$url" >> "$REQUEST_LOG"
+              if [[ "$method" == POST ]]; then printf 201; return 0; fi
+              if [[ "$url" == */git/ref/tags/* ]]; then
+                MOCK_CURRENT_TYPE="$MOCK_REF_TYPE"
+                MOCK_CURRENT_SHA="$MOCK_REF_SHA"
+                [[ "$MOCK_REF_STATUS" != transport ]] || return 7
+                if [[ "$MOCK_REF_STATUS" == 200 ]]; then write_tag_response "$output" "$MOCK_CURRENT_TYPE" "$MOCK_CURRENT_SHA"; fi
+                printf '%s' "$MOCK_REF_STATUS"
+                return 0
+              fi
+              if [[ "$url" == */git/tags/* ]]; then
+                local requested_sha=${url##*/} index=-1 candidate=0
+                local request_shas=( ${MOCK_TAG_REQUEST_SHAS:-} )
+                local types=( ${MOCK_TAG_TYPES:-} )
+                local shas=( ${MOCK_TAG_SHAS:-} )
+                local statuses=( ${MOCK_TAG_STATUSES:-} )
+                for candidate in "${!request_shas[@]}"; do
+                  if [[ "${request_shas[$candidate]}" == "$requested_sha" ]]; then index=$candidate; break; fi
+                done
+                (( index >= 0 )) || { echo "unexpected mocked tag object SHA: $requested_sha" >&2; return 9; }
+                local status=${statuses[$index]:-500}
+                MOCK_CURRENT_TYPE=${types[$index]:-__missing__}
+                MOCK_CURRENT_SHA=${shas[$index]:-__missing__}
+                [[ "$status" != transport ]] || return 7
+                if [[ "$status" == 200 ]]; then write_tag_response "$output" "$MOCK_CURRENT_TYPE" "$MOCK_CURRENT_SHA"; fi
+                printf '%s' "$status"
+                return 0
+              fi
+              echo "unexpected mocked tag URL: $url" >&2
+              return 9
             }
+            write_tag_response() {
+              local output=$1 object_type=$2 object_sha=$3
+              printf '{"object":{' > "$output"
+              if [[ "$object_type" != __missing__ ]]; then printf '"type":"%s"' "$object_type" >> "$output"; fi
+              if [[ "$object_sha" != __missing__ ]]; then
+                [[ "$object_type" == __missing__ ]] || printf ',' >> "$output"
+                printf '"sha":"%s"' "$object_sha" >> "$output"
+              fi
+              printf '}}' >> "$output"
+            }
+            """;
+        var jq = """
+            jq() {
+              local joined="$*" input_file=${@: -1} value=''
+              case "$joined" in
+                *'-nc'*) printf '{}' ;;
+                *'.object.type | strings'*) value=$(sed -n 's/.*"type":"\([^"]*\)".*/\1/p' "$input_file"); [[ -n "$value" ]] || return 1; printf '%s' "$value" ;;
+                *'.object.sha | strings'*) value=$(sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' "$input_file"); [[ -n "$value" ]] || return 1; printf '%s' "$value" ;;
+                *) echo "unexpected jq filter: $*" >&2; return 8 ;;
+              esac
+            }
+            """;
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GITHUB_API_URL"] = "https://api.github.com",
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GH_TOKEN"] = "mock-token",
+            ["REQUEST_LOG"] = log,
+            ["MOCK_REF_STATUS"] = referenceStatus,
+            ["MOCK_REF_TYPE"] = referenceType,
+            ["MOCK_REF_SHA"] = referenceSha,
+            ["MOCK_TAG_REQUEST_SHAS"] = string.Join(' ', new[] { referenceSha }.Concat(replies.Where(reply => reply.Type == "tag").Select(reply => reply.Sha))),
+            ["MOCK_TAG_TYPES"] = string.Join(' ', replies.Select(reply => reply.Type)),
+            ["MOCK_TAG_SHAS"] = string.Join(' ', replies.Select(reply => reply.Sha)),
+            ["MOCK_TAG_STATUSES"] = string.Join(' ', replies.Select(reply => reply.Status)),
+        };
+        var result = WorkflowShell.RunBash(shellState + "\n" + curl + "\n" + jq + "\n" + step, repository.Root, environment);
+        return new TagMutationRun(result, File.ReadAllText(log));
+    }
+
+    private static void AssertExistingTagWasNeverMutated(TempRepository repository) =>
+        AssertExistingTagWasNeverMutated(File.ReadAllText(repository.AbsolutePath("requests.log")));
+
+    private static void AssertExistingTagWasNeverMutated(string requestLog)
+    {
+        Assert.DoesNotContain("POST https://api.github.com/repos/owner/repository/git/refs", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("PATCH", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("PUT", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("DELETE", requestLog, StringComparison.Ordinal);
+    }
+
+    private static ShellResult RunTagRecheck(TempRepository repository, string shellState, string step, string objectSha, string commitSha)
+    {
+        var log = repository.WriteFile("requests.log", string.Empty);
+        var curl = """
+            curl() {
+              local output='' url=''
+              while (( $# )); do case "$1" in --output) output=$2; shift 2 ;; --write-out|--header) shift 2 ;; --silent|--show-error|--location) shift ;; *) url=$1; shift ;; esac; done
+              printf '%s\n' "$url" >> "$REQUEST_LOG"
+              case "$url" in
+                */git/matching-refs/tags/*) printf '%s' "$STUB_TAG_REFS" > "$output"; printf 200 ;;
+                */git/tags/*) printf '{"object":{"type":"commit","sha":"%s"}}' "$STUB_TAG_COMMIT" > "$output"; printf 200 ;;
+                *) echo "unexpected mocked tag URL: $url" >&2; return 9 ;;
+              esac
+            }
+            """;
+        var jq = """
             jq() {
               local joined="$*"
               case "$joined" in
-                *'index($version)'*) [[ -n "${STUB_VERSION_PRESENT:-}" ]] && return 0 || return 1 ;;
-                *) return 0 ;;
+                *'type == "array"'*) printf true ;;
+                *'.[] | [.ref, .object.type, .object.sha] | @tsv'*) printf '%s\n' "$STUB_TAG_ROW" ;;
+                *'length'*) printf '1\n' ;;
+                *'.object.type | strings'*) printf 'commit' ;;
+                *'.object.sha | strings'*) printf '%s' "$STUB_TAG_COMMIT" ;;
+                *'-R -s'*) printf '%s' "$STUB_TAGS_JSON" ;;
+                *'-nc --arg id '* ) printf '{"packageId":"%s","tags":%s}' "$GIZMO_PACKAGE_ID" "$STUB_TAGS_JSON" ;;
+                *) echo "unexpected jq filter: $joined" >&2; return 8 ;;
               esac
             }
-            unzip() {
-              if [[ "$1" == "-Z1" ]]; then printf '%s\n' "${STUB_NUSPEC_ENTRIES:-Gizmo.Widget.nuspec}"; return 0; fi
-              printf '%s' "${STUB_NUSPEC:-}"
-            }
-            {{WorkflowShell.PythonBashFunction()}}
-            {{block}}
             """;
+        var tagRef = "refs/tags/Gizmo.Widget/v3.0.0";
+        var row = $"{tagRef}\ttag\t{objectSha}";
+        var refs = System.Text.Json.JsonSerializer.Serialize(new[] { new { @ref = tagRef, @object = new { type = "tag", sha = objectSha } } });
+        var tagsJson = System.Text.Json.JsonSerializer.Serialize(new[] { new { @ref = tagRef, objectSha } });
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GITHUB_API_URL"] = "https://api.github.com", ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GH_TOKEN"] = "mock-token", ["REQUEST_LOG"] = log, ["STUB_TAG_REFS"] = refs,
+            ["STUB_TAG_ROW"] = row, ["STUB_TAG_COMMIT"] = commitSha, ["STUB_TAGS_JSON"] = tagsJson,
+            ["STATE_PARSER"] = StateScript.Replace('\\', '/'),
+        };
+        return WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + shellState + "\n" + curl + "\n" + jq + "\n" + step, repository.Root, environment);
     }
 
-    private static string Nuspec(string commit, string id = PackageId, string version = PackageVersion) =>
-        $"""
-        <?xml version="1.0" encoding="utf-8"?>
-        <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
-          <metadata>
-            <id>{id}</id>
-            <version>{version}</version>
-            <repository type="git" url="https://github.com/owner/repository" commit="{commit}" />
-          </metadata>
-        </package>
-        """;
+    private static ShellResult RunState(string arguments, string input, IReadOnlyDictionary<string, string>? environment = null) =>
+        WorkflowShell.RunPythonCli(StateScript, arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries), input, environment);
+
+    private static Dictionary<string, string> ActionEnvironment(TempRepository repository, string state, string envFile, string tempDirectory, string curlLog) =>
+        new(StringComparer.Ordinal)
+        {
+            ["STATE"] = state,
+            ["STATE_PARSER"] = Path.Combine(Root, ".github", "package", "state.py").Replace('\\', '/'),
+            ["NUSPEC_PARSER"] = Path.Combine(Root, ".github", "package", "nuspec.py").Replace('\\', '/'),
+            ["GH_TOKEN"] = "mock-token",
+            ["GITHUB_EVENT_NAME"] = "push",
+            ["GITHUB_REPOSITORY"] = "owner/repository",
+            ["GITHUB_SHA"] = Sha,
+            ["GITHUB_REF"] = "refs/heads/pre-release",
+            ["GITHUB_BASE_REF"] = string.Empty,
+            ["GITHUB_RUN_ID"] = "700",
+            ["GITHUB_RUN_ATTEMPT"] = "1",
+            ["GITHUB_ENV"] = envFile,
+            ["RUNNER_TEMP"] = tempDirectory,
+            ["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "nuget").Replace('\\', '/'),
+            ["GITHUB_API_URL"] = "https://api.github.com",
+            ["GITHUB_OUTPUT"] = repository.WriteFile("github-output", string.Empty),
+            ["GITHUB_ACTOR"] = "test",
+            ["GITHUB_REPOSITORY_OWNER"] = "owner",
+            ["CURL_LOG"] = curlLog,
+            ["GIZMO_ARTIFACT_PATH"] = repository.AbsolutePath("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg"),
+        };
+
+    private static Dictionary<string, string> Parse(string content) => content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.Split('=', 2)).Where(parts => parts.Length == 2)
+        .ToDictionary(parts => parts[0], parts => parts[1], StringComparer.Ordinal);
+
+    private static string Nuspec(string commit, string id = "Gizmo.Widget", string version = "3.0.0-dev.42") =>
+        $"<package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\"><metadata><id>{id}</id><version>{version}</version><repository commit=\"{commit}\" /></metadata></package>";
+
+    private static string ReadAction(string name) => WorkflowShell.ReadAction(name);
+
+    private static string FindStep(string action, string name)
+    {
+        var root = YamlWorkflowReader.Parse(action);
+        var runs = YamlWorkflowReader.MappingChild(root, "runs");
+        var step = YamlWorkflowReader.MappingSequence(runs, "steps").Single(item => YamlWorkflowReader.ScalarChild(item, "name") == name);
+        return YamlWorkflowReader.ScalarChild(step, "run");
+    }
 }

@@ -1,38 +1,22 @@
-name: Publish NuGet package to the public NuGet.org feed
-description: Recheck caller state and provenance, then publish the exact prepared package to NuGet.org with caller-owned GitHub OIDC.
+name: Publish package to NuGet.org
+description: Independently revalidate caller state, destination, artifact, and provenance, then publish the exact prepared package to NuGet.org with caller-owned GitHub OIDC.
 inputs:
-  package-id:
-    description: NuGet package ID.
+  state:
+    description: Opaque versioned package state emitted by the plan workflow.
     required: true
-  nuget-user:
+  user:
     description: NuGet.org profile name used for trusted publishing token exchange.
-    required: true
-  package-artifact:
-    description: Repository-relative path of the packed .nupkg inside the workflow artifact.
-    required: true
-  package-version:
-    description: Calculated development or stable package version.
-    required: true
-  calculated-state:
-    description: Complete state emitted by the preparation workflow.
-    required: true
-  tag-state-fingerprint:
-    description: Tag-state fingerprint emitted by the preparation workflow.
-    required: true
-  repository-visibility:
-    description: Preflight caller repository visibility; must be public for this publisher.
     required: true
 runs:
   using: composite
   steps:
-    - name: Validate public publisher invocation
+    - name: Validate NuGet publisher invocation
       shell: bash
       env:
         EVENT_NAME: ${{ github.event_name }}
         REF_NAME: ${{ github.ref }}
         REF_PROTECTED: ${{ github.ref_protected }}
-        NUGET_USER: ${{ inputs.nuget-user }}
-        REPOSITORY_VISIBILITY: ${{ inputs.repository-visibility }}
+        NUGET_USER: ${{ inputs.user }}
       run: |
         set -euo pipefail
         if [[ "$EVENT_NAME" != push ]]; then
@@ -44,11 +28,7 @@ runs:
           exit 1
         fi
         if [[ ! "$NUGET_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-          echo "nuget-user is missing or invalid." >&2
-          exit 1
-        fi
-        if [[ "$REPOSITORY_VISIBILITY" != public ]]; then
-          echo "The public publisher requires a public caller repository; refusing to route visibility '$REPOSITORY_VISIBILITY' to NuGet.org." >&2
+          echo "user is missing or invalid." >&2
           exit 1
         fi
 
@@ -58,23 +38,58 @@ runs:
         name: nuget-package-${{ github.run_id }}-${{ github.run_attempt }}
         path: artifacts
 
-    - name: Recheck calculated state and public package provenance
+    - name: Parse state and revalidate destination and artifact
+      id: revalidate
+      shell: bash
+      env:
+        STATE: ${{ inputs.state }}
+        STATE_PARSER: ${{ github.action_path }}/../../package/state.py
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        fail() { echo "$1" >&2; exit 1; }
+        env_file="$RUNNER_TEMP/gizmo-state.env"
+        shell_file="$RUNNER_TEMP/gizmo-state.shell"
+        if ! printf '%s' "$STATE" | python3 "$STATE_PARSER" validate --role publishable --expect-publisher nuget --github-env "$env_file" > "$shell_file"; then
+          fail "The package state is missing, malformed, tampered, or unknown-version; refusing to publish."
+        fi
+        # shellcheck disable=SC1090
+        . "$shell_file"
+        cat "$env_file" >> "$GITHUB_ENV"
+
+        response_file=$(mktemp)
+        trap 'rm -f "$response_file"' EXIT
+        if ! status=$(curl --silent --show-error --location --connect-timeout 10 --max-time 30 --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"); then
+          fail "Could not fetch authenticated caller repository metadata."
+        fi
+        [[ "$status" == 200 ]] || fail "GitHub returned HTTP $status for caller repository metadata."
+        if ! visibility=$(jq -er 'if type == "object" and (.visibility | type == "string") then .visibility else error("missing visibility") end' "$response_file"); then
+          fail "GitHub returned malformed caller repository metadata."
+        fi
+        [[ "$visibility" == "$GIZMO_REPOSITORY_VISIBILITY" ]] || fail "Caller repository visibility drifted from the planned state; refusing to publish."
+        [[ "$GIZMO_PUBLISHER" == nuget ]] || fail "The planned publisher is not nuget; refusing to publish."
+        [[ "$GIZMO_EVENT" == push ]] || fail "The planned event is not push; refusing to publish."
+
+        [[ -f "$GIZMO_ARTIFACT_PATH" ]] || fail "The exact prepared package artifact is missing."
+        actual_digest=$(sha256sum "$GIZMO_ARTIFACT_PATH" | cut -d ' ' -f1)
+        [[ "$actual_digest" == "$GIZMO_ARTIFACT_DIGEST" ]] || fail "The prepared package artifact digest does not match the planned state; refusing to publish."
+
+    - name: Recheck tag state and NuGet package provenance
       id: collision
       shell: bash
       env:
+        STATE_PARSER: ${{ github.action_path }}/../../package/state.py
+        NUSPEC_PARSER: ${{ github.action_path }}/../../package/nuspec.py
         GH_TOKEN: ${{ github.token }}
-        EXPECTED_PACKAGE_ID: ${{ inputs.package-id }}
-        PACKAGE_VERSION: ${{ inputs.package-version }}
-        PACKAGE_ARTIFACT: ${{ inputs.package-artifact }}
-        EXPECTED_STATE: ${{ inputs.calculated-state }}
-        EXPECTED_FINGERPRINT: ${{ inputs.tag-state-fingerprint }}
       run: |
         set -euo pipefail
         export LC_ALL=C
         response_file=$(mktemp)
         package_file=$(mktemp)
         tag_object_file=$(mktemp)
-        trap 'rm -f "$response_file" "$package_file" "$tag_object_file"' EXIT
+        rows_file=$(mktemp)
+        trap 'rm -f "$response_file" "$package_file" "$tag_object_file" "$rows_file"' EXIT
         resolve_commit() {
           local object_type=$1 object_sha=$2 status depth=0
           while :; do
@@ -89,47 +104,41 @@ runs:
             esac
           done
         }
-        tag_prefix="refs/tags/${EXPECTED_PACKAGE_ID}/"
-        snapshot=''
         page=1
+        : > "$rows_file"
         while :; do
-          if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$EXPECTED_PACKAGE_ID/?per_page=100&page=$page"); then echo "Could not refetch caller-repository package tag refs." >&2; exit 1; fi
+          if ! status=$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$GIZMO_PACKAGE_ID/?per_page=100&page=$page"); then echo "Could not refetch caller-repository package tag refs." >&2; exit 1; fi
           if [[ "$status" != 200 ]] || ! jq -e 'type == "array" and all(.[]; (.ref | type == "string") and (.object | type == "object") and (.object.type | type == "string") and (.object.sha | type == "string"))' "$response_file" > /dev/null; then echo "GitHub returned a malformed package tag-ref response during publication recheck." >&2; exit 1; fi
           while IFS=$'\t' read -r ref object_type object_sha; do
             [[ -z "$ref" ]] && continue
-            if [[ "$ref" != "$tag_prefix"* ]]; then echo "GitHub returned a tag outside the requested package prefix." >&2; exit 1; fi
-            leaf=${ref#"$tag_prefix"}
-            if [[ ! "$leaf" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then echo "Malformed tag under the exact package prefix: $ref" >&2; exit 1; fi
             resolve_commit "$object_type" "$object_sha" > /dev/null || exit 1
-            snapshot+="${ref}=${object_sha}"$'\n'
+            printf '%s\t%s\n' "$ref" "$object_sha" >> "$rows_file"
           done < <(jq -r '.[] | [.ref, .object.type, .object.sha] | @tsv' "$response_file")
           count=$(jq -er 'length' "$response_file")
           if (( count < 100 )); then break; fi
           ((page += 1))
         done
-        snapshot=$(printf '%s' "$snapshot" | LC_ALL=C sort)
-        fingerprint=$(printf '%s' "$snapshot" | sha256sum | cut -d ' ' -f1)
-        tag_state=$(printf '%s' "$snapshot" | base64 --wrap=0)
-        if [[ "$EXPECTED_STATE" != *";tag-state=${tag_state}" || "$fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then echo "Calculated package state drifted before publication; refusing to publish." >&2; exit 1; fi
-        package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
-        version_lower=$(printf '%s' "$PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
+        tags_json=$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {ref: .[0], objectSha: .[1]})' "$rows_file")
+        if ! fingerprint=$(jq -nc --arg id "$GIZMO_PACKAGE_ID" --argjson tags "$tags_json" '{packageId: $id, tags: $tags}' | python3 "$STATE_PARSER" fingerprint); then echo "The observed package tag state is foreign or malformed; refusing to publish." >&2; exit 1; fi
+        if [[ "$fingerprint" != "$GIZMO_TAG_STATE_FINGERPRINT" ]]; then echo "Calculated package state drifted before publication; refusing to publish." >&2; exit 1; fi
+
+        package_id_lower=$(printf '%s' "$GIZMO_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
+        version_lower=$(printf '%s' "$GIZMO_PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
         if ! status=$(curl --silent --show-error --location --connect-timeout 5 --max-time 15 --output "$response_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/index.json"); then echo "Could not recheck whether the public package version already exists." >&2; exit 1; fi
         case "$status" in
           200)
             jq -e 'type == "object" and (.versions | type == "array") and all(.versions[]; type == "string")' "$response_file" > /dev/null || { echo "NuGet.org returned a malformed package-version response." >&2; exit 1; }
-            if jq -e --arg version "$PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then
+            if jq -e --arg version "$GIZMO_PACKAGE_VERSION" '.versions | index($version) != null' "$response_file" > /dev/null; then
               if ! status=$(curl --silent --show-error --location --connect-timeout 5 --max-time 15 --output "$package_file" --write-out '%{http_code}' "https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"); then echo "Could not read the published public package for collision provenance." >&2; exit 1; fi
               if [[ "$status" != 200 ]]; then echo "NuGet.org returned HTTP $status for the published public package; treating the existing version as an unverifiable collision." >&2; exit 1; fi
-              # Read provenance only from the single expected nuspec, never an archive-wide decoy match.
               nuspec_entries=$(unzip -Z1 "$package_file" 2>/dev/null | grep -i '\.nuspec$' || true)
               nuspec_count=$(printf '%s\n' "$nuspec_entries" | grep -c '[^[:space:]]' || true)
               if [[ "$nuspec_count" != 1 ]]; then echo "The existing public package version does not contain exactly one nuspec; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
               nuspec_name=$(printf '%s\n' "$nuspec_entries" | grep '[^[:space:]]')
               nuspec_basename=${nuspec_name##*/}
-              if [[ "${nuspec_basename,,}" != "${EXPECTED_PACKAGE_ID,,}.nuspec" ]]; then echo "The existing public package version nuspec is not the expected package nuspec; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
+              if [[ "${nuspec_basename,,}" != "${GIZMO_PACKAGE_ID,,}.nuspec" ]]; then echo "The existing public package version nuspec is not the expected package nuspec; failing closed instead of publishing or creating a recovery tag." >&2; exit 1; fi
               nuspec=$(unzip -p "$package_file" "$nuspec_name" 2>/dev/null || true)
-              # The nuspec is untrusted metadata, so provenance must be parsed structurally, not by regex.
-              if ! provenance_verdict=$(printf '%s' "$nuspec" | python3 "$GITHUB_ACTION_PATH/scripts/nuspec_provenance.py"); then
+              if ! provenance_verdict=$(printf '%s' "$nuspec" | EXPECTED_PACKAGE_ID="$GIZMO_PACKAGE_ID" PACKAGE_VERSION="$GIZMO_PACKAGE_VERSION" python3 "$NUSPEC_PARSER"); then
                 if [[ "$provenance_verdict" == id ]]; then
                   echo "The existing public package version nuspec ID does not match the expected package ID; failing closed instead of publishing or creating a recovery tag." >&2
                 elif [[ "$provenance_verdict" == version ]]; then
@@ -154,10 +163,8 @@ runs:
       if: ${{ steps.collision.outputs.package-state != 'published' }}
       shell: bash
       env:
-        NUGET_USER: ${{ inputs.nuget-user }}
-        PACKAGE_ARTIFACT: ${{ inputs.package-artifact }}
-        EXPECTED_PACKAGE_ID: ${{ inputs.package-id }}
-        PACKAGE_VERSION: ${{ inputs.package-version }}
+        NUSPEC_PARSER: ${{ github.action_path }}/../../package/nuspec.py
+        NUGET_USER: ${{ inputs.user }}
       run: |
         set -euo pipefail
         export LC_ALL=C
@@ -171,21 +178,20 @@ runs:
         package_file=$(mktemp)
         trap 'rm -f "$push_response" "$package_file"' EXIT
         # No --location: the API key must never follow a redirect to another origin.
-        if ! push_status=$(curl --silent --show-error --request PUT --connect-timeout 10 --max-time 60 --output "$push_response" --write-out '%{http_code}' --header "X-NuGet-ApiKey: $nuget_api_key" --header "X-NuGet-Protocol-Version: 4.1.0" --form "package=@${PACKAGE_ARTIFACT};type=application/octet-stream;filename=package.nupkg" 'https://www.nuget.org/api/v2/package'); then
+        if ! push_status=$(curl --silent --show-error --request PUT --connect-timeout 10 --max-time 60 --output "$push_response" --write-out '%{http_code}' --header "X-NuGet-ApiKey: $nuget_api_key" --header "X-NuGet-Protocol-Version: 4.1.0" --form "package=@${GIZMO_ARTIFACT_PATH};type=application/octet-stream;filename=package.nupkg" 'https://www.nuget.org/api/v2/package'); then
           echo "Could not reach the NuGet.org package-publish endpoint." >&2
           exit 1
         fi
         case "$push_status" in
-          2*) echo "NuGet.org accepted public package $PACKAGE_VERSION."; exit 0 ;;
-          409) echo "NuGet.org already has public package $PACKAGE_VERSION; reconciling the existing package provenance." ;;
+          2*) echo "NuGet.org accepted public package $GIZMO_PACKAGE_VERSION."; exit 0 ;;
+          409) echo "NuGet.org already has public package $GIZMO_PACKAGE_VERSION; reconciling the existing package provenance." ;;
           *) echo "NuGet.org returned HTTP $push_status for the push; failing closed." >&2; exit 1 ;;
         esac
-        # A duplicate still needs a readable provenance check, but flat-container reads can lag a completed push.
         readback_attempts=13
         readback_interval_seconds=10
         readback_max_delay_seconds=120
-        package_id_lower=$(printf '%s' "$EXPECTED_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
-        version_lower=$(printf '%s' "$PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
+        package_id_lower=$(printf '%s' "$GIZMO_PACKAGE_ID" | tr '[:upper:]' '[:lower:]')
+        version_lower=$(printf '%s' "$GIZMO_PACKAGE_VERSION" | tr '[:upper:]' '[:lower:]')
         package_download_url="https://api.nuget.org/v3-flatcontainer/${package_id_lower}/${version_lower}/${package_id_lower}.${version_lower}.nupkg"
         attempt=1
         elapsed=0
@@ -195,15 +201,14 @@ runs:
             status=000
           fi
           if [[ "$status" == 200 ]]; then
-            # Read provenance only from the single expected nuspec, never an archive-wide decoy match.
             nuspec_entries=$(unzip -Z1 "$package_file" 2>/dev/null | grep -i '\.nuspec$' || true)
             nuspec_count=$(printf '%s\n' "$nuspec_entries" | grep -c '[^[:space:]]' || true)
             if [[ "$nuspec_count" != 1 ]]; then echo "The published public package does not contain exactly one nuspec; failing closed." >&2; exit 1; fi
             nuspec_name=$(printf '%s\n' "$nuspec_entries" | grep '[^[:space:]]')
             nuspec_basename=${nuspec_name##*/}
-            if [[ "${nuspec_basename,,}" != "${EXPECTED_PACKAGE_ID,,}.nuspec" ]]; then echo "The published public package nuspec is not the expected package nuspec; failing closed." >&2; exit 1; fi
+            if [[ "${nuspec_basename,,}" != "${GIZMO_PACKAGE_ID,,}.nuspec" ]]; then echo "The published public package nuspec is not the expected package nuspec; failing closed." >&2; exit 1; fi
             nuspec=$(unzip -p "$package_file" "$nuspec_name" 2>/dev/null || true)
-            if ! provenance_verdict=$(printf '%s' "$nuspec" | python3 "$GITHUB_ACTION_PATH/scripts/nuspec_provenance.py"); then
+            if ! provenance_verdict=$(printf '%s' "$nuspec" | EXPECTED_PACKAGE_ID="$GIZMO_PACKAGE_ID" PACKAGE_VERSION="$GIZMO_PACKAGE_VERSION" python3 "$NUSPEC_PARSER"); then
               if [[ "$provenance_verdict" == id ]]; then
                 echo "The published public package nuspec ID does not match the expected package ID; failing closed." >&2
               elif [[ "$provenance_verdict" == version ]]; then
@@ -215,12 +220,12 @@ runs:
               fi
               exit 1
             fi
-            echo "Verified published public package $PACKAGE_VERSION provenance on readback attempt $attempt."
+            echo "Verified published public package $GIZMO_PACKAGE_VERSION provenance on readback attempt $attempt."
             exit 0
           fi
-          echo "Readback attempt $attempt/$readback_attempts returned HTTP $status for public package $PACKAGE_VERSION." >&2
+          echo "Readback attempt $attempt/$readback_attempts returned HTTP $status for public package $GIZMO_PACKAGE_VERSION." >&2
           if (( attempt >= readback_attempts )); then
-            echo "Could not read back the published public package for $PACKAGE_VERSION after $readback_attempts attempts; failing closed." >&2
+            echo "Could not read back the published public package for $GIZMO_PACKAGE_VERSION after $readback_attempts attempts; failing closed." >&2
             exit 1
           fi
           delay=$readback_interval_seconds
@@ -232,6 +237,4 @@ runs:
     - name: Report already-published same-SHA package
       if: ${{ steps.collision.outputs.package-state == 'published' }}
       shell: bash
-      env:
-        PACKAGE_VERSION: ${{ inputs.package-version }}
-      run: echo "Public package version $PACKAGE_VERSION is already published for this caller SHA; skipping publication so the immutable release tag can be reconciled."
+      run: echo "Public package version $GIZMO_PACKAGE_VERSION is already published for this caller SHA; skipping publication so the immutable release tag can be reconciled."
