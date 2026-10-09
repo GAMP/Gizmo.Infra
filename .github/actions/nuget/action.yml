@@ -68,7 +68,6 @@ runs:
           fail "GitHub returned malformed caller repository metadata."
         fi
         [[ "$visibility" == "$GIZMO_REPOSITORY_VISIBILITY" ]] || fail "Caller repository visibility drifted from the planned state; refusing to publish."
-        [[ "$visibility" == public ]] || fail "The NuGet publisher requires a public caller repository; refusing to route visibility '$visibility'."
         [[ "$GIZMO_PUBLISHER" == nuget ]] || fail "The planned publisher is not nuget; refusing to publish."
         [[ "$GIZMO_EVENT" == push ]] || fail "The planned event is not push; refusing to publish."
 

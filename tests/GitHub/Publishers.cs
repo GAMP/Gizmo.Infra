@@ -198,6 +198,20 @@ public sealed class CallerOwnedPublishingActionContractTests
         Assert.DoesNotContain("[[ \"$visibility\" == public ]]", internalAction, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void NugetPublisher_UsesSharedPublisherStateWithoutVisibilityDestinationPolicyGate()
+    {
+        var nugetAction = Read("nuget");
+        Assert.Contains("--expect-publisher nuget", nugetAction, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$visibility\" == \"$GIZMO_REPOSITORY_VISIBILITY\" ]]", nugetAction, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$GIZMO_PUBLISHER\" == nuget ]]", nugetAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("repository-visibility:", nugetAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("requires a private caller repository", nugetAction, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("requires a public caller repository", nugetAction, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("[[ \"$visibility\" == public ]]", nugetAction, StringComparison.Ordinal);
+        Assert.DoesNotContain("[[ \"$visibility\" == private ]]", nugetAction, StringComparison.Ordinal);
+    }
+
     private static string GetStep(string action, string name)
     {
         var root = YamlWorkflowReader.Parse(Read(action));

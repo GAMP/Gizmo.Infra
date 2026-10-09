@@ -128,6 +128,37 @@ public sealed class PrivilegedActionStateGuardTests
         Assert.DoesNotContain("/git/refs", string.Join('\n', requests), StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("private")]
+    [InlineData("internal")]
+    [InlineData("unknown")]
+    public void NugetAction_RejectsLiveVisibilityDriftBeforeOidcOrPackageFeedMutation(string liveVisibility)
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "public", "development", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("nuget"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "nuget").Replace('\\', '/');
+        environment["STUB_LIVE_VISIBILITY"] = liveVisibility;
+        var stubs = "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --write-out|--header|--connect-timeout|--max-time) shift 2 ;; --silent|--show-error|--location) shift ;; *) shift ;; esac; done; printf '{\"visibility\":\"%s\"}' \"$STUB_LIVE_VISIBILITY\" > \"$output\"; printf 200; echo \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY\" >> \"$CURL_LOG\"; }\n"
+            + "jq() { printf '%s' \"$STUB_LIVE_VISIBILITY\"; }\n";
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + stubs + step, repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("visibility drifted from the planned state", result.StandardError, StringComparison.Ordinal);
+        var requests = File.ReadAllLines(curlLog);
+        Assert.Single(requests);
+        Assert.Contains("/repos/owner/repository", requests[0], StringComparison.Ordinal);
+        var requestLog = string.Join('\n', requests);
+        Assert.DoesNotContain("api.nuget.org", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("www.nuget.org", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("oidc", requestLog, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/git/matching-refs/tags/", requestLog, StringComparison.Ordinal);
+        Assert.DoesNotContain("/git/refs", requestLog, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void PublisherSameShaCollisionIsGatedAndTagCannotMoveExistingReleaseRef()
     {
