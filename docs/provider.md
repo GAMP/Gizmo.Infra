@@ -333,6 +333,10 @@ preview build for a specific next patch only while the matching stable
 channel: after the matching stable version is published, NuGet may prefer that
 stable version.
 
+Existing `-dev.*` references match the historical `-dev` family and do not
+advance to `-preview.*` builds; consumers must move to `-preview.*` or an exact
+version.
+
 If a consumer must remain exclusively on preview packages after a matching
 stable release exists, do not rely on `<major>.<minor>.<patch>-preview.*` as that
 channel boundary. Use an exact prerelease version or another explicitly managed

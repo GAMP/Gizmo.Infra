@@ -93,10 +93,14 @@ public sealed class PackageStatePlannerTests
 
         var prPlan = Plan(eventName: "pull_request", role: "development");
         var prState = Seal(prPlan["planned-state"]);
-        AssertValid(prState, "publishable", "none");
+        AssertInvalid(prState, "publishable", "nuget", "publisher-mismatch");
         var invalidPrLabel = Decode(prState);
         invalidPrLabel["packageVersion"] = "3.0.0-preview.42";
         invalidPrLabel["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg";
+        AssertInvalid(Encode(invalidPrLabel), "malformed");
+        invalidPrLabel = Decode(prState);
+        invalidPrLabel["packageVersion"] = "3.0.0-pr.42";
+        invalidPrLabel["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-pr.42.nupkg";
         AssertInvalid(Encode(invalidPrLabel), "malformed");
 
         var payload = Decode(sealedState);
@@ -132,6 +136,8 @@ public sealed class PackageStatePlannerTests
         AssertInvalid(state, "production", "internal", "publisher-mismatch");
         var payload = Decode(state);
         payload["role"] = "development";
+        payload["packageVersion"] = "3.0.0-preview.42";
+        payload["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg";
         AssertInvalid(Encode(payload), "production", "publishable", "role-mismatch");
 
         var wrongSha = ContextForState(state);
