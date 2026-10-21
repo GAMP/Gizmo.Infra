@@ -72,7 +72,7 @@ COMPAT = re.compile(r"^([1-9][0-9]*)\.(" + DEC + r")$")
 STABLE = re.compile(r"^(" + DEC + r")\.(" + DEC + r")\.(" + DEC + r")$")
 VERSION = re.compile(
     r"^(" + DEC + r")\.(" + DEC + r")\.(" + DEC + r")"
-    r"(?:-(pr|dev)\.(" + DEC + r"))?$"
+    r"(?:-(dev|preview)\.(" + DEC + r"))?$"
 )
 TAG_LEAF = re.compile(r"^v(" + DEC + r")\.(" + DEC + r")\.(" + DEC + r")$")
 PACKAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -308,7 +308,7 @@ def plan(request):
     if event == "pull_request":
         patch = 0 if max_patch is None else max_patch + 1
         base = "{0}.{1}".format(request["compatibilityLine"], patch)
-        package_version = "{0}-pr.{1}".format(base, request["runNumber"])
+        package_version = "{0}-dev.{1}".format(base, request["runNumber"])
         publisher = "none"
         tag_requested = False
         release_tag_state = "not-applicable"
@@ -316,7 +316,7 @@ def plan(request):
     elif role == "development":
         patch = 0 if max_patch is None else max_patch + 1
         base = "{0}.{1}".format(request["compatibilityLine"], patch)
-        package_version = "{0}-dev.{1}".format(base, request["runNumber"])
+        package_version = "{0}-preview.{1}".format(base, request["runNumber"])
         publisher = _route(request["visibility"])
         tag_requested = False
         release_tag_state = "not-applicable"
@@ -414,6 +414,14 @@ def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
         version_match.group(1), version_match.group(2), version_match.group(3)
     )
     if version_base != state["baseVersion"]:
+        raise StateError("malformed")
+    # The event/branch role determines the label, never a caller-supplied version.
+    expected_label = (
+        "dev" if state["event"] == "pull_request"
+        else "preview" if state["role"] == "development"
+        else None
+    )
+    if version_match.group(4) != expected_label:
         raise StateError("malformed")
     if state["releaseTag"] != "{0}/v{1}".format(state["packageId"], state["baseVersion"]):
         raise StateError("malformed")

@@ -7,7 +7,7 @@ public sealed class InternalPublisherOriginValidationTests
     private static string Script => Path.Combine(InfraRepositoryLocator.ResolveRoot(), ".github", "actions", "internal", "scripts", "validate.mjs");
     private static string Action => WorkflowShell.ReadAction("internal");
     private const string BaseAddress = "https://nuget.pkg.github.com/owner/download";
-    private const string PackageVersion = "3.0.0-dev.7";
+    private const string PackageVersion = "3.0.0-preview.7";
 
     [Theory]
     [InlineData("https://nuget.pkg.github.com/owner/download")]

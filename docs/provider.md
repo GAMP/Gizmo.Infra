@@ -27,8 +27,8 @@ creates a tag.
 
 | Event / resolved role | Package work | `publisher` | `tag` |
 | --- | --- | --- | --- |
-| `pull_request` | build and pack `<major>.<minor>.<patch>-pr.N` | `none` | `false` |
-| push to `dev` | build and pack `<major>.<minor>.<patch>-dev.N` | routed | `false` |
+| `pull_request` | build and pack `<major>.<minor>.<patch>-dev.N` | `none` | `false` |
+| push to the declared development branch | build and pack `<major>.<minor>.<patch>-preview.N` | routed | `false` |
 | push to `prod` | build and pack `<major>.<minor>.<patch>` | routed | `true` |
 | any other ref | none | `none` | `false` |
 | publishable ref with unsupported routing | none | workflow fails closed | — |
@@ -149,7 +149,7 @@ a canonical decimal: `0` or a non-zero digit followed by digits, so leading
 zeros are rejected. So `1.0`, `1.1`, `3.0`, and `4.12` are valid, while `0.0`,
 `0.7`, `01.0`, `1.01`, and `1.0.14` are rejected. The declared major and minor
 select the active compatibility line; neither is fixed. Callers supply no patch
-or prerelease version: the patch and any `-dev.N`/`-pr.N` suffix are
+or prerelease version: the patch and any `-preview.N`/`-dev.N` suffix are
 infrastructure-owned. Project descriptor values and workflow version inputs are
 not authoritative.
 
@@ -163,8 +163,8 @@ GitHub run number supplies `N`:
 
 | Operation | Calculated package version |
 | --- | --- |
-| Validation | `<major>.<minor>.<patch>-pr.${{ github.run_number }}` (packed only) |
-| Development | `<major>.<minor>.<patch>-dev.${{ github.run_number }}` |
+| Validation | `<major>.<minor>.<patch>-dev.${{ github.run_number }}` (packed only) |
+| Development | `<major>.<minor>.<patch>-preview.${{ github.run_number }}` |
 | Production | `<major>.<minor>.<patch>` and `<package-id>/v<major>.<minor>.<patch>` |
 
 Validation and development calculate the next patch from the complete stable
@@ -267,13 +267,15 @@ and the workflow neither publishes nor creates a recovery tag.
 
 ### Gizmo.Shared 1.0 migration and adoption
 
+This is a historical adoption scenario, not the current published baseline. Its hypothetical next development version follows the new `-preview.N` contract.
+
 `Gizmo.Shared` is on compatibility line 1.0, and the stable `Gizmo.Shared 1.0.13`
 package already exists in the selected registry, so it is not a natural bootstrap
 and needs migration: keep steady state disabled until the existing package is
 adopted. Prove that `Gizmo.Shared 1.0.13` embeds a real caller commit as its
 `RepositoryCommit` and deliberately create the immutable `Gizmo.Shared/v1.0.13`
 tag. Steady state then derives the next patch: the next development build is
-`1.0.14-dev.N`, the next stable release calculates `1.0.14`, and the caller-owned
+`1.0.14-preview.N`, the next stable release calculates `1.0.14`, and the caller-owned
 `tag` action creates the immutable `Gizmo.Shared/v1.0.14` tag.
 
 The evaluated project `<Version>` remains the compatibility line only and the
@@ -314,8 +316,8 @@ automatic package advancement. This behavior is owned by NuGet resolution, not
 by Gizmo.Infra, so callers must choose a range whose semantics match the intended
 channel.
 
-The Gizmo.Shared 1.0 pilot verified the following behavior against NuGet.org with
-clean isolated restores:
+The Gizmo.Shared 1.0 pilot verified the following **historical** `-dev` package behavior against NuGet.org with
+clean isolated restores. These existing published package names are retained as evidence; they are **not** the new development naming policy:
 
 | PackageReference version | Observed behavior |
 | --- | --- |
@@ -325,14 +327,14 @@ clean isolated restores:
 | `1.0.14-dev.*` | Resolved stable `1.0.14` even though matching development versions existed. |
 | `1.0.*` | Resolved the latest stable patch, `1.0.15`, and did not select `1.0.16-dev.*`. |
 
-Therefore `<major>.<minor>.<patch>-dev.*` is suitable for following the newest
-development build for a specific next patch only while the matching stable
+For newly published preview versions, `<major>.<minor>.<patch>-preview.*` is suitable for following the newest
+preview build for a specific next patch only while the matching stable
 `<major>.<minor>.<patch>` does not exist. It is not a permanent dev-only
 channel: after the matching stable version is published, NuGet may prefer that
 stable version.
 
-If a consumer must remain exclusively on development packages after a matching
-stable release exists, do not rely on `<major>.<minor>.<patch>-dev.*` as that
+If a consumer must remain exclusively on preview packages after a matching
+stable release exists, do not rely on `<major>.<minor>.<patch>-preview.*` as that
 channel boundary. Use an exact prerelease version or another explicitly managed
 consumer policy instead.
 
@@ -342,7 +344,7 @@ predictable choice when automatic advancement is not required.
 
 Broader prerelease-aware floats are also possible:
 
-| Pattern | Scope | Example with the current Gizmo.Shared 1.x set |
+| Pattern | Scope | Example with the historical Gizmo.Shared 1.x pilot set |
 | --- | --- | --- |
 | `1.0.*-*` | Highest version in the `1.0` line, including prereleases | Selects `1.0.16-dev.21` while stable `1.0.16` does not exist; after stable `1.0.16` is published, that stable version wins. |
 | `1.*-*` | Highest version anywhere in major `1`, including prereleases | Also selects `1.0.16-dev.21` today, but may later move to a higher minor such as `1.1.0-dev.N`. |
