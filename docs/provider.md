@@ -329,7 +329,7 @@ clean isolated restores. These existing published package names are retained as 
 
 For newly published preview versions, `<major>.<minor>.<patch>-preview.*` is suitable for following the newest
 preview build for a specific next patch only while the matching stable
-`<major>.<minor>.<patch>` does not exist. It is not a permanent dev-only
+`<major>.<minor>.<patch>` does not exist. It is not a permanent preview-only
 channel: after the matching stable version is published, NuGet may prefer that
 stable version.
 
@@ -347,7 +347,7 @@ Broader prerelease-aware floats are also possible:
 | Pattern | Scope | Example with the historical Gizmo.Shared 1.x pilot set |
 | --- | --- | --- |
 | `1.0.*-*` | Highest version in the `1.0` line, including prereleases | Selects `1.0.16-dev.21` while stable `1.0.16` does not exist; after stable `1.0.16` is published, that stable version wins. |
-| `1.*-*` | Highest version anywhere in major `1`, including prereleases | Also selects `1.0.16-dev.21` today, but may later move to a higher minor such as `1.1.0-dev.N`. |
+| `1.*-*` | Highest version anywhere in major `1`, including prereleases | Also selects `1.0.16-dev.21` at the time of the pilot, but may later move to a higher minor such as `1.1.0-dev.N`. |
 | `1.0.*` | Highest stable version in the `1.0` line | Selects `1.0.15` and ignores `1.0.16-dev.*`. |
 
 The important distinction is that the numeric core is compared before
