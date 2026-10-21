@@ -17,12 +17,12 @@ public sealed class PackageStatePlannerTests
         var pr = Plan(eventName: "pull_request", role: "development", visibility: "public", runNumber: "42");
         Assert.Equal("none", pr["publisher"]);
         Assert.Equal("false", pr["tag"]);
-        Assert.Equal("3.0.0-pr.42", StateField(pr["planned-state"], "packageVersion"));
+        Assert.Equal("3.0.0-dev.42", StateField(pr["planned-state"], "packageVersion"));
 
         var development = Plan(eventName: "push", role: "development", visibility: "public", runNumber: "42");
         Assert.Equal("nuget", development["publisher"]);
         Assert.Equal("false", development["tag"]);
-        Assert.Equal("3.0.0-dev.42", StateField(development["planned-state"], "packageVersion"));
+        Assert.Equal("3.0.0-preview.42", StateField(development["planned-state"], "packageVersion"));
 
         var production = Plan(eventName: "push", role: "production", visibility: "private", runNumber: "42");
         Assert.Equal("internal", production["publisher"]);
@@ -50,10 +50,10 @@ public sealed class PackageStatePlannerTests
     {
         var tags = new[] { Tag("3.0.8", OtherSha), Tag("3.0.99", OtherSha), Tag("2.99.999", OtherSha) };
         var maximum = Plan(eventName: "push", role: "development", tags: tags);
-        Assert.Equal("3.0.100-dev.42", maximum["package-version"]);
+        Assert.Equal("3.0.100-preview.42", maximum["package-version"]);
 
         var nextMinor = Plan(eventName: "push", role: "development", compatibilityLine: "3.1", tags: [Tag("3.0.7", OtherSha)]);
-        Assert.Equal("3.1.0-dev.42", nextMinor["package-version"]);
+        Assert.Equal("3.1.0-preview.42", nextMinor["package-version"]);
         foreach (var line in new[] { "3.2", "4.1" })
         {
             var invalid = Plan(eventName: "push", role: "development", compatibilityLine: line, tags: [Tag("3.0.7", OtherSha)]);
@@ -85,6 +85,23 @@ public sealed class PackageStatePlannerTests
         var planned = Plan(eventName: "push", role: "development");
         var sealedState = Seal(planned["planned-state"]);
         AssertValid(sealedState, "publishable", "nuget");
+
+        var invalidDevelopmentLabel = Decode(sealedState);
+        invalidDevelopmentLabel["packageVersion"] = "3.0.0-dev.42";
+        invalidDevelopmentLabel["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg";
+        AssertInvalid(Encode(invalidDevelopmentLabel), "malformed");
+
+        var prPlan = Plan(eventName: "pull_request", role: "development");
+        var prState = Seal(prPlan["planned-state"]);
+        AssertInvalid(prState, "publishable", "nuget", "publisher-mismatch");
+        var invalidPrLabel = Decode(prState);
+        invalidPrLabel["packageVersion"] = "3.0.0-preview.42";
+        invalidPrLabel["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg";
+        AssertInvalid(Encode(invalidPrLabel), "malformed");
+        invalidPrLabel = Decode(prState);
+        invalidPrLabel["packageVersion"] = "3.0.0-pr.42";
+        invalidPrLabel["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-pr.42.nupkg";
+        AssertInvalid(Encode(invalidPrLabel), "malformed");
 
         var payload = Decode(sealedState);
         payload["v"] = 2;
@@ -119,6 +136,8 @@ public sealed class PackageStatePlannerTests
         AssertInvalid(state, "production", "internal", "publisher-mismatch");
         var payload = Decode(state);
         payload["role"] = "development";
+        payload["packageVersion"] = "3.0.0-preview.42";
+        payload["artifactPath"] = "artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg";
         AssertInvalid(Encode(payload), "production", "publishable", "role-mismatch");
 
         var wrongSha = ContextForState(state);
@@ -137,7 +156,7 @@ public sealed class PackageStatePlannerTests
         Assert.Equal(0, ExitCode(request));
         Assert.Equal("none", request["publisher"]);
         Assert.Equal("false", request["tag"]);
-        Assert.Equal("3.0.0-pr.42", request["package-version"]);
+        Assert.Equal("3.0.0-dev.42", request["package-version"]);
         Assert.Equal("not-applicable", request["release-tag-state"]);
         Assert.Equal("refs/heads/" + baseBranch, StateField(request["planned-state"], "ref"));
 

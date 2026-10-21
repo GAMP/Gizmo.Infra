@@ -98,7 +98,7 @@ publication result.
 The canonical template contains:
 
 - `plan` — calls the reusable plan workflow with `contents: read`. It builds and
-  packs the calculated `-pr.N` validation version for a pull request, prepares
+  packs the calculated `-dev.N` validation version for a pull request, prepares
   the development or stable version for a push, and exports `publisher`, `tag`,
   and the opaque `state`.
 - `nuget` — caller-owned, `contents: read` plus `id-token: write`, and only for
@@ -253,6 +253,8 @@ disagree about the same version.
 
 ### Gizmo.Shared 1.0 migration and adoption
 
+The following historical adoption scenario illustrates version/tag calculations; it is not a statement that the 1.0.13 baseline is still current. Under the updated policy its *hypothetical next* development package uses `-preview.N`.
+
 `Gizmo.Shared` is on compatibility line 1.0, and the stable `Gizmo.Shared 1.0.13`
 package already exists in the selected registry, so the line is not a natural
 bootstrap: keep steady state disabled until the migration procedure above adopts
@@ -260,7 +262,7 @@ that package. Prove the published `1.0.13` embeds a valid 40-character
 `RepositoryCommit` that is a real commit in the caller repository and produced
 that package, then deliberately create the immutable `Gizmo.Shared/v1.0.13` tag.
 Steady state then resumes at the next patch: the next development build is
-`1.0.14-dev.N`, the next stable release publishes `1.0.14`, and the caller-owned
+`1.0.14-preview.N`, the next stable release publishes `1.0.14`, and the caller-owned
 `tag` action creates the immutable `Gizmo.Shared/v1.0.14` tag.
 
 The evaluated project `<Version>` stays the compatibility line only: the pilot

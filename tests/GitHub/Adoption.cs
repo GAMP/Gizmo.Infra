@@ -48,7 +48,7 @@ public sealed class SharedPublisherProvenanceContractTests
         Assert.Contains("Unprovable highest — migration stays disabled", caller, StringComparison.Ordinal);
         Assert.Contains("RepositoryCommit", caller, StringComparison.Ordinal);
         Assert.Contains("Gizmo.Shared/v1.0.13", caller, StringComparison.Ordinal);
-        Assert.Contains("1.0.14-dev.N", caller, StringComparison.Ordinal);
+        Assert.Contains("1.0.14-preview.N", caller, StringComparison.Ordinal);
         Assert.Contains("Gizmo.Shared/v1.0.14", caller, StringComparison.Ordinal);
         Assert.Contains("separate, deliberate, one-time caller action, outside the workflow", caller, StringComparison.Ordinal);
 
@@ -56,7 +56,7 @@ public sealed class SharedPublisherProvenanceContractTests
         Assert.Contains("Natural bootstrap", provider, StringComparison.Ordinal);
         Assert.Contains("Migration stays disabled", provider, StringComparison.Ordinal);
         Assert.Contains("Gizmo.Shared/v1.0.13", provider, StringComparison.Ordinal);
-        Assert.Contains("1.0.14-dev.N", provider, StringComparison.Ordinal);
+        Assert.Contains("1.0.14-preview.N", provider, StringComparison.Ordinal);
         Assert.Contains("same-SHA recovery is the only automatic success", provider, StringComparison.Ordinal);
         Assert.Contains("at most 13 flat-container `GET` requests", provider, StringComparison.Ordinal);
         Assert.Contains("120-second total-delay cap", provider, StringComparison.Ordinal);

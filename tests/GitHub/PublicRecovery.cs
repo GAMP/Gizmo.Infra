@@ -42,7 +42,7 @@ public sealed class PrivilegedActionStateGuardTests
     {
         using var repository = new TempRepository();
         var expectedBytes = "signed-prepared-package";
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "altered-package");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "altered-package");
         var state = CreateSealedState(repository, visibility, "development", expectedBytes);
         var content = ReadAction(publisher);
         var step = FindStep(content, "Parse state and revalidate destination and artifact");
@@ -177,14 +177,14 @@ public sealed class PrivilegedActionStateGuardTests
     public void NugetFreshPackage_IsPublishedThroughMockedOidcAndAcceptedPush()
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var shell = StateShell(state, "publishable", "nuget");
         var script = shell + "\n" + CurlPublishingStub() + "\n" + JqPublishingStub() + "\n" + PublishStep("nuget");
         var result = WorkflowShell.RunBash(script, repository.Root, PublishingEnvironment(repository, artifact));
 
         Assert.Equal(0, result.ExitCode);
-        Assert.Contains("NuGet.org accepted public package 3.0.0-dev.42.", result.StandardOutput, StringComparison.Ordinal);
+        Assert.Contains("NuGet.org accepted public package 3.0.0-preview.42.", result.StandardOutput, StringComparison.Ordinal);
         var requests = File.ReadAllText(repository.AbsolutePath("requests.log"));
         Assert.Contains("PUT https://www.nuget.org/api/v2/package", requests, StringComparison.Ordinal);
         Assert.Contains("X-NuGet-ApiKey: nuget-api-key", requests, StringComparison.Ordinal);
@@ -196,7 +196,7 @@ public sealed class PrivilegedActionStateGuardTests
     public void NugetDuplicatePush_ReconcilesMatchingSameShaProvenanceOnReadback()
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var script = StateShell(state, "publishable", "nuget") + "\n" + CurlPublishingStub() + "\n"
             + JqPublishingStub() + "\nunzip() { if [[ \"$1\" == -Z1 ]]; then printf 'Gizmo.Widget.nuspec'; else printf '%s' \"$STUB_NUSPEC\"; fi; }\n"
@@ -207,15 +207,15 @@ public sealed class PrivilegedActionStateGuardTests
         var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + script, repository.Root, environment);
 
         Assert.True(result.ExitCode == 0, result.StandardError + "\n" + result.StandardOutput);
-        Assert.Contains("Verified published public package 3.0.0-dev.42 provenance", result.StandardOutput, StringComparison.Ordinal);
-        Assert.Contains("GET https://api.nuget.org/v3-flatcontainer/gizmo.widget/3.0.0-dev.42/gizmo.widget.3.0.0-dev.42.nupkg", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
+        Assert.Contains("Verified published public package 3.0.0-preview.42 provenance", result.StandardOutput, StringComparison.Ordinal);
+        Assert.Contains("GET https://api.nuget.org/v3-flatcontainer/gizmo.widget/3.0.0-preview.42/gizmo.widget.3.0.0-preview.42.nupkg", File.ReadAllText(repository.AbsolutePath("requests.log")), StringComparison.Ordinal);
     }
 
     [Fact]
     public void NugetDuplicateReadback_RetriesDelayedIndexingWithinBoundedBudget()
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var environment = PublishingEnvironment(repository, artifact);
         environment["STUB_PUSH_STATUS"] = "409";
@@ -260,7 +260,7 @@ public sealed class PrivilegedActionStateGuardTests
     public void NugetDuplicateReadback_UnreadablePackageExhaustsThirteenAttemptsAndTwelveMockSleeps()
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var environment = PublishingEnvironment(repository, artifact);
         environment["STUB_PUSH_STATUS"] = "409";
@@ -282,7 +282,7 @@ public sealed class PrivilegedActionStateGuardTests
     public void NugetUnexpectedPushStatus_FailsWithoutReadback(string pushStatus)
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var environment = PublishingEnvironment(repository, artifact);
         environment["STUB_PUSH_STATUS"] = pushStatus;
@@ -348,7 +348,7 @@ public sealed class PrivilegedActionStateGuardTests
         using var repository = new TempRepository();
         var localBytes = "prepared-artifact-bytes";
         var storedBytes = "repository-resigned-stored-bytes";
-        var localArtifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", localBytes);
+        var localArtifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", localBytes);
         var state = CreateSealedState(repository, "public", "development", localBytes);
         var collision = RunCollision(repository, "nuget", state, "public", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: true);
         Assert.Equal(0, collision.ExitCode);
@@ -374,7 +374,7 @@ public sealed class PrivilegedActionStateGuardTests
         var requests = File.ReadAllLines(repository.AbsolutePath("curl.log"));
         var serviceIndex = Array.FindIndex(requests, line => line.EndsWith("https://nuget.pkg.github.com/owner/index.json", StringComparison.Ordinal));
         var packageIndex = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/index.json", StringComparison.Ordinal));
-        var packageDownload = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/3.0.0-dev.42/gizmo.widget.3.0.0-dev.42.nupkg", StringComparison.Ordinal));
+        var packageDownload = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/3.0.0-preview.42/gizmo.widget.3.0.0-preview.42.nupkg", StringComparison.Ordinal));
         Assert.True(serviceIndex >= 0 && packageIndex > serviceIndex && packageDownload > packageIndex,
             string.Join(Environment.NewLine, requests));
 
@@ -583,7 +583,7 @@ public sealed class PrivilegedActionStateGuardTests
     private static void AssertNugetReadbackRejected(string nuspec, string nuspecEntries, string expectedError)
     {
         using var repository = new TempRepository();
-        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg", "prepared");
+        var artifact = repository.WriteFile("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg", "prepared");
         var state = CreateSealedState(repository, "public", "development", "prepared");
         var environment = PublishingEnvironment(repository, artifact);
         environment["STUB_PUSH_STATUS"] = "409";
@@ -826,7 +826,7 @@ public sealed class PrivilegedActionStateGuardTests
         ["NUGET_USER"] = "mock-profile",
         ["GIZMO_ARTIFACT_PATH"] = artifact.Replace('\\', '/'),
         ["GIZMO_PACKAGE_ID"] = "Gizmo.Widget",
-        ["GIZMO_PACKAGE_VERSION"] = "3.0.0-dev.42",
+        ["GIZMO_PACKAGE_VERSION"] = "3.0.0-preview.42",
         ["REQUEST_LOG"] = repository.AbsolutePath("requests.log"),
         ["STUB_READBACK_STATUSES"] = "200",
         ["STUB_NUSPEC"] = Nuspec(Sha),
@@ -1028,14 +1028,14 @@ public sealed class PrivilegedActionStateGuardTests
             ["GITHUB_ACTOR"] = "test",
             ["GITHUB_REPOSITORY_OWNER"] = "owner",
             ["CURL_LOG"] = curlLog,
-            ["GIZMO_ARTIFACT_PATH"] = repository.AbsolutePath("artifacts/Gizmo.Widget.3.0.0-dev.42.nupkg"),
+            ["GIZMO_ARTIFACT_PATH"] = repository.AbsolutePath("artifacts/Gizmo.Widget.3.0.0-preview.42.nupkg"),
         };
 
     private static Dictionary<string, string> Parse(string content) => content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
         .Select(line => line.Split('=', 2)).Where(parts => parts.Length == 2)
         .ToDictionary(parts => parts[0], parts => parts[1], StringComparer.Ordinal);
 
-    private static string Nuspec(string commit, string id = "Gizmo.Widget", string version = "3.0.0-dev.42") =>
+    private static string Nuspec(string commit, string id = "Gizmo.Widget", string version = "3.0.0-preview.42") =>
         $"<package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\"><metadata><id>{id}</id><version>{version}</version><repository commit=\"{commit}\" /></metadata></package>";
 
     private static string ReadAction(string name) => WorkflowShell.ReadAction(name);
