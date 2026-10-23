@@ -3,8 +3,8 @@ name: NuGet package
 on:
   workflow_call:
     inputs:
-      dev:
-        description: Caller development branch name declared once in the single caller workflow.
+      prev:
+        description: Caller preview branch name declared once in the single caller workflow.
         required: true
         type: string
       prod:
@@ -21,6 +21,9 @@ on:
       state:
         description: Opaque versioned package state consumed only by Gizmo.Infra actions.
         value: ${{ jobs.plan.outputs.state }}
+      infra-sha:
+        description: Verified 40-character Gizmo.Infra commit SHA this run executes.
+        value: ${{ jobs.plan.outputs.infra-sha }}
 
 permissions: {}
 
@@ -34,6 +37,7 @@ jobs:
       publisher: ${{ steps.gate.outputs.role == 'none' && 'none' || steps.plan.outputs.publisher }}
       tag: ${{ steps.gate.outputs.role == 'none' && 'false' || steps.plan.outputs.tag }}
       state: ${{ steps.gate.outputs.role == 'none' && '' || steps.seal.outputs.state }}
+      infra-sha: ${{ steps.trusted-identity.outputs.infra-sha }}
     steps:
       - name: Resolve caller branch role cheaply
         id: gate
@@ -42,22 +46,50 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           BASE_REF: ${{ github.base_ref }}
-          DEV_BRANCH: ${{ inputs.dev }}
+          PREV_BRANCH: ${{ inputs.prev }}
           PROD_BRANCH: ${{ inputs.prod }}
         run: |
           set -euo pipefail
           fail() { echo "$1" >&2; exit 1; }
-          [[ -n "$DEV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The dev and prod branch inputs are both required."
-          [[ "$DEV_BRANCH" != "$PROD_BRANCH" ]] || fail "The dev and prod branches must differ."
-          git check-ref-format --branch "$DEV_BRANCH" > /dev/null 2>&1 || fail "The dev branch input is not a valid branch name."
+          [[ -n "$PREV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The prev and prod branch inputs are both required."
+          [[ "$PREV_BRANCH" != "$PROD_BRANCH" ]] || fail "The prev and prod branches must differ."
+          git check-ref-format --branch "$PREV_BRANCH" > /dev/null 2>&1 || fail "The preview branch input is not a valid branch name."
           git check-ref-format --branch "$PROD_BRANCH" > /dev/null 2>&1 || fail "The prod branch input is not a valid branch name."
           effective_ref="$REF"
           if [[ "$EVENT_NAME" == pull_request ]]; then effective_ref="refs/heads/$BASE_REF"; fi
           role=none
-          if [[ "$effective_ref" == "refs/heads/$DEV_BRANCH" ]]; then role=development
+          if [[ "$effective_ref" == "refs/heads/$PREV_BRANCH" ]]; then role=development
           elif [[ "$effective_ref" == "refs/heads/$PROD_BRANCH" ]]; then role=production
           fi
           printf 'role=%s\n' "$role" >> "$GITHUB_OUTPUT"
+
+      - name: Validate trusted Gizmo.Infra workflow identity
+        id: trusted-identity
+        shell: bash
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          fail() { echo "$1" >&2; exit 1; }
+          trusted_prefix='GAMP/Gizmo.Infra/.github/workflows/package.yml@'
+          [[ "$WORKFLOW_REPOSITORY" == GAMP/Gizmo.Infra ]] || fail "The reusable workflow repository is not GAMP/Gizmo.Infra."
+          [[ "$WORKFLOW_FILE_PATH" == .github/workflows/package.yml ]] || fail "The reusable workflow file path is not .github/workflows/package.yml."
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "The resolved workflow commit is not a complete 40-character lowercase SHA."
+          [[ "$WORKFLOW_REF" == "$trusted_prefix"* ]] || fail "The reusable workflow reference is not the expected Gizmo.Infra workflow file."
+          workflow_ref_target=${WORKFLOW_REF#"$trusted_prefix"}
+          if [[ "$workflow_ref_target" == refs/tags/stable ]]; then
+            :
+          elif [[ "$workflow_ref_target" =~ ^[0-9a-f]{40}$ ]]; then
+            [[ "$workflow_ref_target" == "$WORKFLOW_SHA" ]] || fail "The explicit workflow reference SHA does not match the resolved workflow commit."
+          else
+            fail "The reusable workflow must be referenced by refs/tags/stable or an explicit complete 40-character commit SHA."
+          fi
+          printf 'infra-sha=%s\n' "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+          printf 'Trusted Gizmo.Infra workflow reference: %s\n' "$WORKFLOW_REF"
+          printf 'Resolved Gizmo.Infra commit: %s\n' "$WORKFLOW_SHA"
 
       - name: Checkout caller repository
         if: ${{ steps.gate.outputs.role != 'none' }}
@@ -71,31 +103,12 @@ jobs:
         with:
           dotnet-version: 11.0.x
 
-      - name: Validate immutable Gizmo.Infra workflow identity
-        if: ${{ steps.gate.outputs.role != 'none' }}
-        id: infra-source
-        shell: bash
-        env:
-          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
-          WORKFLOW_REF: ${{ job.workflow_ref }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-          WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
-        run: |
-          set -euo pipefail
-          expected_workflow_ref="GAMP/Gizmo.Infra/.github/workflows/package.yml@"
-          workflow_ref_sha=${WORKFLOW_REF#"$expected_workflow_ref"}
-          if [[ "$WORKFLOW_REPOSITORY" != GAMP/Gizmo.Infra ]] || [[ "$WORKFLOW_FILE_PATH" != .github/workflows/package.yml ]] || [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" == "$WORKFLOW_REF" ]] || [[ ! "$workflow_ref_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$workflow_ref_sha" != "$WORKFLOW_SHA" ]]; then
-            echo "The reusable workflow must be called from the expected Gizmo.Infra file with a complete immutable commit SHA." >&2
-            exit 1
-          fi
-          printf 'repository=%s\nref=%s\n' "$WORKFLOW_REPOSITORY" "$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
-
       - name: Checkout immutable Gizmo.Infra action source
         if: ${{ steps.gate.outputs.role != 'none' }}
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          repository: ${{ steps.infra-source.outputs.repository }}
-          ref: ${{ steps.infra-source.outputs.ref }}
+          repository: GAMP/Gizmo.Infra
+          ref: ${{ steps.trusted-identity.outputs.infra-sha }}
           path: .gizmo-infra
           persist-credentials: false
 
@@ -106,7 +119,7 @@ jobs:
         with:
           caller-repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          dev: ${{ inputs.dev }}
+          prev: ${{ inputs.prev }}
           prod: ${{ inputs.prod }}
           current-ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
@@ -117,7 +130,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           CURRENT_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
-          DEV_BRANCH: ${{ inputs.dev }}
+          PREV_BRANCH: ${{ inputs.prev }}
           PROD_BRANCH: ${{ inputs.prod }}
           BRANCH_ROLE: ${{ steps.metadata.outputs.branch-role }}
           PACKAGE_ID: ${{ steps.metadata.outputs.package-id }}
@@ -184,7 +197,7 @@ jobs:
             --arg run "$GITHUB_RUN_ID" \
             --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg event "$EVENT_NAME" \
-            --arg dev "$DEV_BRANCH" \
+            --arg prev "$PREV_BRANCH" \
             --arg prod "$PROD_BRANCH" \
             --arg role "$BRANCH_ROLE" \
             --arg packageId "$PACKAGE_ID" \
@@ -192,7 +205,7 @@ jobs:
             --arg runNumber "$GITHUB_RUN_NUMBER" \
             --arg visibility "$VISIBILITY" \
             --argjson tags "$tags_json" \
-            '{repo: $repo, sha: $sha, ref: $ref, run: $run, attempt: $attempt, event: $event, dev: $dev, prod: $prod, role: $role, packageId: $packageId, compatibilityLine: $compatibilityLine, runNumber: $runNumber, visibility: $visibility, tags: $tags}' > "$request_file"
+            '{repo: $repo, sha: $sha, ref: $ref, run: $run, attempt: $attempt, event: $event, prev: $prev, prod: $prod, role: $role, packageId: $packageId, compatibilityLine: $compatibilityLine, runNumber: $runNumber, visibility: $visibility, tags: $tags}' > "$request_file"
           python3 "$STATE_PY" plan < "$request_file" >> "$GITHUB_OUTPUT"
 
       - name: Restore with NuGet audit

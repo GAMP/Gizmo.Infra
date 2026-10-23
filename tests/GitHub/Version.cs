@@ -69,8 +69,8 @@ public sealed class PackageStatePlannerTests
     [Fact]
     public void Planner_ReturnsCheapNoOpForUnrelatedBranchAndFailsUnsupportedVisibilityClosed()
     {
-        var gate = RunBash("role=none; [[ \"$REF\" == refs/heads/\"$DEV_BRANCH\" ]] && role=development; printf '%s' \"$role\";",
-            new Dictionary<string, string> { ["REF"] = "refs/heads/topic", ["DEV_BRANCH"] = "dev" });
+        var gate = RunBash("role=none; [[ \"$REF\" == refs/heads/\"$PREV_BRANCH\" ]] && role=development; printf '%s' \"$role\";",
+            new Dictionary<string, string> { ["REF"] = "refs/heads/topic", ["PREV_BRANCH"] = "dev" });
         Assert.Equal(0, gate.ExitCode);
         Assert.Equal("none", gate.StandardOutput);
 
@@ -83,6 +83,14 @@ public sealed class PackageStatePlannerTests
     public void StateCli_SealsArtifactDigestAndRejectsMalformedUnknownDuplicateOversizeAndTamperedState()
     {
         var planned = Plan(eventName: "push", role: "development");
+        var normalizedState = planned["planned-state"].Replace('-', '+').Replace('_', '/');
+        normalizedState += new string('=', (4 - normalizedState.Length % 4) % 4);
+        using (var decodedState = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(normalizedState))))
+        {
+            Assert.True(decodedState.RootElement.TryGetProperty("prev", out _));
+            Assert.False(decodedState.RootElement.TryGetProperty("dev", out _));
+        }
+        Assert.Contains("(\"GIZMO_PREV\", \"prev\")", File.ReadAllText(StateScript), StringComparison.Ordinal);
         var sealedState = Seal(planned["planned-state"]);
         AssertValid(sealedState, "publishable", "nuget");
 
@@ -104,8 +112,19 @@ public sealed class PackageStatePlannerTests
         AssertInvalid(Encode(invalidPrLabel), "malformed");
 
         var payload = Decode(sealedState);
-        payload["v"] = 2;
+        payload["v"] = 1;
+        payload.Remove("prev");
+        payload["dev"] = "pre-release";
         AssertInvalid(Encode(payload), "unknown-version");
+        payload = Decode(sealedState);
+        payload["v"] = 3;
+        AssertInvalid(Encode(payload), "unknown-version");
+        payload = Decode(sealedState);
+        payload["v"] = null;
+        AssertInvalid(Encode(payload), "malformed");
+        payload = Decode(sealedState);
+        payload.Remove("v");
+        AssertInvalid(Encode(payload), "malformed");
         payload = Decode(sealedState);
         payload["surprise"] = "extra";
         AssertInvalid(Encode(payload), "malformed");
@@ -145,6 +164,22 @@ public sealed class PackageStatePlannerTests
         var bound = Invoke("validate --role production --expect-publisher publishable", state, wrongSha);
         Assert.NotEqual(0, bound.ExitCode);
         Assert.Contains("binding-mismatch", bound.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Planner_RejectsLegacyDevelopmentRequestKey()
+    {
+        var request = JsonSerializer.Serialize(new
+        {
+            repo = "owner/repository", sha = Sha, @ref = "refs/heads/pre-release", run = "700", attempt = "1",
+            @event = "push", dev = "pre-release", prod = "release", role = "development", packageId = PackageId,
+            compatibilityLine = "3.0", runNumber = "42", visibility = "public", tags = Array.Empty<object>(),
+        });
+
+        var result = Invoke("plan", request);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("malformed-request", result.Error, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -211,16 +246,16 @@ public sealed class PackageStatePlannerTests
     [InlineData("@", "release", "development")]
     [InlineData("café", "release", "development")]
     [InlineData("development", "stable/release.2", "production")]
-    public void GitAcceptedNontrivialBranchNames_ResolveRolePlanSealAndValidate(string dev, string prod, string role)
+    public void GitAcceptedNontrivialBranchNames_ResolveRolePlanSealAndValidate(string prev, string prod, string role)
     {
-        AssertGitAcceptsBranch(dev);
+        AssertGitAcceptsBranch(prev);
         AssertGitAcceptsBranch(prod);
-        var branch = role == "production" ? prod : dev;
+        var branch = role == "production" ? prod : prev;
         var expectedRef = "refs/heads/" + branch;
-        var gate = RunPreflightRole(dev, prod, expectedRef);
+        var gate = RunPreflightRole(prev, prod, expectedRef);
         Assert.Equal(role, gate.StandardOutput);
 
-        var plan = PlanFor("push", role, dev, prod, expectedRef);
+        var plan = PlanFor("push", role, prev, prod, expectedRef);
         Assert.Equal(0, ExitCode(plan));
         var env = RunnerEnvironment("push", expectedRef, string.Empty);
         var state = Seal(plan["planned-state"], env);
@@ -271,16 +306,16 @@ public sealed class PackageStatePlannerTests
         string? currentSha = null,
         IReadOnlyList<object>? tags = null)
     {
-        var dev = "pre-release";
+        var prev = "pre-release";
         var prod = "release";
-        var reference = role == "production" ? "refs/heads/" + prod : "refs/heads/" + dev;
-        return PlanFor(eventName, role, dev, prod, reference, visibility, compatibilityLine, runNumber, currentSha, tags);
+        var reference = role == "production" ? "refs/heads/" + prod : "refs/heads/" + prev;
+        return PlanFor(eventName, role, prev, prod, reference, visibility, compatibilityLine, runNumber, currentSha, tags);
     }
 
     private static Dictionary<string, string> PlanFor(
         string eventName,
         string role,
-        string dev,
+        string prev,
         string prod,
         string reference,
         string visibility = "public",
@@ -292,7 +327,7 @@ public sealed class PackageStatePlannerTests
         var request = new
         {
             repo = "owner/repository", sha = currentSha ?? Sha, @ref = reference, run = "700", attempt = "1",
-            @event = eventName, dev, prod, role, packageId = PackageId,
+            @event = eventName, prev, prod, role, packageId = PackageId,
             compatibilityLine, runNumber, visibility, tags = tags ?? [],
         };
         var result = Invoke("plan", JsonSerializer.Serialize(request));
@@ -384,14 +419,14 @@ public sealed class PackageStatePlannerTests
 
     private static void AssertGitAcceptsBranch(string branch) => Assert.Equal(0, GitBranchCheck(branch).ExitCode);
 
-    private static ShellResult RunPreflightRole(string dev, string prod, string currentRef)
+    private static ShellResult RunPreflightRole(string prev, string prod, string currentRef)
     {
         var action = WorkflowShell.ReadAction("preflight");
-        var block = WorkflowShell.ExtractBlock(action, "[[ -n \"$DEV_BRANCH\"", "fi");
+        var block = WorkflowShell.ExtractBlock(action, "[[ -n \"$PREV_BRANCH\"", "fi");
         return WorkflowShell.RunBash("set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n" + block + "\nprintf '%s' \"$branch_role\"",
             Path.GetTempPath(), new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["DEV_BRANCH"] = dev, ["PROD_BRANCH"] = prod, ["CURRENT_REF"] = currentRef,
+                ["PREV_BRANCH"] = prev, ["PROD_BRANCH"] = prod, ["CURRENT_REF"] = currentRef,
             });
     }
 
@@ -422,6 +457,7 @@ public sealed class PackageStatePlannerTests
         private readonly Dictionary<string, object?> _values;
         public JsonObjectWrapper(JsonElement element) => _values = element.EnumerateObject().ToDictionary(property => property.Name, property => JsonSerializer.Deserialize<object>(property.Value.GetRawText()), StringComparer.Ordinal);
         public object? this[string key] { set => _values[key] = value; }
+        public void Remove(string key) => _values.Remove(key);
         public string ToJson() => JsonSerializer.Serialize(_values);
     }
 }

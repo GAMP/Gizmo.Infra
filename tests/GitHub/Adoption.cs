@@ -10,14 +10,13 @@ public sealed class SharedPublisherProvenanceContractTests
         var root = InfraRepositoryLocator.ResolveRoot();
         var sharedParser = Path.Combine(root, ".github", "package", "nuspec.py");
         Assert.True(File.Exists(sharedParser));
-        foreach (var action in new[] { "nuget", "internal" })
-        {
-            var content = WorkflowShell.ReadAction(action);
-            Assert.Contains("${{ github.action_path }}/../../package/nuspec.py", content, StringComparison.Ordinal);
-            Assert.Contains("python3 \"$NUSPEC_PARSER\"", content, StringComparison.Ordinal);
-            Assert.DoesNotContain("grep -oE 'commit=", content, StringComparison.Ordinal);
-            Assert.Contains("does not contain exactly one nuspec", content, StringComparison.Ordinal);
-        }
+        var content = WorkflowShell.ReadAction("nuget");
+        Assert.Contains("${{ github.action_path }}/../../package/nuspec.py", content, StringComparison.Ordinal);
+        Assert.Contains("python3 \"$NUSPEC_PARSER\"", content, StringComparison.Ordinal);
+        Assert.DoesNotContain("grep -oE 'commit=", content, StringComparison.Ordinal);
+        Assert.Contains("does not contain exactly one nuspec", content, StringComparison.Ordinal);
+
+        Assert.False(Directory.Exists(Path.Combine(root, ".github", "actions", "internal")));
 
         Assert.False(Directory.Exists(Path.Combine(root, ".github", "actions", "public")));
         Assert.False(Directory.Exists(Path.Combine(root, ".github", "actions", "private")));

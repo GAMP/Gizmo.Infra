@@ -17,7 +17,7 @@ import shlex
 import subprocess
 import sys
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Exact top-level state keys -> required type; a missing or extra key fails.
 STATE_KEYS = {
@@ -28,7 +28,7 @@ STATE_KEYS = {
     "run": str,
     "attempt": str,
     "event": str,
-    "dev": str,
+    "prev": str,
     "prod": str,
     "role": str,
     "publisher": str,
@@ -53,7 +53,7 @@ REQUEST_KEYS = {
     "run": str,
     "attempt": str,
     "event": str,
-    "dev": str,
+    "prev": str,
     "prod": str,
     "role": str,
     "packageId": str,
@@ -170,8 +170,8 @@ def _safe_ref(ref):
     return _structurally_safe(ref) and ref.startswith("refs/")
 
 
-def _derive_role(ref, dev, prod):
-    if ref == "refs/heads/" + dev:
+def _derive_role(ref, prev, prod):
+    if ref == "refs/heads/" + prev:
         return "development"
     if ref == "refs/heads/" + prod:
         return "production"
@@ -233,9 +233,9 @@ def _validate_request(request):
         raise StateError("malformed-request")
     if not NUMERIC.match(request["runNumber"]):
         raise StateError("malformed-request")
-    if not _safe_branch(request["dev"]) or not _safe_branch(request["prod"]):
+    if not _safe_branch(request["prev"]) or not _safe_branch(request["prod"]):
         raise StateError("malformed-request")
-    if request["dev"] == request["prod"]:
+    if request["prev"] == request["prod"]:
         raise StateError("malformed-request")
     if not PACKAGE_ID.match(request["packageId"]):
         raise StateError("malformed-request")
@@ -252,7 +252,7 @@ def _validate_request(request):
 def plan(request):
     _validate_request(request)
     role = request["role"]
-    derived = _derive_role(request["ref"], request["dev"], request["prod"])
+    derived = _derive_role(request["ref"], request["prev"], request["prod"])
     if role != derived:
         raise StateError("role-mismatch")
     if role == "none":
@@ -351,7 +351,7 @@ def plan(request):
         "run": request["run"],
         "attempt": request["attempt"],
         "event": event,
-        "dev": request["dev"],
+        "prev": request["prev"],
         "prod": request["prod"],
         "role": role,
         "publisher": publisher,
@@ -382,9 +382,15 @@ def plan(request):
 
 
 def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
-    _check_keys(state, STATE_KEYS, "malformed")
-    if state["v"] != SCHEMA_VERSION:
+    # Check the version before the key set so a payload from another schema version reports unknown-version.
+    if not isinstance(state, dict):
+        raise StateError("malformed")
+    version = state.get("v")
+    if not _type_ok(version, int):
+        raise StateError("malformed")
+    if version != SCHEMA_VERSION:
         raise StateError("unknown-version")
+    _check_keys(state, STATE_KEYS, "malformed")
     if not REPO.match(state["repo"]) or not HEX40.match(state["sha"]):
         raise StateError("malformed")
     if not _safe_ref(state["ref"]):
@@ -393,9 +399,9 @@ def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
         raise StateError("malformed")
     if state["event"] not in EVENTS:
         raise StateError("malformed")
-    if not _safe_branch(state["dev"]) or not _safe_branch(state["prod"]):
+    if not _safe_branch(state["prev"]) or not _safe_branch(state["prod"]):
         raise StateError("malformed")
-    if state["dev"] == state["prod"]:
+    if state["prev"] == state["prod"]:
         raise StateError("malformed")
     if state["role"] not in ROLES or state["publisher"] not in PUBLISHERS:
         raise StateError("malformed")
@@ -445,7 +451,7 @@ def _validate_state(state, role_mode, expect_publisher, allow_empty_digest):
     if not HEX64.match(state["tagStateFingerprint"]):
         raise StateError("malformed")
 
-    if _derive_role(state["ref"], state["dev"], state["prod"]) != state["role"]:
+    if _derive_role(state["ref"], state["prev"], state["prod"]) != state["role"]:
         raise StateError("role-mismatch")
 
     if state["event"] == "pull_request":
@@ -542,7 +548,7 @@ _ENV_KEYS = [
     ("GIZMO_RUN", "run"),
     ("GIZMO_ATTEMPT", "attempt"),
     ("GIZMO_EVENT", "event"),
-    ("GIZMO_DEV", "dev"),
+    ("GIZMO_PREV", "prev"),
     ("GIZMO_PROD", "prod"),
     ("GIZMO_ROLE", "role"),
     ("GIZMO_PUBLISHER", "publisher"),
