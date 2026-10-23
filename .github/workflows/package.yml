@@ -213,7 +213,7 @@ jobs:
         shell: bash
         env:
           PROJECT_PATH: ${{ steps.metadata.outputs.project-path }}
-        run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1904%3BNU1903 -p:WarningsNotAsErrors=NU1901%3BNU1902
+        run: dotnet restore "$PROJECT_PATH" -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low -p:WarningsAsErrors=NU1605%3BNU1900%3BNU1905 -p:WarningsNotAsErrors=NU1901%3BNU1902%3BNU1903%3BNU1904
 
       - name: Build
         if: ${{ steps.gate.outputs.role != 'none' }}

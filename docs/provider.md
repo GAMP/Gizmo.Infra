@@ -389,21 +389,33 @@ commands only through quoted environment variables.
 
 ## Dependency baseline and audit reporting
 
-The restore step keeps the existing NuGet audit gate unchanged: high and critical
-advisories (`NU1903`/`NU1904`) remain errors, low and moderate advisories
-(`NU1901`/`NU1902`) remain non-blocking warnings, and no suppression is added.
+The restore step keeps NuGet audit enabled over direct and transitive packages
+(`-p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low`) and passes two
+percent-encoded flag sets: `-p:WarningsAsErrors=NU1605%3BNU1900%3BNU1905` and
+`-p:WarningsNotAsErrors=NU1901%3BNU1902%3BNU1903%3BNU1904`, encoded because a raw
+`;` would end the step's command. The second set makes **every** vulnerability
+finding a visible, non-blocking warning, low through critical and wider than the
+known MP198 advisory; nothing is suppressed, so each finding stays visible and
+unresolved. This temporary CI alignment with local restore, by explicit user
+decision, is not an allowlist, not customer acceptance of the known advisories,
+and not a permanent posture: a caller cannot rely on this plan to fail a build on
+a high or critical advisory and must gate it in a caller-owned job.
+
+The first set escalates exactly `NU1605` (downgrade, named because the
+command-line property replaces the SDK default that promotes it), `NU1900`
+(vulnerability-data retrieval), and `NU1905` (an audit source without a
+vulnerability database), which appears only when audit sources are configured, so
+its absence is not coverage evidence. The escalation hard-fails only what NuGet
+reports and proves no feed completeness. Both are command-line globals and replace
+a caller's project-level `WarningsAsErrors` and `WarningsNotAsErrors` for that
+restore; unrelated warnings keep their default severity, and `Build`/`Pack` run
+with `--no-restore` and no audit properties.
+
 The approved Version 3 customer baseline preserves the actual MessagePack and
 SignalR package versions resolved at its authoritative product commit; it is not
 a universal package version, and this workflow does not automatically upgrade or
-reset it.
-
-Known vulnerabilities in those frozen packages are reported as accepted customer
-risk, with package, version, severity, and advisory URL, not as remediated or
-zero-vulnerability evidence. A conflict between the freeze and the existing
-high/critical gate is reported for an explicit decision instead of being waived,
-and `NU1605` downgrade diagnostics stay distinct from audit findings. No
-workflow or documentation claim here asserts a clean audit that the source does
-not produce.
+reset it. No workflow or documentation claim here asserts a clean audit that the
+source does not produce.
 
 ## Consumer floating-version behavior
 

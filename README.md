@@ -45,7 +45,12 @@ remote configuration.
 The approved Version 3 customer baseline preserves the actual MessagePack and
 SignalR package versions resolved at its authoritative product commit, not a
 universal version and not an automatic upgrade. Known vulnerabilities in those
-frozen packages are reported as accepted customer risk with package, version,
-severity, and advisory URL. The existing high/critical audit gate remains
-unchanged; a conflict with the freeze is reported for an explicit decision rather
-than waived, and no false clean-audit claim is made.
+frozen packages remain known, visible, and unresolved, with package, version,
+severity, and advisory URL; they are not remediated, and this repository makes no
+clean-audit claim.
+
+NuGet audit stays enabled at `low` over direct and transitive packages, and, by
+temporary explicit user decision, every vulnerability finding (`NU1901`-`NU1904`,
+low to critical) is a visible non-blocking warning that is not suppressed. See
+[docs/provider.md](docs/provider.md#dependency-baseline-and-audit-reporting) for
+the authoritative flag set, escalation codes, and their limits.
