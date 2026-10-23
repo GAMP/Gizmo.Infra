@@ -215,20 +215,21 @@ whole workflow run) instead. The nuget publisher that already succeeded is
 idempotent: the same-SHA rerun recognizes the published package and proceeds to reconcile
 the immutable release tag.
 
-## Caller dependency baseline and audit gate
+## Caller dependency baseline and audit reporting
 
 The approved Version 3 customer baseline keeps the actual MessagePack and
 SignalR package versions resolved at the authoritative product commit. It is not
 a universal package version, and a caller must not automatically upgrade or reset
 those packages to make a run appear clean.
 
-Known vulnerabilities in the frozen packages are reported as accepted customer
-risk, with package, version, severity, and advisory URL. The reusable plan
-workflow's existing high/critical audit gate remains unchanged, and a conflict
-between the freeze and that gate is reported for an explicit decision rather than
-silently waived. `NU1605` downgrade diagnostics remain distinct from audit
-findings. Do not suppress the audit, claim zero vulnerabilities, or describe the
-frozen baseline as remediated when it is not.
+Known vulnerabilities in the frozen packages remain visible and unresolved, with
+package, version, severity, and advisory URL; do not suppress the audit or call
+the baseline remediated.
+
+The reusable plan temporarily treats every vulnerability finding, including high
+and critical, as a non-blocking warning, so it will not fail a build on an
+advisory; enforce any hard gate in a caller-owned job. Exact flags and limits:
+[provider.md](provider.md#dependency-baseline-and-audit-reporting).
 
 ## One-time existing-package bootstrap and adoption
 
