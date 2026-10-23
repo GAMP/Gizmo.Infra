@@ -10,25 +10,39 @@ shape is in [caller.md](caller.md).
 
 Gizmo.Infra exposes one direct `workflow_call` workflow,
 `.github/workflows/package.yml`. It requires exactly two caller-supplied string
-inputs, `dev` and `prod`, and declares exactly three outputs, `publisher`, `tag`,
-and `state`. There is no mode, descriptor version, workflow version, project,
-package, version, patch, or visibility input.
+inputs, `prev` and `prod`, and declares exactly four outputs, `publisher`, `tag`,
+`state`, and `infra-sha`. There is no mode, descriptor version, workflow version,
+project, package, version, patch, visibility, or caller SHA input.
 
-Every caller must reference the workflow at an immutable, complete 40-character
-Gizmo.Infra commit SHA. A branch, tag, abbreviated SHA, or expression is not an
-acceptable workflow reference.
+**Warning: breaking input rename.** A caller that still passes `with: dev` must
+change that key to `with: prev` in the same change that adopts this `@stable`
+contract or a new explicit Infra SHA; a caller pinned to an older Infra SHA keeps
+the old contract. There is no `dev` alias, and schema version 2 rejects a
+version 1 state with no fallback.
 
-The workflow runs one `contents: read` preparation job. It resolves the caller
-branch role, discovers the single SDK-style packable project, resolves the
-authenticated caller repository visibility, calculates the package version and
-tag state, builds and packs the exact artifact, and emits the routing outputs. It
-never requests OIDC, never contacts a package feed, never publishes, and never
-creates a tag.
+Callers reference the workflow exactly once through the maintained
+`GAMP/Gizmo.Infra/.github/workflows/package.yml@stable` entrypoint by default.
+That entrypoint must resolve to the Gizmo.Infra `refs/tags/stable` tag; a branch
+named `stable` must never exist to shadow it. The only supported opt-out is to
+replace `@stable` with one explicit, complete 40-character Gizmo.Infra commit
+SHA. An arbitrary branch, another tag, a bare unqualified `stable` value in
+`job.workflow_ref`, an abbreviated SHA, an expression, or a caller-supplied SHA
+value is not an acceptable or trusted workflow reference.
+
+The workflow runs one `contents: read` preparation job. Immediately after the
+cheap role gate, and before any checkout or toolchain setup, it validates its own
+trusted identity from the runner-provided `job.workflow_*` contexts and exports
+the verified resolved commit as `infra-sha`. It then resolves the caller branch
+role, discovers the single SDK-style packable project, resolves the authenticated
+caller repository visibility, calculates the package version and tag state,
+builds and packs the exact artifact, and emits the routing outputs. It never
+requests OIDC, never contacts a package feed, never publishes, and never creates
+a tag.
 
 | Event / resolved role | Package work | `publisher` | `tag` |
 | --- | --- | --- | --- |
 | `pull_request` | build and pack `<major>.<minor>.<patch>-dev.N` | `none` | `false` |
-| push to the declared development branch | build and pack `<major>.<minor>.<patch>-preview.N` | routed | `false` |
+| push to the declared preview branch | build and pack `<major>.<minor>.<patch>-preview.N` | routed | `false` |
 | push to `prod` | build and pack `<major>.<minor>.<patch>` | routed | `true` |
 | any other ref | none | `none` | `false` |
 | publishable ref with unsupported routing | none | workflow fails closed | — |
@@ -36,9 +50,15 @@ creates a tag.
 A pull request only validates; it never publishes and never tags. An unrelated
 ref is a cheap successful no-op: the role is resolved before any checkout,
 toolchain setup, project discovery, tag lookup, build, pack, publish, or tag
-work. A publishable ref whose visibility cannot be routed fails the plan job,
-so no publisher and no tag job run; unsupported routing is never reported as a
-silent `none` publication result.
+work, and only the unconditional trusted identity guard still runs so the no-op
+exports its verified `infra-sha`. A publishable ref whose visibility cannot be
+routed fails the plan job, so no publisher and no tag job run; unsupported
+routing is never reported as a silent `none` publication result.
+
+Routing selects `nuget` for `public` visibility and `internal` for `private`
+visibility. The `internal` capability is selected but not implemented: the
+canonical internal job fails closed, publishes nothing, and no tag job can run
+from it. It is never a silent skip, a private fallback, or a public NuGet route.
 
 ### Branch role and trusted source
 
@@ -47,14 +67,26 @@ branches. A pull request resolves the role from its base branch; a push resolves
 it from the effective branch; any other ref resolves `none`. The physical branch
 names must be distinct valid Git branch names.
 
-The workflow validates its own repository and file path through the
-caller-independent `job.workflow_*` contexts. It validates `job.workflow_ref` as
-the expected workflow identity ending in the same complete 40-character commit
-SHA reported by `job.workflow_sha`, then checks out that exact commit into
-`.gizmo-infra` and runs the bundled `preflight` action there; it never assumes a
-caller-local `./.github/actions` path belongs to Gizmo.Infra. `job.workflow_sha`
-alone is a resolved commit and cannot establish that a caller used a full SHA;
-the original `job.workflow_ref` check enforces that invariant.
+Immediately after the cheap role gate, and before any checkout or toolchain
+setup, an unconditional trusted identity guard validates four runner-provided
+facts. The workflow repository must be exactly `GAMP/Gizmo.Infra`, the file path
+exactly `.github/workflows/package.yml`, and `job.workflow_sha` a complete
+40-character lowercase commit SHA. The suffix of `job.workflow_ref` after that
+exact repository and path must be either `refs/tags/stable` or a complete
+40-character lowercase SHA equal to `job.workflow_sha`. A bare `stable`, an
+arbitrary branch, another tag, a malformed value, a foreign repository or path,
+or a mismatched SHA fails closed. The guard trusts only those runner facts: it
+does not accept a caller-supplied SHA, query a ref, or fall back to `github.sha`.
+
+The verified `job.workflow_sha` is exported as the `infra-sha` step, job, and
+workflow output. The guard runs even when the role resolves `none`, so a valid
+no-op still reports its resolved provenance, while the remaining preparation
+steps stay role-gated. For real work the workflow checks out the literal
+`GAMP/Gizmo.Infra` repository at `infra-sha` into `.gizmo-infra` and runs the
+bundled `preflight` action there; it never assumes a caller-local
+`./.github/actions` path belongs to Gizmo.Infra. `job.workflow_sha` alone is a
+resolved commit and cannot establish which reference the caller used; the
+`job.workflow_ref` check enforces the stable-tag-or-explicit-SHA invariant.
 
 The preflight uses the caller `GITHUB_TOKEN` and `github.repository` to read
 authenticated repository metadata with bounded connect and total request
@@ -65,15 +97,26 @@ responses, malformed metadata, and unknown values fail closed. It never reads
 
 ### Routing outputs
 
-The plan job exports `publisher`, `tag`, and `state`.
+The plan job exports `publisher`, `tag`, `state`, and `infra-sha`.
 
 `publisher` is `nuget`, `internal`, or `none`. `tag` is `true` only for a
-production push that selected a publisher. `state` is an opaque, explicitly
-versioned, bounded payload consumed only by Gizmo.Infra composite actions; the
-caller must forward it unchanged and must never parse it. It is an API
-simplification, not a signature or trust boundary: a caller can always alter its
-own workflow, so each privileged action independently revalidates the
+production push that selected a publisher. The planner contract is unchanged:
+a private repository still seals `publisher=internal`, which the canonical
+caller must route to the fail-closed placeholder. `state` is an opaque,
+explicitly versioned, bounded payload consumed only by Gizmo.Infra composite
+actions; the caller must forward it unchanged and must never parse it. It is an
+API simplification, not a signature or trust boundary: a caller can always alter
+its own workflow, so each privileged action independently revalidates the
 security-sensitive facts it needs from live GitHub, feed, and tag state.
+
+`infra-sha` is the verified 40-character Gizmo.Infra commit the run executes.
+The nuget publisher and tag job must validate it as non-empty lowercase hex,
+check out the literal `GAMP/Gizmo.Infra` repository at that exact commit into
+`.gizmo-infra`, verify the checkout HEAD equals it, and only then run the local
+composite action from `./.gizmo-infra/.github/actions/`. This keeps one run on
+one Infra commit even if `refs/tags/stable` moves between jobs, and it is why the
+caller has one external reusable-workflow reference instead of separate remote
+publisher or tag action references.
 
 Discovered repository visibility, selected destination capability, and
 authentication are three separate concerns:
@@ -81,32 +124,35 @@ authentication are three separate concerns:
 | Discovered visibility | Selected capability | Authentication |
 | --- | --- | --- |
 | `public` | `nuget` | Caller-owned OIDC (`id-token: write`), exchanged for a short-lived NuGet.org API key |
-| `private` | `internal` | Caller `GITHUB_TOKEN` with `packages: write` |
+| `private` | `internal` (not implemented) | None; the canonical internal job fails closed and publishes nothing |
 | `internal` | unsupported; fail closed | None; the plan job fails and no publication or tag work runs |
 
 The plan workflow only discovers and exports visibility. The caller owns the
-routing jobs and every credential. Repository visibility and destination registry
-are separate concerns; the concrete internal-registry backend is an
-implementation detail behind the `internal` action and is not part of the public
-contract.
+routing jobs and the public credential. Repository visibility and destination
+registry are separate concerns. No internal-registry backend or composite action
+is implemented; the canonical internal job fails closed before any publication
+or tag work.
 
 Callers grant permissions on the calling job; a called workflow cannot elevate
 them. Do not use `secrets: inherit`, pass an API key, or create a
 `NUGET_API_KEY` secret. The public publisher requests only `contents: read` and
-`id-token: write`; the internal publisher requests only `contents: read` and
-`packages: write`; the tag job requests only `contents: write`. The plan job
+`id-token: write`; the internal placeholder requests only `contents: read` and
+no write credential; the tag job requests only `contents: write`. The plan job
 requests only `contents: read` and never requests OIDC.
 
 ## Composite actions
 
 The plan job runs the bundled `preflight` composite action for discovery. The
-caller-owned jobs then compose these pinned Gizmo.Infra composite actions:
+caller-owned nuget and tag jobs then run these Gizmo.Infra composite actions
+locally from the same-run `.gizmo-infra` checkout at the plan's `infra-sha`:
 
 | Action | Destination | Credentials | Inputs | Modes |
 | --- | --- | --- | --- | --- |
 | `nuget` | NuGet.org | OIDC (`id-token: write`) | `state`, `user` | development and production |
-| `internal` | internal registry | Caller `GITHUB_TOKEN` (`packages: write`) | `state` | development and production |
 | `tag` | none | Caller `GITHUB_TOKEN` (`contents: write`) | `state` | production only; fails closed otherwise |
+
+The internal capability has no composite action. The canonical caller's internal
+job is a fail-closed placeholder with no publication credential.
 
 Each action structurally parses and validates the versioned `state`, then
 independently revalidates the push event, the protected branch ref, the
@@ -137,9 +183,8 @@ nuspec's package ID and version match the calculated values and its full
 decoy or unexpected nuspec name, or any provenance mismatch fails closed before
 any tag can be reconciled. Every publish, readback, and metadata request carries
 explicit connect and total time budgets, and the key-bearing `PUT` never follows
-a redirect. The `nuget` action rejects any visibility other than `public`, and
-the `internal` action rejects any visibility other than `private`, so an
-unsupported visibility cannot be silently routed by a caller mistake.
+a redirect. The `nuget` action rejects any visibility other than `public`, so a
+caller wiring mistake cannot silently publish through a different route.
 
 ## Automatic versioning
 
@@ -215,6 +260,34 @@ declaration of the same group can deadlock the run against itself. GitHub does
 not guarantee FIFO: the latest pending run may replace an earlier pending run,
 so this is not a durable queue.
 
+### Stable entrypoint, reruns, and promotion
+
+`refs/tags/stable` is the only intentionally movable Gizmo.Infra reference. It
+moves only through an explicitly approved promotion of an integrated, validated
+commit that has passed the applicable review and validation. The promotion
+records the old and new target SHA, the actor, and a readback resolving
+`refs/tags/stable^{commit}` to the new target; package-qualified release tags,
+published packages, and their provenance are never moved or rewritten. Neither
+the reusable workflow nor any composite action promotes the tag.
+
+A normal rerun of all jobs re-executes the plan job. When the caller uses the
+`@stable` entrypoint, GitHub resolves the tag again for the rerun, so the rerun
+may execute a newer Infra commit than the original attempt. All jobs in that
+rerun still share the new plan's `infra-sha`, so same-run consistency is
+preserved even though the run attempt may differ. Use the explicit 40-character
+SHA opt-out when an exact Infra commit must survive reruns.
+
+A partial retry of only failed nuget or tag jobs does not re-execute the plan
+job. The sealed state binds the original `GITHUB_RUN_ATTEMPT`, and the artifact
+name includes `github.run_attempt`, so such a retry can fail closed with a
+state-binding or artifact mismatch. The payload is also schema-versioned, so a
+state from another Gizmo.Infra schema version is rejected as `unknown-version`
+instead of being read through a compatibility fallback. Re-run all jobs (or
+re-run the whole workflow run) so the plan re-seals state and rebuilds the
+attempt-scoped artifact. The nuget publisher that already succeeded is
+idempotent: a same-SHA rerun recognizes the published package and proceeds to
+reconcile the immutable release tag.
+
 ## One-time existing-package bootstrap and adoption
 
 The workflow derives every version from tags. For each package it considers only
@@ -234,7 +307,7 @@ enabled:
   advertise the first `<major>.<minor>.0`, and a production run calculates
   `<major>.<minor>.0` with `release-tag-state=missing`. The plan workflow never
   creates a synthetic tag; the immutable release tag is created only by the
-  caller-owned `tag` action, in a resolved `production` run, after the selected
+  caller-owned `tag` action, in a resolved `production` run, after the nuget
   publisher succeeded, and only for the exact calculated release tag. This is the
   only case where steady state is safe without a migration step.
 - **Migration required** — the active compatibility line already has any stable
@@ -288,12 +361,15 @@ The plan job packs the calculated version with the caller commit as repository
 metadata, computes the exact `.nupkg` digest, and uploads only its exact path.
 Artifact names include both `github.run_id` and `github.run_attempt`, so a rerun
 can download the exact artifact that its preparation produced. The caller-owned
-publisher actions download that artifact by name, verify its digest against the
-plan state, and never rebuild it; they recheck collision and provenance
-immediately before publishing. Same-SHA recovery re-runs an existing production
-`push` workflow run rather than a new manually dispatched run: the re-run keeps
-the pushed caller commit and immutable tag state, so the publisher treats the
-matching package as already published and the tag job reconciles the release tag.
+nuget publisher downloads that artifact by name, verifies its digest against the
+plan state, and never rebuilds it; it rechecks collision and provenance
+immediately before publishing. Same-SHA recovery re-runs all jobs of an existing
+production `push` workflow run rather than a new manually dispatched run: the
+rerun keeps the pushed caller commit and immutable tag state, the plan re-seals
+the attempt-scoped state and artifact, the nuget publisher treats the matching
+package as already published, and the tag job reconciles the release tag. A
+partial retry of only nuget or tag jobs is not sufficient, because the state and
+artifact are bound to the original run attempt; see the rerun rules above.
 
 The public publisher's duplicate readback is deterministic and finite: it issues
 at most 13 flat-container `GET` requests spaced 10 seconds apart, with a
@@ -305,9 +381,29 @@ request or delay budget is exhausted and then fails closed. A new package
 accepted on the push `2xx` status performs no readback, and the readback runs
 only after a `409` duplicate.
 
-All action references are pinned to full commit SHAs, checkout credentials are
-disabled, and caller-supplied strings enter shell commands only through quoted
-environment variables.
+Third-party action references are pinned to full commit SHAs and checkout
+credentials are disabled. Gizmo.Infra's reusable-workflow entrypoint is the
+`stable` tag or an explicit 40-character SHA, and its composite actions run from
+the plan's same-run `infra-sha` checkout. Caller-supplied strings enter shell
+commands only through quoted environment variables.
+
+## Dependency baseline and audit reporting
+
+The restore step keeps the existing NuGet audit gate unchanged: high and critical
+advisories (`NU1903`/`NU1904`) remain errors, low and moderate advisories
+(`NU1901`/`NU1902`) remain non-blocking warnings, and no suppression is added.
+The approved Version 3 customer baseline preserves the actual MessagePack and
+SignalR package versions resolved at its authoritative product commit; it is not
+a universal package version, and this workflow does not automatically upgrade or
+reset it.
+
+Known vulnerabilities in those frozen packages are reported as accepted customer
+risk, with package, version, severity, and advisory URL, not as remediated or
+zero-vulnerability evidence. A conflict between the freeze and the existing
+high/critical gate is reported for an explicit decision instead of being waived,
+and `NU1605` downgrade diagnostics stay distinct from audit findings. No
+workflow or documentation claim here asserts a clean audit that the source does
+not produce.
 
 ## Consumer floating-version behavior
 
@@ -379,17 +475,21 @@ wildcards, plus an optional GitHub environment or package scopes if the caller
 uses them. The same caller policy covers both development and production
 publication.
 
-Do not bind the Gizmo.Infra commit SHA in the NuGet.org policy. Pinning every
-Gizmo.Infra workflow and action reference to one immutable 40-character commit
-SHA is a separate GitHub supply-chain invariant. The repository or organization
-variable `NUGET_USER` is a NuGet.org profile identifier, not a secret or API key.
+Do not bind the Gizmo.Infra commit SHA in the NuGet.org policy. Using the single
+`@stable` entrypoint, or its explicit 40-character SHA opt-out, and running local
+actions from the plan's verified `infra-sha` is a separate GitHub supply-chain
+invariant. The repository or organization variable `NUGET_USER` is a NuGet.org
+profile identifier, not a secret or API key.
 
 ## Shared state module (implementation)
 
-The plan workflow and every composite action share one checked-in module,
+The plan workflow and the `nuget` and `tag` actions share one checked-in module,
 `.github/package/state.py`. It exposes `plan`, `seal --digest <sha256>`,
 `validate --role production|publishable --expect-publisher nuget|internal|publishable`,
 and `fingerprint`; `validate` reads the opaque state on stdin and writes the
 validated routing fields to stdout, or to the path given by `--github-env`.
-Consuming actions revalidate independently and never treat the payload as a
-signature.
+The `internal` value remains part of the unchanged planner and state contract;
+no internal publisher action consumes it. The payload is schema version 2, and a
+payload with any other version is rejected as `unknown-version` with no
+compatibility fallback or alias. Consuming actions revalidate
+independently and never treat the payload as a signature.

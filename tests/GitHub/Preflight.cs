@@ -11,7 +11,7 @@ public sealed class PackagePreflightActionTests
     public void Preflight_DeclaresOnlyDiscoveryInputsAndDoesNotSelectPublisher()
     {
         var root = YamlWorkflowReader.Parse(Action);
-        Assert.Equal(new[] { "caller-repository", "current-ref", "dev", "github-token", "prod" },
+        Assert.Equal(new[] { "caller-repository", "current-ref", "github-token", "prev", "prod" },
             Keys(YamlWorkflowReader.MappingChild(root, "inputs")).OrderBy(value => value, StringComparer.Ordinal));
         Assert.Equal(new[] { "branch-role", "compatibility-line", "package-id", "project-path", "repository-visibility" },
             Keys(YamlWorkflowReader.MappingChild(root, "outputs")).OrderBy(value => value, StringComparer.Ordinal));
@@ -31,7 +31,7 @@ public sealed class PackagePreflightActionTests
                      ("refs/tags/v3.0.0", "none"),
                  })
         {
-            var script = "set -euo pipefail\nDEV_BRANCH=pre-release\nPROD_BRANCH=release\nCURRENT_REF='" + reference + "'\n" + block + "\nprintf '%s' \"$branch_role\"\n";
+            var script = "set -euo pipefail\nPREV_BRANCH=pre-release\nPROD_BRANCH=release\nCURRENT_REF='" + reference + "'\n" + block + "\nprintf '%s' \"$branch_role\"\n";
             var result = WorkflowShell.RunBash(script, Path.GetTempPath());
             Assert.Equal(0, result.ExitCode);
             Assert.Equal(expected, result.StandardOutput);
@@ -42,9 +42,9 @@ public sealed class PackagePreflightActionTests
     [Fact]
     public void BranchInputs_RejectMissingEqualAndMalformedNames()
     {
-        Assert.Contains("git check-ref-format --branch \"$DEV_BRANCH\"", Action, StringComparison.Ordinal);
+        Assert.Contains("git check-ref-format --branch \"$PREV_BRANCH\"", Action, StringComparison.Ordinal);
         Assert.Contains("git check-ref-format --branch \"$PROD_BRANCH\"", Action, StringComparison.Ordinal);
-        foreach (var (dev, prod, expected) in new[]
+        foreach (var (prev, prod, expected) in new[]
                  {
                      ("", "release", "both required"),
                      ("release", "release", "must differ"),
@@ -52,8 +52,8 @@ public sealed class PackagePreflightActionTests
                  })
         {
             var script = "set -euo pipefail\nfail() { echo \"$1\" >&2; exit 1; }\n"
-                + "DEV_BRANCH='" + dev + "'\nPROD_BRANCH='" + prod + "'\n"
-                + WorkflowShell.ExtractBlock(Action, "[[ -n \"$DEV_BRANCH\"", "git check-ref-format --branch \"$PROD_BRANCH\"");
+                + "PREV_BRANCH='" + prev + "'\nPROD_BRANCH='" + prod + "'\n"
+                + WorkflowShell.ExtractBlock(Action, "[[ -n \"$PREV_BRANCH\"", "git check-ref-format --branch \"$PROD_BRANCH\"");
             var result = WorkflowShell.RunBash(script, Path.GetTempPath());
             Assert.NotEqual(0, result.ExitCode);
             Assert.Contains(expected, result.StandardError, StringComparison.Ordinal);

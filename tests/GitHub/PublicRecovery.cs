@@ -11,10 +11,9 @@ public sealed class PrivilegedActionStateGuardTests
     private static readonly string Sha = new('a', 40);
 
     [Theory]
-    [InlineData("nuget", "nuget", "development")]
-    [InlineData("internal", "internal", "development")]
-    [InlineData("tag", "publishable", "production")]
-    public void Mutators_RejectMalformedStateBeforeAuthenticatedOrMutationCalls(string action, string expectedPublisher, string role)
+    [InlineData("nuget", "nuget")]
+    [InlineData("tag", "publishable")]
+    public void Mutators_RejectMalformedStateBeforeAuthenticatedOrMutationCalls(string action, string expectedPublisher)
     {
         using var repository = new TempRepository();
         var content = ReadAction(action);
@@ -32,12 +31,10 @@ public sealed class PrivilegedActionStateGuardTests
         Assert.Empty(File.ReadAllText(outputPath));
         Assert.Contains("--expect-publisher " + expectedPublisher, content, StringComparison.Ordinal);
         Assert.Contains("--role " + (action == "tag" ? "production" : "publishable"), content, StringComparison.Ordinal);
-        _ = role;
     }
 
     [Theory]
     [InlineData("nuget", "public")]
-    [InlineData("internal", "private")]
     public void Publisher_RejectsArtifactDigestDriftBeforeCallingGitHub(string publisher, string visibility)
     {
         using var repository = new TempRepository();
@@ -60,72 +57,6 @@ public sealed class PrivilegedActionStateGuardTests
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("artifact digest does not match", result.StandardError, StringComparison.Ordinal);
         Assert.Equal("called", File.ReadAllText(curlLog).Trim());
-    }
-
-    [Fact]
-    public void InternalAction_RejectsNugetPlannedStateBeforeMetadataOrRegistryRequests()
-    {
-        using var repository = new TempRepository();
-        var state = CreateSealedState(repository, "public", "development", "prepared");
-        var output = repository.WriteFile("github-env", string.Empty);
-        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
-        var environment = ActionEnvironment(repository, state, output, repository.Root, repository.AbsolutePath("curl.log"));
-        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
-        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
-            repository.Root, environment);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("missing, malformed, tampered, or unknown-version", result.StandardError, StringComparison.Ordinal);
-        Assert.False(File.Exists(repository.AbsolutePath("curl.log")));
-        Assert.Empty(File.ReadAllText(output));
-    }
-
-    [Theory]
-    [InlineData("unknown-version")]
-    [InlineData("unsupported-routing")]
-    public void InternalAction_RejectsUnknownOrUnsupportedPolicyStateBeforeMetadata(string fault)
-    {
-        using var repository = new TempRepository();
-        var state = CreateSealedState(repository, "private", "development", "prepared");
-        state = fault == "unknown-version"
-            ? ReplaceStateField(state, "v", "2")
-            : ReplaceStateField(ReplaceStateField(state, "repositoryVisibility", "\"internal\""), "publisher", "\"internal\"");
-        var output = repository.WriteFile("github-env", string.Empty);
-        var curlLog = repository.AbsolutePath("curl.log");
-        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
-        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
-        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
-        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step,
-            repository.Root, environment);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(fault, result.StandardError, StringComparison.Ordinal);
-        Assert.False(File.Exists(curlLog));
-        Assert.Empty(File.ReadAllText(output));
-    }
-
-    [Fact]
-    public void InternalAction_RejectsLiveVisibilityDriftBeforePackageFeedOrPublicationCalls()
-    {
-        using var repository = new TempRepository();
-        var state = CreateSealedState(repository, "private", "development", "prepared");
-        var output = repository.WriteFile("github-env", string.Empty);
-        var step = FindStep(ReadAction("internal"), "Parse state and revalidate destination and artifact");
-        var curlLog = repository.AbsolutePath("curl.log");
-        var environment = ActionEnvironment(repository, state, output, repository.Root, curlLog);
-        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "internal").Replace('\\', '/');
-        environment["STUB_LIVE_VISIBILITY"] = "public";
-        var stubs = "curl() { local output=''; while (( $# )); do case \"$1\" in --output) output=$2; shift 2 ;; --write-out|--header) shift 2 ;; --silent|--show-error|--location) shift ;; *) shift ;; esac; done; printf '{\"visibility\":\"%s\"}' \"$STUB_LIVE_VISIBILITY\" > \"$output\"; printf 200; echo \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY\" >> \"$CURL_LOG\"; }\n"
-            + "jq() { printf '%s' \"$STUB_LIVE_VISIBILITY\"; }\n";
-        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + stubs + step, repository.Root, environment);
-
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("visibility drifted from the planned state", result.StandardError, StringComparison.Ordinal);
-        var requests = File.ReadAllLines(curlLog);
-        Assert.Single(requests);
-        Assert.Contains("/repos/owner/repository", requests[0], StringComparison.Ordinal);
-        Assert.DoesNotContain("nuget.pkg.github.com", string.Join('\n', requests), StringComparison.Ordinal);
-        Assert.DoesNotContain("/git/refs", string.Join('\n', requests), StringComparison.Ordinal);
     }
 
     [Theory]
@@ -163,14 +94,55 @@ public sealed class PrivilegedActionStateGuardTests
     public void PublisherSameShaCollisionIsGatedAndTagCannotMoveExistingReleaseRef()
     {
         var nuget = ReadAction("nuget");
-        var internalAction = ReadAction("internal");
         Assert.Contains("package-state=published", nuget, StringComparison.Ordinal);
-        Assert.Contains("package-state=published", internalAction, StringComparison.Ordinal);
         Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", nuget, StringComparison.Ordinal);
-        Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", internalAction, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$GIZMO_PUBLISHER\" == nuget ]]", ReadAction("tag"), StringComparison.Ordinal);
         Assert.Contains("Release tag already exists for a different commit; refusing to move it.", ReadAction("tag"), StringComparison.Ordinal);
         Assert.Contains("--request POST", ReadAction("tag"), StringComparison.Ordinal);
         Assert.DoesNotContain("--request PATCH", ReadAction("tag"), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TagAction_RejectsInternalPublisherStateBeforeTagMutation()
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "production", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var temporary = repository.AbsolutePath("runner-temp");
+        Directory.CreateDirectory(temporary);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("tag"), "Parse state and revalidate production policy role");
+        var environment = ActionEnvironment(repository, state, output, temporary, curlLog);
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "tag").Replace('\\', '/');
+        environment["GITHUB_REF"] = "refs/heads/release";
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction() + "\n" + step, repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("did not select the nuget publisher", result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(curlLog));
+        Assert.Contains("GIZMO_PUBLISHER=internal", File.ReadAllText(output), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NugetAction_RejectsPrivatePublisherStateBeforeAuthenticatedWork()
+    {
+        using var repository = new TempRepository();
+        var state = CreateSealedState(repository, "private", "production", "prepared");
+        var output = repository.WriteFile("github-env", string.Empty);
+        var temporary = repository.AbsolutePath("runner-temp");
+        Directory.CreateDirectory(temporary);
+        var curlLog = repository.AbsolutePath("curl.log");
+        var step = FindStep(ReadAction("nuget"), "Parse state and revalidate destination and artifact");
+        var environment = ActionEnvironment(repository, state, output, temporary, curlLog);
+        environment["GITHUB_REF"] = "refs/heads/release";
+        environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", "nuget").Replace('\\', '/');
+        var result = WorkflowShell.RunBash(WorkflowShell.PythonBashFunction()
+            + "\ncurl() { echo called >> \"$CURL_LOG\"; return 1; }\n" + step, repository.Root, environment);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("publisher-mismatch", result.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(curlLog));
+        Assert.Empty(File.ReadAllText(output));
     }
 
     [Fact]
@@ -355,33 +327,6 @@ public sealed class PrivilegedActionStateGuardTests
         Assert.NotEqual(File.ReadAllText(localArtifact), storedBytes);
         Assert.Equal(storedBytes, File.ReadAllText(repository.AbsolutePath("downloaded-package.nupkg")));
         Assert.Contains("package-state=published", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void InternalPublisher_RechecksProtectedRouteAndSameShaCollisionWithoutPublishingAgain()
-    {
-        using var repository = new TempRepository();
-        var state = CreateSealedState(repository, "private", "development", "prepared");
-        var guard = FindStep(ReadAction("internal"), "Validate internal publisher invocation");
-        var protectedPush = WorkflowShell.RunBash(guard, repository.Root,
-            new Dictionary<string, string> { ["EVENT_NAME"] = "push", ["REF_PROTECTED"] = "true", ["REF_NAME"] = "refs/heads/pre-release" });
-        Assert.Equal(0, protectedPush.ExitCode);
-
-        var collision = RunCollision(repository, "internal", state, "private", Nuspec(Sha), "Gizmo.Widget.nuspec", versionPresent: true);
-        Assert.True(collision.ExitCode == 0, collision.StandardError + "\n" + collision.StandardOutput);
-        Assert.Contains("package-state=published", File.ReadAllText(repository.AbsolutePath("github-output")), StringComparison.Ordinal);
-        Assert.Contains("if: ${{ steps.collision.outputs.package-state != 'published' }}", ReadAction("internal"), StringComparison.Ordinal);
-        var requests = File.ReadAllLines(repository.AbsolutePath("curl.log"));
-        var serviceIndex = Array.FindIndex(requests, line => line.EndsWith("https://nuget.pkg.github.com/owner/index.json", StringComparison.Ordinal));
-        var packageIndex = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/index.json", StringComparison.Ordinal));
-        var packageDownload = Array.FindIndex(requests, line => line.EndsWith("/gizmo.widget/3.0.0-preview.42/gizmo.widget.3.0.0-preview.42.nupkg", StringComparison.Ordinal));
-        Assert.True(serviceIndex >= 0 && packageIndex > serviceIndex && packageDownload > packageIndex,
-            string.Join(Environment.NewLine, requests));
-
-        var unprotected = WorkflowShell.RunBash(guard, repository.Root,
-            new Dictionary<string, string> { ["EVENT_NAME"] = "push", ["REF_PROTECTED"] = "false", ["REF_NAME"] = "refs/heads/pre-release" });
-        Assert.NotEqual(0, unprotected.ExitCode);
-        Assert.Contains("protected branch", unprotected.StandardError, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -629,7 +574,7 @@ public sealed class PrivilegedActionStateGuardTests
         var request = JsonSerializer.Serialize(new
         {
             repo = "owner/repository", sha = Sha, @ref = reference, run = "700", attempt = "1", @event = "push",
-            dev = "pre-release", prod = "release", role, packageId = "Gizmo.Widget", compatibilityLine = "3.0",
+            prev = "pre-release", prod = "release", role, packageId = "Gizmo.Widget", compatibilityLine = "3.0",
             runNumber = "42", visibility, tags = tags ?? Array.Empty<object>(),
         });
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -651,19 +596,6 @@ public sealed class PrivilegedActionStateGuardTests
         return Parse(seal.StandardOutput)["state"];
     }
 
-    private static string ReplaceStateField(string state, string key, string jsonValue)
-    {
-        var normalized = state.Replace('-', '+').Replace('_', '/');
-        normalized += new string('=', (4 - normalized.Length % 4) % 4);
-        using var document = JsonDocument.Parse(Convert.FromBase64String(normalized));
-        var fields = document.RootElement.EnumerateObject()
-            .ToDictionary(property => property.Name, property => property.Value.Clone(), StringComparer.Ordinal);
-        using var replacement = JsonDocument.Parse(jsonValue);
-        fields[key] = replacement.RootElement.Clone();
-        return Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(fields))
-            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
-    }
-
     private static ShellResult RunCollision(
         TempRepository repository,
         string action,
@@ -676,24 +608,18 @@ public sealed class PrivilegedActionStateGuardTests
     {
         var output = repository.WriteFile("github-output", string.Empty);
         var stateRole = "publishable";
-        var publisher = action == "nuget" ? "nuget" : "internal";
-        var shellState = StateShell(state, stateRole, publisher);
-        var stepName = action == "nuget"
-            ? "Recheck tag state and NuGet package provenance"
-            : "Recheck tag state and internal package provenance";
-        var step = FindStep(ReadAction(action), stepName);
+        var shellState = StateShell(state, stateRole, "nuget");
+        var step = FindStep(ReadAction(action), "Recheck tag state and NuGet package provenance");
         var packagePath = repository.WriteFile("artifact.nupkg", "stored package");
         var environment = ActionEnvironment(repository, state, output, repository.Root, repository.AbsolutePath("curl.log"));
         environment["GITHUB_ACTION_PATH"] = Path.Combine(Root, ".github", "actions", action).Replace('\\', '/');
         environment["NUSPEC_PARSER"] = Path.Combine(Root, ".github", "package", "nuspec.py").Replace('\\', '/');
-        environment["VALIDATE_ORIGIN"] = Path.Combine(Root, ".github", "actions", "internal", "scripts", "validate.mjs").Replace('\\', '/');
         environment["STUB_VISIBILITY"] = visibility;
         environment["STUB_VERSION_PRESENT"] = versionPresent ? "true" : "false";
         environment["STUB_PACKAGE_STATUS"] = packageStatus;
         environment["STUB_NUSPEC"] = nuspec;
         environment["STUB_NUSPEC_ENTRIES"] = nuspecEntries;
         environment["STUB_PACKAGE_FILE"] = packagePath.Replace('\\', '/');
-        environment["STUB_PACKAGE_BASE"] = "https://nuget.pkg.github.com/owner/download";
         environment["STUB_NUPKG_BODY"] = "repository-resigned-stored-bytes";
         environment["STUB_DOWNLOADED_PACKAGE"] = repository.AbsolutePath("downloaded-package.nupkg");
         var wrapper = shellState + "\n" + CollisionCurlStub() + "\n" + CollisionJqStub() + "\n" + CollisionUnzipStub();
@@ -740,11 +666,6 @@ public sealed class PrivilegedActionStateGuardTests
             https://api.nuget.org/*/*.nupkg)
               if [[ "$STUB_PACKAGE_STATUS" == 200 ]]; then printf '%s' "${STUB_NUPKG_BODY:-mock-nupkg}" > "$output"; cp "$output" "$STUB_DOWNLOADED_PACKAGE"; fi
               printf '%s' "$STUB_PACKAGE_STATUS" ;;
-            https://nuget.pkg.github.com/owner/index.json)
-              printf '{"resources":[{"@type":"PackageBaseAddress/3.0.0","@id":"%s"}]}' "$STUB_PACKAGE_BASE" > "$output"; printf 200 ;;
-            https://nuget.pkg.github.com/*/download/*/index.json)
-              if [[ "$STUB_VERSION_PRESENT" == true ]]; then printf '{"versions":["%s"]}' "$GIZMO_PACKAGE_VERSION" > "$output"; printf 200; else printf '{"versions":[]}' > "$output"; printf 404; fi ;;
-            https://nuget.pkg.github.com/*/download/*.nupkg) printf 'mock-nupkg' > "$output"; printf 200 ;;
             *) echo "unexpected mock URL: $url" >&2; return 9 ;;
           esac
         }
@@ -754,7 +675,6 @@ public sealed class PrivilegedActionStateGuardTests
         jq() {
           local joined="$*"
           case "$joined" in
-            *'PackageBaseAddress/3.0.0'*) printf '%s' "$STUB_PACKAGE_BASE" ;;
             *'index($version)'*) [[ "$STUB_VERSION_PRESENT" == true ]] && return 0 || return 1 ;;
             *'-nc --arg id '*|*'-R -s'*) printf '{"packageId":"%s","tags":[]}' "$GIZMO_PACKAGE_ID" ;;
             *'.[] | [.ref, .object.type, .object.sha] | @tsv'*) printf '%s' "${STUB_TAG_ROWS:-}" ;;

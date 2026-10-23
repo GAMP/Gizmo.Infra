@@ -45,7 +45,7 @@ runs:
         [[ "$GIZMO_EVENT" == push ]] || fail "Tagging is allowed only from push."
         [[ "$GIZMO_ROLE" == production ]] || fail "Tagging requires the production policy role; refusing to tag a '$GIZMO_ROLE' run."
         [[ "$GIZMO_TAG" == true ]] || fail "The planned state did not request a tag; refusing to tag."
-        [[ "$GIZMO_PUBLISHER" == nuget || "$GIZMO_PUBLISHER" == internal ]] || fail "The planned state did not select a supported publisher; refusing to tag."
+        [[ "$GIZMO_PUBLISHER" == nuget ]] || fail "The planned state did not select the nuget publisher; refusing to tag."
 
     - name: Refetch and recheck calculated state before tagging
       shell: bash

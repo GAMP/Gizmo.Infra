@@ -7,8 +7,8 @@ inputs:
   github-token:
     description: Caller workflow token used only for authenticated repository metadata lookup.
     required: true
-  dev:
-    description: Caller development branch name declared once in the single caller workflow.
+  prev:
+    description: Caller preview branch name declared once in the single caller workflow.
     required: true
   prod:
     description: Caller production branch name declared once in the single caller workflow.
@@ -41,7 +41,7 @@ runs:
       env:
         CALLER_REPOSITORY: ${{ inputs.caller-repository }}
         GH_TOKEN: ${{ inputs.github-token }}
-        DEV_BRANCH: ${{ inputs.dev }}
+        PREV_BRANCH: ${{ inputs.prev }}
         PROD_BRANCH: ${{ inputs.prod }}
         CURRENT_REF: ${{ inputs.current-ref }}
       run: |
@@ -54,14 +54,14 @@ runs:
         [[ "$CALLER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "github.repository is malformed."
         [[ -n "$GH_TOKEN" ]] || fail "The caller GITHUB_TOKEN is required to read repository metadata."
 
-        [[ -n "$DEV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The dev and prod branch inputs are both required."
-        [[ "$DEV_BRANCH" != "$PROD_BRANCH" ]] || fail "The dev and prod branches must differ."
-        git check-ref-format --branch "$DEV_BRANCH" > /dev/null 2>&1 || fail "The dev branch input is not a valid branch name."
+        [[ -n "$PREV_BRANCH" && -n "$PROD_BRANCH" ]] || fail "The prev and prod branch inputs are both required."
+        [[ "$PREV_BRANCH" != "$PROD_BRANCH" ]] || fail "The prev and prod branches must differ."
+        git check-ref-format --branch "$PREV_BRANCH" > /dev/null 2>&1 || fail "The preview branch input is not a valid branch name."
         git check-ref-format --branch "$PROD_BRANCH" > /dev/null 2>&1 || fail "The prod branch input is not a valid branch name."
 
         # The role derives only from event identity and the declared branches, never a caller configuration file.
         branch_role=none
-        if [[ "$CURRENT_REF" == "refs/heads/$DEV_BRANCH" ]]; then
+        if [[ "$CURRENT_REF" == "refs/heads/$PREV_BRANCH" ]]; then
           branch_role=development
         elif [[ "$CURRENT_REF" == "refs/heads/$PROD_BRANCH" ]]; then
           branch_role=production
